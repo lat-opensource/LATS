@@ -164,11 +164,15 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
         CPUState *self_cpu = current_cpu;
 
 #ifdef CONFIG_LATX_OPT_BQL
+        unsigned long ticket = qemu_cond_wait_prepare_1(&qemu_work_cond);
+
         pthread_spin_unlock(&mutex->spin);
-        waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, mutex, 10000, true);
+        waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, ticket, 10000);
         while (!waked) {
             qemu_cpu_kick(cpu);
-            waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, mutex, 10000, false);
+            waked = qemu_cond_wait_1_n_unlocked(
+                &qemu_work_cond, qatomic_read(&qemu_work_cond.wait_seq),
+                10000);
         }
         pthread_spin_lock(&mutex->spin);
 #else

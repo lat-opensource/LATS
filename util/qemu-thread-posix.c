@@ -705,8 +705,10 @@ void *qemu_thread_join(QemuThread *thread)
 /* Busy-wait tickets and futex wake generations are independent. */
 void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex)
 {
+    unsigned long ticket = qemu_cond_wait_prepare_1(cond);
+
+    /* A notifier taking this lock must see our ticket before we unlock. */
     pthread_spin_unlock(&mutex->spin);
-    unsigned long ticket = qatomic_fetch_inc(&cond->wait_seq);
 
     while (qatomic_read(&cond->release_seq) < ticket) {
         smp_mb();
@@ -715,25 +717,18 @@ void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex)
 }
 
 /*
- * return true : cond is waked up
- * return false: count reaches max
+ * Poll a ticket prepared by the caller while holding the predicate lock.
+ * The caller drops the lock before entering this function.
  */
-bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, QemuMutex *mutex, int n, bool inc)
+bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n)
 {
-    bool res = false;
-//    pthread_spin_unlock(&mutex->spin);
-    unsigned long ticket = inc ? qatomic_fetch_inc(&cond->wait_seq) :
-                                 qatomic_read(&cond->wait_seq);
     int count = 0;
+
     while (qatomic_read(&cond->release_seq) < ticket && count < n) {
         smp_mb();
         count += 1;
     }
-    if (!(qatomic_read(&cond->release_seq) < ticket)) {
-        res = true;
-    }
-//    pthread_spin_lock(&mutex->spin);
-    return res;
+    return qatomic_read(&cond->release_seq) >= ticket;
 }
 
 void qemu_cond_broadcast_1(QemuCond *cond)
@@ -782,10 +777,10 @@ void qemu_cond_signal_2(QemuCond *cond)
 
 void qemu_cond_wait_3(QemuCond *cond, QemuMutex *mutex, int n)
 {
-    pthread_spin_unlock(&mutex->spin);
-    unsigned long ticket = qatomic_fetch_inc(&cond->wait_seq);
+    unsigned long ticket = qemu_cond_wait_prepare_1(cond);
     int count = 0;
 
+    pthread_spin_unlock(&mutex->spin);
     while (qatomic_read(&cond->release_seq) < ticket && count < n) {
         smp_mb();
         count += 1;

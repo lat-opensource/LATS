@@ -408,8 +408,21 @@ unsigned qemu_lockcnt_count(QemuLockCnt *lockcnt);
 void qemu_spin_lock_impl(QemuMutex *mutex, const char *file, const int line);
 
 #ifdef CONFIG_LATX_OPT_BQL
+/*
+ * All waiters use the same predicate lock, which serializes ticket allocation
+ * and publishes it before unlocking. Atomic loads/stores let notifiers sample
+ * wait_seq without locking. Atomic read-modify-write is unnecessary here.
+ */
+static inline unsigned long qemu_cond_wait_prepare_1(QemuCond *cond)
+{
+    unsigned long ticket = qatomic_read(&cond->wait_seq);
+
+    qatomic_set(&cond->wait_seq, ticket + 1);
+    return ticket;
+}
+
 void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex);
-bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, QemuMutex *mutex, int n, bool inc);
+bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n);
 void qemu_cond_broadcast_1(QemuCond *cond);
 void qemu_cond_signal_1(QemuCond *cond);
 void qemu_mutex_lock_1(QemuMutex *mutex);
