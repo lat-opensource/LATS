@@ -733,7 +733,22 @@ bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n)
 
 void qemu_cond_broadcast_1(QemuCond *cond)
 {
-    qatomic_set(&cond->release_seq, qatomic_read(&cond->wait_seq));
+    unsigned long last = qatomic_read(&cond->wait_seq);
+    unsigned long released = qatomic_read(&cond->release_seq);
+
+    /*
+     * Keep the existing inclusive release rule: a vCPU kick need not hold
+     * the predicate lock. Concurrent broadcasts must not overwrite a newer
+     * release with an older wait_seq snapshot.
+     */
+    while (released < last) {
+        unsigned long old = qatomic_cmpxchg(&cond->release_seq, released, last);
+
+        if (old == released) {
+            break;
+        }
+        released = old;
+    }
     smp_mb();
 }
 
