@@ -821,7 +821,8 @@ void qemu_cond_broadcast_3(QemuCond *cond)
 void qemu_cond_signal_3(QemuCond *cond)
 {
     qemu_cond_signal_1(cond);
-    qemu_cond_signal_2(cond);
+    /* Ticket order need not match futex queue order. Wake the eligible one. */
+    qemu_cond_broadcast_2(cond);
 }
 
 #endif
