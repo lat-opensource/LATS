@@ -26,6 +26,7 @@ struct QemuCond {
     /* OPT_BQL: next ticket starts at 1; release_seq never moves backwards. */
     unsigned long wait_seq;
     unsigned long release_seq;
+    /* Independent generation used to avoid a check-then-futex-wait race. */
     unsigned futex_seq;
     pthread_cond_t cond;
     bool initialized;
