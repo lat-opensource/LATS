@@ -23,7 +23,7 @@ typedef struct QemuRecMutex {
 } QemuRecMutex;
 
 struct QemuCond {
-    /* OPT_BQL: next ticket starts at 1. */
+    /* OPT_BQL: next ticket starts at 1; release_seq never moves backwards. */
     unsigned long wait_seq;
     unsigned long release_seq;
     unsigned futex_seq;
