@@ -170,9 +170,7 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
         waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, ticket, 10000);
         while (!waked) {
             qemu_cpu_kick(cpu);
-            waked = qemu_cond_wait_1_n_unlocked(
-                &qemu_work_cond, qatomic_read(&qemu_work_cond.wait_seq),
-                10000);
+            waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, ticket, 10000);
         }
         pthread_spin_lock(&mutex->spin);
 #else
