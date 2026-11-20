@@ -31,3 +31,15 @@ test_latx_scalar_compare_decode = executable(
 )
 test('test-latx-scalar-compare-decode', test_latx_scalar_compare_decode,
      suite: ['unit', 'latx-decode'], timeout: 30)
+
+if targetos == 'linux' and 'CONFIG_LATX_OPT_BQL' in config_host
+  test_qemu_cond_bql = executable(
+    'test-qemu-cond-bql',
+    files('../unit/test-qemu-cond-bql.c') + genh,
+    dependencies: [glib, qemuutil],
+    link_args: ['-Wl,--wrap=pthread_spin_unlock'],
+    build_by_default: false,
+  )
+  test('test-qemu-cond-bql', test_qemu_cond_bql,
+       suite: ['unit', 'latx-thread'], timeout: 15)
+endif
