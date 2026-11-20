@@ -57,15 +57,15 @@ check_host_deps() {
     fi
 
     if [ "$make_configure" -eq 1 ]; then
-        if ! pkg-config --exists pixman-1; then
+        if ! pkg-config --print-errors --exists pixman-1; then
             missing="$missing libpixman-1-dev"
         fi
 
-        if ! pkg-config --exists spice-server; then
+        if ! pkg-config --print-errors --exists spice-server; then
             missing="$missing libspice-server-dev"
         fi
 
-        if ! pkg-config --exists sdl2; then
+        if ! pkg-config --print-errors --exists sdl2; then
             missing="$missing libsdl2-dev"
         fi
     fi
