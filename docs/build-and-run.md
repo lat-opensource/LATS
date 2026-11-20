@@ -145,6 +145,22 @@ sudo rmmod hamt_pm
 升级内核后必须重新编译 `hamt-pm`。该模块只用于 ABI1.0 环境；ABI2.0 应优先使用
 内核提供的 `sfb_state` 接口。
 
+### 开启 TSO
+
+运行 Windows 10 及更高版本的客户机时，建议开启 TSO（Total Store Order），
+以获得更好的内存模型兼容性和运行稳定性。
+
+ABI2.0 系统优先通过内核 debugfs 接口开启。默认状态为 `3`，写入 `5` 后启用：
+
+```bash
+cat /sys/kernel/debug/loongarch/tso_state
+sudo sh -c 'echo 5 > /sys/kernel/debug/loongarch/tso_state'
+```
+
+ABI1.0 系统使用
+[memory-model-config](https://github.com/lat-opensource/memory-model-config)
+项目提供的配置方式，按该项目说明完成配置。
+
 ### HAMT 不可用时
 
 如果宿主内核版本、KVM 接口或 SFB 控制不满足要求，使用以下参数关闭 HAMT：
@@ -380,8 +396,7 @@ Windows 等客户机操作系统的介质、授权和激活由用户自行负责
 ## 8. GPU 加速
 
 LATS 支持通过本地 vGPU 软件栈和客户机 vGPU 驱动启用 GPU 加速。本地 vGPU
-库、客户机驱动及配套运行环境均不由本项目提供，使用前需要自行准备并确认
-版本兼容。
+软件栈和客户机 vGPU 驱动后续将以二进制形式在 release 版本中发布。
 
 ### 准备本地 vGPU 库
 
