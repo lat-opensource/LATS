@@ -717,8 +717,8 @@ void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex)
 }
 
 /*
- * Poll a ticket prepared by the caller while holding the predicate lock.
- * The caller drops the lock before entering this function.
+ * The caller prepares a ticket while holding its predicate lock, then drops
+ * the lock and polls. A timeout does not cancel or replace that ticket.
  */
 bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n)
 {
