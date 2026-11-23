@@ -64,9 +64,12 @@ int gen_latxs_ras_tp_repair(void *code_ptr);
 uint32_t latxs_ras_tp_closed_gate(TranslationBlock *tb);
 #ifdef CONFIG_LATX_TU
 #define LATXS_RAS_TP_COLD_OFFSET(tb) ((tb)->s_data->ras_tp_cold_offset)
+#define LATXS_RAS_TP_COLD_INSNS(tb) ((tb)->s_data->ras_tp_cold_insns)
 #else
 #define LATXS_RAS_TP_COLD_OFFSET(tb) ((tb)->ras_tp_cold_offset)
+#define LATXS_RAS_TP_COLD_INSNS(tb) ((tb)->ras_tp_cold_insns)
 #endif
+#define LATXS_RAS_TP_COLD_SIZE(tb) (LATXS_RAS_TP_COLD_INSNS(tb) * 4U)
 void latxs_ras_tp_emit_call_cold(void);
 /* Invalidate generated return predictions before a TB lookup mode change. */
 void latxs_ras_tp_emit_clear(void);

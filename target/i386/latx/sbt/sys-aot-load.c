@@ -1599,8 +1599,10 @@ static inline int recover_tb(TranslationBlock *curr_tb, aot_block *aot_tb, int *
         /* curr_tb->preorder_tb_offset = aot_tb->preorder_tb_offset; */
         curr_tb->inst_ptr_offset = aot_tb->inst_ptr_offset;
         LATXS_RAS_TP_COLD_OFFSET(curr_tb) = 0;
+        LATXS_RAS_TP_COLD_INSNS(curr_tb) = 0;
         if (option_rastoptp && curr_tb->inst_ptr_offset) {
             LATXS_RAS_TP_COLD_OFFSET(curr_tb) = aot_tb->ras_tp_cold_offset;
+            LATXS_RAS_TP_COLD_INSNS(curr_tb) = LATX_RAS_TP_CALL_COLD_INSNS;
         }
         curr_tb->label_pos_nocheck = aot_tb->label_pos_nocheck;
         curr_tb->misc_flags = aot_tb->misc_flags;
@@ -2055,8 +2057,10 @@ inline int recover_tb_head(TranslationBlock *curr_tb, aot_block *aot_tb)
     /* curr_tb->preorder_tb_offset = aot_tb->preorder_tb_offset; */
     curr_tb->inst_ptr_offset = aot_tb->inst_ptr_offset;
     LATXS_RAS_TP_COLD_OFFSET(curr_tb) = 0;
+    LATXS_RAS_TP_COLD_INSNS(curr_tb) = 0;
     if (option_rastoptp && curr_tb->inst_ptr_offset) {
         LATXS_RAS_TP_COLD_OFFSET(curr_tb) = aot_tb->ras_tp_cold_offset;
+        LATXS_RAS_TP_COLD_INSNS(curr_tb) = LATX_RAS_TP_CALL_COLD_INSNS;
     }
     curr_tb->label_pos_nocheck = aot_tb->label_pos_nocheck;
     curr_tb->misc_flags = aot_tb->misc_flags;

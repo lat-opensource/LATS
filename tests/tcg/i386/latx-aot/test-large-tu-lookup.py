@@ -42,7 +42,6 @@ program = r'''
 #define CONFIG_LATX_TU 1
 #define MAKE_64BIT_MASK(lo, width) (((UINT64_C(1) << (width)) - 1) << (lo))
 #define ROUND_DOWN(value, align) ((value) & ~((uintptr_t)(align) - 1))
-#define LATX_RAS_TP_CALL_COLD_INSNS 5
 ''' + definitions + "\n" + tbmini + r'''
 #endif
 typedef struct {
@@ -51,7 +50,7 @@ typedef struct {
 } AOTNativeRecord;
 typedef struct { unsigned count; AOTNativeRecord records[1]; } AOTNativeTUInfo;
 typedef struct { AOTNativeTUInfo *native; } TranslationUnitPages;
-typedef struct { uint64_t tu_size; uint32_t ras_tp_cold_offset; } Data;
+typedef struct { uint64_t tu_size; uint32_t ras_tp_cold_offset, ras_tp_cold_insns; } Data;
 typedef struct {
     struct { void *ptr; size_t offset_in_tu; } tc;
     unsigned ir2_num;
@@ -104,6 +103,7 @@ static void check_table(unsigned count, bool from_aot_loader)
         tu_tbmini_set_pointer(&(header + i + 1)->mtbp_uint64, (uintptr_t)&members[i], 8);
     }
     data[count - 1].ras_tp_cold_offset = native_offset + 64;
+    data[count - 1].ras_tp_cold_insns = 5;
     assert(tcg_tb_lookup_fast((uintptr_t)code + 4) == &members[0]);
     assert(tcg_tb_lookup_fast((uintptr_t)code + (count - 1) * 8 + 4) == &members[count - 1]);
     assert(tcg_tb_lookup_fast((uintptr_t)code + native_offset + 4) == &members[0]);
@@ -116,6 +116,74 @@ static void check_table(unsigned count, bool from_aot_loader)
     assert(!tcg_tb_lookup_fast((uintptr_t)code + 4));
     free(members); free(data);
 }
+
+/* Lookup uses recorded cold ranges independently of instruction encoding,
+ * skips out-of-TU metadata without rejecting normal lookup, and preserves
+ * source ownership across adjacent cold fragments in the final member. */
+static void check_variable_cold(unsigned words)
+{
+    memset(buffer, 0, buffer_size);
+    TBMini *header = (void *)buffer;
+    uint8_t *code = buffer + 3 * sizeof(*header);
+    Data data[2] = {{0}, {0}};
+    TranslationBlock members[2] = {
+        { .tc = {code, 0}, .ir2_num = 4, .s_data = &data[0] },
+        { .tc = {code + 16, 16}, .ir2_num = 4 + words,
+          .s_data = &data[1] },
+    };
+    uint32_t *cold = (void *)(code + 32);
+    unsigned bytes = 32 + words * 4;
+
+    write_jit_tu_header((uintptr_t)header, 2);
+    data[0].tu_size = bytes;
+    data[0].ras_tp_cold_offset = 32;
+    data[0].ras_tp_cold_insns = words;
+    data[1].ras_tp_cold_offset = UINT32_MAX; /* no CALL */
+    tu_tbmini_set_pointer(&(header + 1)->mtbp_uint64,
+                         (uintptr_t)&members[0], 16);
+    tu_tbmini_set_pointer(&(header + 2)->mtbp_uint64,
+                         (uintptr_t)&members[1], 16 + words * 4);
+    memset(cold, 0xff, words * 4);
+
+    assert(tcg_tb_lookup_fast((uintptr_t)code + 4) == &members[0]);
+    assert(tcg_tb_lookup_fast((uintptr_t)code + 20) == &members[1]);
+    for (unsigned i = 0; i < words; i++) {
+        assert(tcg_tb_lookup_fast((uintptr_t)&cold[i]) == &members[0]);
+    }
+    assert(!tcg_tb_lookup_fast((uintptr_t)code + bytes));
+
+    data[0].ras_tp_cold_insns = 0;
+    data[0].ras_tp_cold_offset = UINT32_MAX;
+    assert(tcg_tb_lookup_fast((uintptr_t)code + 4) == &members[0]);
+    assert(tcg_tb_lookup_fast((uintptr_t)cold) == &members[1]);
+
+    data[0].ras_tp_cold_offset = bytes - 4;
+    data[0].ras_tp_cold_insns = 3;
+    assert(tcg_tb_lookup_fast((uintptr_t)code + 4) == &members[0]);
+    assert(tcg_tb_lookup_fast((uintptr_t)code + 20) == &members[1]);
+    assert(tcg_tb_lookup_fast((uintptr_t)code + bytes - 4) == &members[1]);
+    assert(!tcg_tb_lookup_fast((uintptr_t)code + bytes));
+
+    data[0].ras_tp_cold_offset = bytes + 16;
+    data[0].ras_tp_cold_insns = 3;
+    assert(tcg_tb_lookup_fast((uintptr_t)code + 4) == &members[0]);
+    assert(tcg_tb_lookup_fast((uintptr_t)code + 20) == &members[1]);
+    assert(!tcg_tb_lookup_fast((uintptr_t)code + bytes + 16));
+
+    /* Two adjacent, source-owned fragments can live in the final member. */
+    data[0].ras_tp_cold_offset = 32;
+    data[0].ras_tp_cold_insns = words;
+    data[1].ras_tp_cold_offset = bytes;
+    data[1].ras_tp_cold_insns = 3;
+    data[0].tu_size += 12;
+    members[1].ir2_num += 3;
+    tu_tbmini_set_pointer(&(header + 2)->mtbp_uint64,
+                         (uintptr_t)&members[1], 16 + words * 4 + 12);
+    assert(tcg_tb_lookup_fast((uintptr_t)code + bytes - 4) == &members[0]);
+    assert(tcg_tb_lookup_fast((uintptr_t)code + bytes) == &members[1]);
+    assert(tcg_tb_lookup_fast((uintptr_t)code + bytes + 8) == &members[1]);
+    assert(!tcg_tb_lookup_fast((uintptr_t)code + bytes + 12));
+}
 int main(void)
 {
     assert(!posix_memalign((void **)&buffer, CODE_GEN_ALIGN, buffer_size));
@@ -124,6 +192,9 @@ int main(void)
         for (unsigned i = 0; i < sizeof(counts) / sizeof(counts[0]); i++) {
             check_table(counts[i], loader != 0);
         }
+    }
+    for (unsigned words = 3; words <= 7; words++) {
+        check_variable_cold(words);
     }
     memset(buffer, 0, buffer_size);
     TranslationBlock ordinary = {0};

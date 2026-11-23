@@ -220,7 +220,9 @@ GBytes *aot_pack_function_tus(const GPtrArray *fragments, uint64_t entry)
                 block.inst_ptr_offset < 0 ||
                 (uint64_t)block.inst_ptr_offset > code_size ||
                 (block.inst_ptr_offset && option_rastoptp &&
-                 block.ras_tp_cold_offset > code_size)) {
+                 (block.ras_tp_cold_offset > code_size ||
+                  LATX_RAS_TP_CALL_COLD_INSNS * 4 >
+                      code_size - block.ras_tp_cold_offset))) {
                 return NULL;
             }
             if (members->len) {

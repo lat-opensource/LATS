@@ -143,7 +143,9 @@ struct separated_data{
     uint8_t sys_eob_use_fsht : 1;
     uint8_t has_hras_check_gate : 1;
     uint8_t ignore_eip_update : 1;
-#if defined(CONFIG_LATX_TU)
+#ifdef CONFIG_LATX_TU
+    /* Runtime repair length in four-byte instructions; zero means absent. */
+    uint8_t ras_tp_cold_insns : 3;
     uint8_t tu_tb_mode;
 #endif
 };
@@ -438,6 +440,9 @@ struct TranslationBlock {
 #endif
 #ifdef CONFIG_LATX_DEBUG
     int inhibit_irq_type;
+#endif
+#ifndef CONFIG_LATX_TU
+    uint8_t ras_tp_cold_insns;
 #endif
 };
 

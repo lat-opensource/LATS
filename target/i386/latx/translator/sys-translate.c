@@ -101,6 +101,7 @@ void latxs_tr_tb_init(TRANSLATION_DATA *td, TranslationBlock *tb)
     td->curr_ir1_inst = NULL;
     if (tb) {
         LATXS_RAS_TP_COLD_OFFSET(tb) = 0;
+        LATXS_RAS_TP_COLD_INSNS(tb) = 0;
     }
 }
 
@@ -446,6 +447,11 @@ int latxs_tr_translate_tb(TranslationBlock *tb, int *search_size)
     if (translation_done) {
         code_nr = latxs_tr_ir2_assemble(tb->tc.ptr);
         if (option_rastoptp && code_nr > 0 && tb->inst_ptr_offset) {
+            uint32_t cold = LATXS_RAS_TP_COLD_OFFSET(tb);
+            uint32_t size = LATXS_RAS_TP_COLD_SIZE(tb);
+            g_assert(size && !(cold & 3) &&
+                     cold <= (uint64_t)code_nr * 4 &&
+                     size <= (uint64_t)code_nr * 4 - cold);
             g_assert(*(uint32_t *)((uintptr_t)tb->tc.ptr + tb->inst_ptr_offset) ==
                      latxs_ras_tp_closed_gate(tb));
         }

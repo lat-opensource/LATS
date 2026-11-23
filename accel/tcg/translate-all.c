@@ -531,6 +531,7 @@ inline void latxs_tb_reset(TranslationBlock *tb)
     tb->s_data->tu_cold_exit_offset[1] = TU_COLD_EXIT_INVALID;
 #endif
     LATXS_RAS_TP_COLD_OFFSET(tb) = 0;
+    LATXS_RAS_TP_COLD_INSNS(tb) = 0;
     tb->label_pos_nocheck = 0;
 }
 

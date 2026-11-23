@@ -18,6 +18,7 @@ program = r'''
 #include <stdio.h>
 #include <string.h>
 #include "lats/aot-format.h"
+#include "latx-ras-config.h"
 #define TARGET_PAGE_MASK (~UINT64_C(4095))
 #define TB_JMP_OFFSET_INVALID 0xffff
 #define MAX_TB_IN_TS 1024
@@ -151,6 +152,20 @@ static void check_pack(void)
     assert(aot_make_tu_id(vector, 4, pages, 2) == h->tu_id);
     g_bytes_unref(packed);
     assert(!aot_pack_function_tus(fragments, 0x800100));
+    if (option_rastoptp) {
+        const unsigned cold_offsets[] = {40, 44, 48, 64, 68};
+        for (unsigned i = 0; i < G_N_ELEMENTS(cold_offsets); i++) {
+            GBytes *old = replace(fragments, 0);
+            aot_tu_head *head = (void *)g_bytes_get_data(fragments->pdata[0], NULL);
+            aot_block *blocks = (void *)((aot_tu_page *)(head + 1) + head->page_count);
+            blocks[0].ras_tp_cold_offset = cold_offsets[i];
+            GBytes *candidate = aot_pack_function_tus(fragments, 0x420100);
+            /* Appending the second fragment must not conceal truncation. */
+            assert((candidate != NULL) == (cold_offsets[i] <= 44));
+            if (candidate) g_bytes_unref(candidate);
+            g_bytes_unref(fragments->pdata[0]); fragments->pdata[0] = old;
+        }
+    }
     for (unsigned test = 0; test < 7; test++) {
         GBytes *old = replace(fragments, 0);
         gsize bytes;
@@ -208,5 +223,6 @@ with tempfile.TemporaryDirectory(prefix="lats-function-source-") as temp:
         ["pkg-config", "--cflags", "--libs", "glib-2.0"], text=True))
     subprocess.run(["cc", "-std=gnu11", "-Wall", "-Wextra", "-Werror",
                     "-DLATS_AOT_DISK_TU", "-I", str(root / "include"),
+                    "-I", str(root / "target/i386/latx/include"),
                     str(path / "check.c"), "-o", str(path / "check"), *flags], check=True)
     subprocess.run([str(path / "check")], check=True)

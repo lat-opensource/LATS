@@ -1521,8 +1521,11 @@ void latxs_ras_tp_emit_call_cold(void)
         }
     }
     la_out1(LISA_B, &td->ras_tp_call_done);
-    g_assert(!option_aot_save ||
-             td->ir2_asm_nr - start == LATX_RAS_TP_CALL_COLD_INSNS);
+    unsigned cold_insns = td->ir2_asm_nr - start;
+    QEMU_BUILD_BUG_ON(LATX_RAS_TP_CALL_COLD_INSNS > 7);
+    g_assert(cold_insns && cold_insns <= 7);
+    LATXS_RAS_TP_COLD_INSNS(tb) = cold_insns;
+    g_assert(!option_aot_save || cold_insns == LATX_RAS_TP_CALL_COLD_INSNS);
 }
 
 /* Save is enabled during ordinary JIT execution too. Only this explicit

@@ -250,6 +250,8 @@ void tu_reset_tb(TranslationBlock *tb)
     tb->s_data->tu_unlink_stub_offset = TU_UNLINK_STUB_INVALID;
     tb->s_data->tu_cold_exit_offset[0] = TU_COLD_EXIT_INVALID;
     tb->s_data->tu_cold_exit_offset[1] = TU_COLD_EXIT_INVALID;
+    LATXS_RAS_TP_COLD_OFFSET(tb) = 0;
+    LATXS_RAS_TP_COLD_INSNS(tb) = 0;
 #endif
 
 //#ifdef CONFIG_LATX_AOT
@@ -427,7 +429,6 @@ TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
     tb->preorder_tb_offset = 0;
     tb->preorder_next = NULL;
     tb->inst_ptr_offset = 0;
-    LATXS_RAS_TP_COLD_OFFSET(tb) = 0;
 
 #ifdef CONFIG_LATX_PROFILER
     CLN_TB_PROFILE(tb);
@@ -3376,7 +3377,12 @@ static int latxs_label_dispose_in_tu(TranslationBlock **tb_list,
             g_assert(LATXS_RAS_TP_COLD_OFFSET(member) == TU_COLD_EXIT_INVALID);
             LATXS_RAS_TP_COLD_OFFSET(member) =
                 label_pos[ras_calls[i].miss.val] << 2;
-            g_assert(LATXS_RAS_TP_COLD_OFFSET(member) > member->inst_ptr_offset);
+            uint32_t cold = LATXS_RAS_TP_COLD_OFFSET(member);
+            uint32_t size = LATXS_RAS_TP_COLD_SIZE(member);
+            g_assert(member->inst_ptr_offset >= 0 &&
+                     cold > (uint32_t)member->inst_ptr_offset && size &&
+                     cold <= (uint64_t)ir2_num * 4 &&
+                     size <= (uint64_t)ir2_num * 4 - cold);
         }
     }
 
@@ -3739,7 +3745,6 @@ retranslate_one_tb_in_tu:
         if (option_rastoptp) {
             td->ras_tp_has_call = false;
             tb->inst_ptr_offset = 0;
-            LATXS_RAS_TP_COLD_OFFSET(tb) = TU_COLD_EXIT_INVALID;
             ras_calls[i].valid = false;
         }
 
@@ -4106,7 +4111,6 @@ static TranslationBlock* aot_tb_create(CPUState *cpu, target_ulong pc,
     tb->preorder_tb_offset = 0;
     tb->preorder_next = NULL;
     tb->inst_ptr_offset = 0;
-    LATXS_RAS_TP_COLD_OFFSET(tb) = 0;
 
 #ifdef CONFIG_LATX_PROFILER
     CLN_TB_PROFILE(tb);
@@ -5477,7 +5481,6 @@ static TranslationBlock* create_check_tb(CPUState *cpu, TranslationBlock *aot_tb
     tb->preorder_tb_offset = 0;
     tb->preorder_next = NULL;
     tb->inst_ptr_offset = 0;
-    LATXS_RAS_TP_COLD_OFFSET(tb) = 0;
 
 #ifdef CONFIG_LATX_PROFILER
     CLN_TB_PROFILE(tb);

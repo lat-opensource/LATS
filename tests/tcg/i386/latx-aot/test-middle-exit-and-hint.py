@@ -73,7 +73,6 @@ c_prog = r"""
 #define TU_TBM_MAGIC 0xa55a
 #define HOST_VIRT_ADDR_SPACE_BITS 48
 #define CODE_GEN_ALIGN 32
-#define LATX_RAS_TP_CALL_COLD_INSNS 5
 #define TB_JMP_OFFSET_INVALID 0xffff
 #define TB_JMP_CP_DATA_VALID (1U << 31)
 #define TB_JMP_CP_DATA_LINKED (1U << 30)
@@ -148,6 +147,7 @@ typedef struct { AOTNativeTUInfo *native; uint32_t id; } TranslationUnitPages;
 typedef struct {
     uint64_t tu_size;
     uint32_t ras_tp_cold_offset;
+    uint8_t ras_tp_cold_insns;
     const void *aot_native_call_entry;
 } Data;
 typedef struct TranslationBlock {
@@ -345,6 +345,7 @@ int main(void)
     Data sdata = {
         .tu_size = 65536,
         .ras_tp_cold_offset = 0,
+        .ras_tp_cold_insns = 0,
         .aot_native_call_entry = tu_code + 32768,
     };
     TranslationBlock owner = {

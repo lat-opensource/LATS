@@ -35,7 +35,6 @@
 #include "tcg/tcg-split-tb.h"
 #include "target/i386/latx/include/latx-perfmap.h"
 #include "target/i386/latx/include/latx-options.h"
-#include "target/i386/latx/include/latx-ras-config.h"
 #include "qemu/log.h"
 
 #if defined(CONFIG_LATX_TU) && defined(CONFIG_SOFTMMU)
@@ -254,15 +253,10 @@ static void *query_tu_tbm_table(TBMini *tbm, uintptr_t tc_ptr)
         /* Saved CALL members may follow out-of-line repair code. Existing
          * final members can also contain other members' repair stubs. */
         uint32_t cold = member->s_data->ras_tp_cold_offset;
-        if (cold) {
-            uint32_t cold_bytes = LATX_RAS_TP_CALL_COLD_INSNS * 4;
-            if (cold > bytes || cold_bytes > bytes - cold) {
-                return NULL;
-            }
-            if (tc_ptr >= base + cold &&
-                tc_ptr - (base + cold) < cold_bytes) {
-                return member;
-            }
+        uint32_t cold_size = member->s_data->ras_tp_cold_insns * 4U;
+        if (cold_size && cold <= bytes && cold_size <= bytes - cold &&
+            tc_ptr >= base + cold && tc_ptr - (base + cold) < cold_size) {
+            return member;
         }
         if (tc_ptr >= start && tc_ptr - start < size) {
             if (normal) {
