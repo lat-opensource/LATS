@@ -15,6 +15,8 @@ if host_arch == 'loongarch64'
     'hamt.c',
     'hamt-init.c',
     'hamt-ptw.c',
+    'hamt-smc-bitmap.c',
+    'hamt-smc-vcpu-bitmap.c',
     'hamt-tlb.c',
     'hamt-error.c',
     'hamt-interrupt.c',

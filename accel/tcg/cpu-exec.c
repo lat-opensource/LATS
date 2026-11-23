@@ -50,6 +50,9 @@
 #include "qemu/cacheflush.h"
 #include "qemu/memalign.h"
 #include "hamt-dmw.h"
+#if defined(TARGET_I386) && defined(CONFIG_LATX_HACK_MEM) && !defined(CONFIG_USER_ONLY)
+#include "hamt-ptw.h"
+#endif
 
 #include "latx/include/latx-ras.h"
 #include "latx/include/latx-misc.h"
@@ -1853,7 +1856,11 @@ void cpu_exec_step_atomic(CPUState *cpu)
         start_exclusive();
         g_assert(cpu == current_cpu);
         g_assert(!cpu->running);
-        cpu->running = true;
+        qatomic_set(&cpu->running, true);
+#if defined(TARGET_I386) && defined(CONFIG_LATX_HACK_MEM) && !defined(CONFIG_USER_ONLY)
+        smp_mb();
+        hamt_smc_resume_flush(cpu);
+#endif
 
 #if defined(TARGET_I386) && defined(CONFIG_SOFTMMU)
         if (env->aot_native_atomic.descriptor) {
@@ -1907,7 +1914,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
      */
 atomic_done:
     g_assert(cpu_in_exclusive_context(cpu));
-    cpu->running = false;
+    qatomic_set(&cpu->running, false);
     end_exclusive();
 #ifdef CONFIG_LATX_OPT_NOFP
     if (native_atomic) {

@@ -9,6 +9,9 @@
 
 void *hamt_get_ptwdata(void);
 void *hamt_get_ptwdata1m(void);
+size_t hamt_get_ptwdata_size(void);
+struct CPUState;
+void hamt_smc_resume_flush(struct CPUState *cpu);
 void hamt_ptwdata_set_mmio(uint64_t base, uint64_t size);
 void hamt_ptwdata_smc_protect(uint64_t base, uint64_t size);
 void hamt_ptwdata_smc_unprotect(uint64_t base, uint64_t size);

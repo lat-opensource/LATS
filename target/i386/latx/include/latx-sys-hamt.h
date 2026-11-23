@@ -26,6 +26,9 @@ typedef struct {
     void *database;
     void *database2;
     void *subcodebase;
+    void *smc_bitmap_base;
+    void *smc_bitmap_high_water;
+    unsigned long smc_bitmap_words;
     void *begin;
     void *end;
     int *size;

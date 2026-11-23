@@ -31,6 +31,7 @@ void hamt_ptwdata_vga_protect(uint64_t start, uint64_t count);
 int hamt_ptwdata_vga_snapshot_is_dirty(uint64_t start, uint64_t count, void *bitmap);
 void *hamt_get_ptwdata(void);
 void *hamt_get_ptwdata1m(void);
+size_t hamt_get_ptwdata_size(void);
 void hamt_realloc_ptwdata(void *opaque);
 int dune_enter(void *cpu, int mode, int cpuid);
 void latxs_init_rr_thread_sigfpe(void);
@@ -80,6 +81,15 @@ void hamt_flush_tlb_global_mmio(void)
 
 void hamt_flush_tlb_page_mmio(uint64_t vaddr)
 {
+}
+
+void hamt_smc_resume_flush(struct CPUState *cpu)
+{
+}
+
+size_t hamt_get_ptwdata_size(void)
+{
+    return 0;
 }
 
 void hamt_protect_code(uint64_t guest_phys_page, int full)

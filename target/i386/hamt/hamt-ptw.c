@@ -38,6 +38,7 @@
 
 #include "hamt-ptw.h"
 #include "hamt-ptw-internal.h"
+#include "hamt-smc-bitmap.h"
 #include "hamt-hostmem.h"
 
 #include "loongarch-csr.h"
@@ -132,6 +133,30 @@ void *hamt_get_ptwdata(void)
 void *hamt_get_ptwdata1m(void)
 {
     return ptwdata1m;
+}
+size_t hamt_get_ptwdata_size(void)
+{
+    return ptwdata_size;
+}
+
+static HamtSmcBitmap smc_bitmap;
+static pthread_once_t smc_bitmap_once = PTHREAD_ONCE_INIT;
+
+static void hamt_smc_bitmap_init_shared(void)
+{
+    if (!hamt_smc_bitmap_init(&smc_bitmap, ptwdata_size)) {
+        fprintf(stderr, "HAMT: SMC bitmap allocation failed; using full flush\n");
+    } else if (!HAMT_HOLE_ASSERT(smc_bitmap.vcpu[0].words) ||
+               !HAMT_HOLE_ASSERT(smc_bitmap.page1m)) {
+        hamt_smc_bitmap_destroy(&smc_bitmap);
+        fprintf(stderr, "HAMT: SMC bitmap address unsuitable; using full flush\n");
+    }
+}
+
+HamtSmcBitmap *hamt_smc_bitmap_get(void)
+{
+    pthread_once(&smc_bitmap_once, hamt_smc_bitmap_init_shared);
+    return &smc_bitmap;
 }
 
 void hamt_ptwdata_set_mmio(uint64_t base, uint64_t size)
@@ -543,6 +568,14 @@ do_check_protect:
     paddr = (pte & PG_ADDRESS_MASK & ~(page_size - 1)) | (addr & (page_size - 1));
     haddr = paddr + rambase;
 
+    if (hamt_smc_bitmap_enabled()) {
+        if (!option_smc_bitmap_rw || (prot & PAGE_WRITE)) {
+            hamt_smc_bitmap_mark(hamt_smc_bitmap_get(), paddr, 12,
+                                 current_cpu->cpu_index);
+        }
+        hamt_smc_bitmap_publish();
+    }
+
     uint8_t *ptwdata = hamt_get_ptwdata();
     assert(ptwdata == env->ptw4k);
     if (ptwdata[paddr >> 12] == 1) {
@@ -607,6 +640,16 @@ do_check_protect:
                                      ? hamt_large_page_bit(addr) : UINT32_MAX;
     }
     hamt_set_hardware_tlb_nocheck(env, addr, haddr, prot, 0);
+    if (hamt_smc_bitmap_enabled()) {
+        if (!option_smc_bitmap_rw || (prot & PAGE_WRITE)) {
+            hamt_smc_bitmap_mark(hamt_smc_bitmap_get(), paddr, 12,
+                                 current_cpu->cpu_index);
+        }
+    }
+    hamt_smc_bitmap_publish();
+    if (hamt_ptwdata_get_page(paddr) != 0) {
+        hamt_flush_tlb_all();
+    }
     return true;
 
 do_fault_rsvd:

@@ -46,6 +46,7 @@
 
 #include "hamt-options.h"
 #include "hamt-ptw.h"
+#include "hamt-smc-bitmap.h"
 #include "hamt-tlb.h"
 #include "hamt-va.h"
 #include "hamt-dmw.h"
@@ -1403,8 +1404,14 @@ extern void tlb_reset_dirty_range_all(ram_addr_t start, ram_addr_t length);
 bool tlb_code_page_is_protected(ram_addr_t ram_addr)
 {
 #ifdef CONFIG_LATX_HACK_MEM
-    return !latx_hack_gpa_in_ram(ram_addr) ||
-           hamt_ptwdata_smc_page_is_protected(ram_addr);
+    if (!latx_hack_gpa_in_ram(ram_addr)) {
+        return true;
+    }
+    if (!hamt_ptwdata_smc_page_is_protected(ram_addr)) {
+        return false;
+    }
+    return !hamt_smc_bitmap_enabled() ||
+           !hamt_smc_protect_pending(hamt_smc_bitmap_get(), ram_addr);
 #else
     return true;
 #endif
@@ -1417,12 +1424,27 @@ void tlb_protect_code(ram_addr_t ram_addr)
 #ifdef CONFIG_LATX_HACK_MEM
     if (latx_hack_gpa_in_ram(ram_addr)) {
         if (!hamt_ptwdata_smc_page_is_protected(ram_addr)) {
-            hamt_protect_code(qemu_ram_addr_to_gpa(ram_addr), 0);
+            uint64_t gpa = qemu_ram_addr_to_gpa(ram_addr);
+            bool bitmap_enabled = hamt_smc_bitmap_enabled();
+            HamtSmcBitmap *bitmap = bitmap_enabled ? hamt_smc_bitmap_get() : NULL;
+            bool pending = bitmap && hamt_smc_protect_begin(bitmap, ram_addr);
+
             hamt_ptwdata_smc_protect_page(ram_addr);
+            /* An alias with a different RAM offset needs the full fallback. */
+            hamt_protect_code(gpa, bitmap_enabled && gpa != ram_addr);
             tlb_reset_dirty_range_all(ram_addr & TARGET_PAGE_MASK,
                                       TARGET_PAGE_SIZE);
+            if (pending) {
+                hamt_smc_protect_end(bitmap, ram_addr);
+            }
         } else if (qemu_tcg_mttcg_enabled() && CPU_NEXT(first_cpu)) {
             /* Another vCPU may still be completing the first protection. */
+            if (hamt_smc_bitmap_enabled() &&
+                hamt_smc_protect_pending(hamt_smc_bitmap_get(), ram_addr)) {
+                uint64_t gpa = qemu_ram_addr_to_gpa(ram_addr);
+
+                hamt_protect_code(gpa, gpa != ram_addr);
+            }
             tlb_reset_dirty_range_all(ram_addr & TARGET_PAGE_MASK,
                                       TARGET_PAGE_SIZE);
         }

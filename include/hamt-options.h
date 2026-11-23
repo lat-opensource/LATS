@@ -13,6 +13,9 @@ extern int option_hamt_submode;
 extern int option_hamt_config;
 extern int option_hamt_dump;
 extern int option_hamt_print;
+extern int option_smc_bitmap;
+extern int option_smc_bitmap_rw;
+extern int option_smc_bitmap_flush;
 
 static inline int hamt_enabled(void) {
     return option_hamt;
@@ -79,6 +82,14 @@ static inline int hamt_use_ptw_inrefill_4K2(void) {
 }
 static inline int hamt_use_ptw_inrefill_4K2M(void) {
     return (option_hamt_config & 0xC0) == (0x3 << 6);
+}
+
+static inline bool hamt_smc_bitmap_enabled(void)
+{
+    return option_smc_bitmap && hamt_mode_dmw() &&
+           hamt_use_ptw() &&
+           (!hamt_use_ptw_inrefill() || hamt_use_ptw_inrefill_4K2M()) &&
+           !hamt_use_pgd() && hamt_enable_ipi() && hamt_enable_ipi_sync();
 }
 
 static inline bool hamt_do_cpl(int cpl) {

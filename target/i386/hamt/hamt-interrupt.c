@@ -48,25 +48,32 @@
 #include "hamt-exccode.h"
 #include "latx-sys-hamt.h"
 
-void hamt_prepare_ipi(int cpuid, int n)
+_Static_assert((HAMT_CPU_MAX - 1) * 8 < HAMT_IPI_SEQ_INDEX,
+               "IPI acknowledgement slots overlap the sequence");
+_Static_assert(HAMT_IPI_MASK_INDEX < 4096 / sizeof(uint64_t),
+               "IPI snapshot scratch exceeds its data page");
+
+uint64_t hamt_prepare_ipi(int cpuid, int n)
 {
     uint64_t *d = (void *)(hamt_ipi_data_area[cpuid]);
-    /**d = n - 1;*/
-    for(int i = 0; i < n; ++i) {
-        // 64 Bytes Cache Line Align
-        // d[0], d[8], d[16], d[24]
-        d[i<<3] = 0;
-    }
+    uint64_t sequence = qatomic_read(&d[HAMT_IPI_SEQ_INDEX]) + 1;
+
+    (void)n;
+    /* Zero is reserved for never acknowledged; wraparound is unsupported. */
+    g_assert(sequence != 0);
+    qatomic_set(&d[HAMT_IPI_SEQ_INDEX], sequence);
+    smp_mb();
+    return sequence;
 }
 
 int hamt_finish_ipi(int cpuid, uint64_t *r,
-        int n, int mask, int waitcpus)
+        int n, int mask, int waitcpus, uint64_t sequence)
 {
     uint64_t *d = (void *)(hamt_ipi_data_area[cpuid]);
     int res = 0;
     for (int i = 0; i < n; ++i) {
         if (i == cpuid || !(mask & (1<<i))) continue;
-        if (d[i<<3]) {
+        if (qatomic_read(&d[i << 3]) == sequence) {
             res += 1;
         }
     }

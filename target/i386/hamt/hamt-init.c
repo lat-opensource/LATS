@@ -45,6 +45,7 @@
 #include "hamt.h"
 #include "hamt-interrupt.h"
 #include "hamt-data.h"
+#include "hamt-smc-bitmap.h"
 #include "hamt-entry-func.h"
 #include "latx-sys-hamt.h"
 #include "error.h"
@@ -185,10 +186,18 @@ static void hamt_prepare_entry_tlb(int cpuid)
     if (tlb_refill_entry_size[cpuid]) return;
     HAMT_PREPARE_TLB_INIT();
 
-    hamt_excp_t d;
+    hamt_excp_t d = {0};
     d.codebase = hamt_entry_tlb_ptr;
     d.database = (void *)hamt_data_area[cpuid];
     d.subcodebase = tlb_refill_ptw[cpuid];
+    if (hamt_smc_bitmap_enabled()) {
+        HamtSmcBitmap *bitmap = hamt_smc_bitmap_get();
+        if (bitmap->vcpu && cpuid < 32) {
+            d.smc_bitmap_base = bitmap->vcpu[cpuid].words;
+            d.smc_bitmap_high_water = &bitmap->vcpu[cpuid].high_water;
+            d.smc_bitmap_words = bitmap->vcpu[cpuid].word_count;
+        }
+    }
     d.type  = HAMT_EXCP_ENTRY_TLBREFILL;
     d.verbose = HAMT_BUILD_VERBOSE;
 
@@ -426,10 +435,18 @@ static void hamt_prepare_int_ipi(int cpuid)
         hamt_interrupt_code_ptr = hamt_interrupt_code_base;
     }
 
-    hamt_excp_t d;
+    hamt_excp_t d = {0};
     d.codebase = hamt_interrupt_code_ptr;
     d.database = (void *)hamt_data_area[cpuid];
     d.database2 = (void *)hamt_ipi_data_area[cpuid];
+    if (hamt_smc_bitmap_enabled() && option_smc_bitmap_flush) {
+        HamtSmcBitmap *bitmap = hamt_smc_bitmap_get();
+        if (bitmap->vcpu && cpuid < 32) {
+            d.smc_bitmap_base = bitmap->vcpu[cpuid].words;
+            d.smc_bitmap_high_water = &bitmap->vcpu[cpuid].high_water;
+            d.smc_bitmap_words = bitmap->vcpu[cpuid].word_count;
+        }
+    }
     d.type = HAMT_EXCP_INTERRUPT_IPI;
     d.begin = &hamt_int_ipi_entry_begin[cpuid];
     d.end   = &hamt_int_ipi_entry_end[cpuid];

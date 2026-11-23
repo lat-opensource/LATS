@@ -41,6 +41,9 @@
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
 #include "latx-sigrt-sys.h"
+#if defined(TARGET_I386) && defined(CONFIG_LATX_HACK_MEM) && !defined(CONFIG_USER_ONLY)
+#include "hamt-ptw.h"
+#endif
 
 /* common functionality among all TCG variants */
 
@@ -73,6 +76,11 @@ int tcg_cpus_exec(CPUState *cpu)
     int ret;
     assert(tcg_enabled());
     cpu_exec_start(cpu);
+#if defined(TARGET_I386) && defined(CONFIG_LATX_HACK_MEM) && !defined(CONFIG_USER_ONLY)
+    /* Pair with the protector's deferred-flush publication. */
+    smp_mb();
+    hamt_smc_resume_flush(cpu);
+#endif
     offline_cpu = cpu;
     ret = cpu_exec(cpu);
     cpu_exec_end(cpu);
