@@ -23,4 +23,10 @@ void latx_helper_aot_cpu_query(CPUX86State *env, unsigned descriptor);
 void latx_helper_aot_system(CPUX86State *env, unsigned descriptor, uint64_t operand);
 void latx_helper_aot_x87(CPUX86State *env, unsigned descriptor, uint64_t operand);
 
+double latx_helper_log2(double x);
+double latx_helper_pow(double x, double y);
+double latx_helper_atan2(double y, double x);
+double latx_helper_cos(double x);
+double latx_helper_sin(double x);
+
 #endif

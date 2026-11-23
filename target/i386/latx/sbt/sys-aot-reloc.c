@@ -31,6 +31,13 @@ static uint32_t tu_rel_entry_num;
 static uint32_t tu_rel_table_capacity;
 static pthread_mutex_t tu_rel_table_lock;
 
+/* Local non-PIE wrappers keep libm helper addresses invariant under ASLR. */
+double latx_helper_log2(double x) { return log2(x); }
+double latx_helper_pow(double x, double y) { return pow(x, y); }
+double latx_helper_atan2(double y, double x) { return atan2(y, x); }
+double latx_helper_cos(double x) { return cos(x); }
+double latx_helper_sin(double x) { return sin(x); }
+
 uintptr_t relkind_to_fixup_addr[] = {
     [AOT_NATIVE_ATOMIC] =
         (uintptr_t)offsetof(struct latx_sc_table_t, aot_native_atomic),
@@ -375,11 +382,11 @@ uintptr_t relkind_to_fixup_addr[] = {
     [PF_TABLE] = (uintptr_t)pf_table,
     [UPDATE_FP_STATUS] = (uintptr_t)update_fp_status,
     [UPDATE_MXCSR_STATUS] = (uintptr_t)update_mxcsr_status,
-    [LOG2] = (uintptr_t)log2,
-    [POW] = (uintptr_t)pow,
-    [ATAN2] = (uintptr_t)atan2,
-    [COS] = (uintptr_t)cos,
-    [SIN] = (uintptr_t)sin,
+    [LOG2] = (uintptr_t)latx_helper_log2,
+    [POW] = (uintptr_t)latx_helper_pow,
+    [ATAN2] = (uintptr_t)latx_helper_atan2,
+    [COS] = (uintptr_t)latx_helper_cos,
+    [SIN] = (uintptr_t)latx_helper_sin,
     [LOAD_AES_Td0] = (uintptr_t)AES_Td0,
     [LOAD_AES_Td1] = (uintptr_t)AES_Td1,
     [LOAD_AES_Td2] = (uintptr_t)AES_Td2,

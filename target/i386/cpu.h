@@ -1681,6 +1681,8 @@ typedef struct CPUArchState {
     void *apic_state;
     void *hpet_state;
     void *timers_state;
+    uint64_t *hpet_vpages;
+    uint64_t *apic_vpages;
     uint32_t *interrupt_request_ptr;
 #ifdef CONFIG_LATX_TB_EXEC_TRACE
     void **tb_exec_trace;

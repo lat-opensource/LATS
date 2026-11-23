@@ -31,6 +31,8 @@ struct CPUArchState;
 bool hamt_switch_pcid(struct CPUArchState *env, uint64_t cr3, bool noflush);
 void hamt_flush_tlb_all(void);
 void hamt_flush_tlb_page(uint64_t vaddr);
+void hamt_flush_tlb_global_mmio(void);
+void hamt_flush_tlb_page_mmio(uint64_t vaddr);
 
 void hamt_set_tlb_simple(uint64_t ehi,
         uint64_t elo0, uint64_t elo1,

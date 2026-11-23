@@ -21,6 +21,9 @@
 #include "latx-native-asm.h"
 #include "latx-cp-counter.h"
 #include "latx-ras.h"
+#ifdef CONFIG_SOFTMMU
+#include "latx-sys-mmio.h"
+#endif
 #ifdef CONFIG_LATX_TU
 #include "./include/latx-tu.h"
 #endif
@@ -200,6 +203,8 @@ void latx_lsenv_init(CPUArchState *env)
 #endif
 
     env->timers_state = timers_state_ptr;
+    env->hpet_vpages = latx_mem_get_hpet_vpages();
+    env->apic_vpages = latx_mem_get_apic_vpages();
 #ifdef CONFIG_LATX_PRINT
     printf("%s:%d env %p timers_state %p\n", __func__, __LINE__,
             env, env->timers_state);

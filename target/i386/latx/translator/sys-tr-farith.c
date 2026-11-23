@@ -13,6 +13,7 @@
 #include "translate.h"
 #include "sys-excp.h"
 #include "sys-aot.h"
+#include "latx-helper.h"
 
 void latxs_sys_farith_register_ir1(void)
 {
@@ -698,7 +699,7 @@ bool latxs_translate_fsin(IR1_INST *pir1)
 
     latxs_tr_gen_call_to_helper_prologue_cfg(fplib_helper_cfg);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fparam0, &ftemp1);
-    latxs_tr_gen_call_to_helper((ADDR)sin, SIN);
+    latxs_tr_gen_call_to_helper((ADDR)latx_helper_sin, SIN);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fvalue, &fparam0);
     latxs_tr_gen_call_to_helper_epilogue_cfg(fplib_helper_cfg);
 
@@ -741,7 +742,7 @@ bool latxs_translate_fcos(IR1_INST *pir1)
 
     latxs_tr_gen_call_to_helper_prologue_cfg(fplib_helper_cfg);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fparam0, &ftemp1);
-    latxs_tr_gen_call_to_helper((ADDR)cos, COS);
+    latxs_tr_gen_call_to_helper((ADDR)latx_helper_cos, COS);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fvalue, &fparam0);
     latxs_tr_gen_call_to_helper_epilogue_cfg(fplib_helper_cfg);
 
@@ -790,7 +791,7 @@ bool latxs_translate_fpatan(IR1_INST *pir1)
     latxs_tr_gen_call_to_helper_prologue_cfg(fplib_helper_cfg);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fparam0, &ftemp2); /* st1 */
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fparam1, &ftemp1); /* st0 */
-    latxs_tr_gen_call_to_helper((ADDR)atan2, ATAN2);
+    latxs_tr_gen_call_to_helper((ADDR)latx_helper_atan2, ATAN2);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fvalue, &fparam0);
     latxs_tr_gen_call_to_helper_epilogue_cfg(fplib_helper_cfg);
 
@@ -1026,7 +1027,7 @@ bool latxs_translate_f2xm1(IR1_INST *pir1)
     latxs_tr_gen_call_to_helper_prologue_cfg(fplib_helper_cfg);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fparam0, &ftemp2);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fparam1, &ftemp1);
-    latxs_tr_gen_call_to_helper((ADDR)pow, POW);
+    latxs_tr_gen_call_to_helper((ADDR)latx_helper_pow, POW);
     latxs_append_ir2_opnd2(LISA_FMOV_D, &fvalue, &fparam0);
     latxs_tr_gen_call_to_helper_epilogue_cfg(fplib_helper_cfg);
 
@@ -1080,7 +1081,7 @@ bool latxs_translate_fyl2x(IR1_INST *pir1)
 
     latxs_append_ir2_opnd2(LISA_FMOV_D, &param_0, &param_tmp);
     /* Call the function  */
-    latxs_tr_gen_call_to_helper((ADDR)log2, LOG2);
+    latxs_tr_gen_call_to_helper((ADDR)latx_helper_log2, LOG2);
 
     IR2_OPND ret_opnd, ret_value;
     ret_opnd = latxs_ir2_opnd_new(IR2_OPND_FPR, 0);

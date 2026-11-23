@@ -26,7 +26,13 @@ bool latx_mem_is_apic(uint64_t paddr)
 void latx_mem_set_hpet_vpage(uint64_t addr);
 void latx_mem_clear_hpet_vpage(uint64_t addr);
 void latx_mem_clear_hpet_vpages(void);
+void latx_mem_clear_hpet_vpages_non_global(void);
 void latx_mem_set_apic_vpage(uint64_t addr);
+void latx_mem_clear_apic_vpage(uint64_t addr);
+void latx_mem_clear_apic_vpages(void);
+void latx_mem_clear_apic_vpages_non_global(void);
+uint64_t *latx_mem_get_hpet_vpages(void);
+uint64_t *latx_mem_get_apic_vpages(void);
 void latx_apic_mem_write(uint64_t addr, uint64_t val, unsigned size,
                          void *tcptr);
 

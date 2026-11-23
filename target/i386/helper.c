@@ -26,6 +26,7 @@
 #ifndef CONFIG_USER_ONLY
 #include "sysemu/hw_accel.h"
 #include "monitor/monitor.h"
+#include "hamt-tlb.h"
 #endif
 #include "qemu/log.h"
 #include "latx/include/latx-options.h"
@@ -130,6 +131,11 @@ void cpu_x86_update_cr0(CPUX86State *env, uint32_t new_cr0)
     int pe_state;
 
     qemu_log_mask(CPU_LOG_MMU, "CR0 update: CR0=0x%08x\n", new_cr0);
+#ifndef CONFIG_USER_ONLY
+    if ((new_cr0 ^ env->cr[0]) & CR0_PG_MASK) {
+        hamt_flush_tlb_global_mmio();
+    }
+#endif
     if ((new_cr0 & (CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK)) !=
         (env->cr[0] & (CR0_PG_MASK | CR0_WP_MASK | CR0_PE_MASK))) {
         tlb_flush(CPU(cpu));
@@ -192,6 +198,12 @@ void cpu_x86_update_cr4(CPUX86State *env, uint32_t new_cr4)
     if (option_pcid) {
         flush_bits |= CR4_PKE_MASK | CR4_PKS_MASK;
     }
+#ifndef CONFIG_USER_ONLY
+    if ((new_cr4 ^ env->cr[4]) &
+        (CR4_PGE_MASK | CR4_PAE_MASK | CR4_PSE_MASK | CR4_LA57_MASK)) {
+        hamt_flush_tlb_global_mmio();
+    }
+#endif
     if ((new_cr4 ^ env->cr[4]) & flush_bits) {
         tlb_flush(env_cpu(env));
     }
@@ -627,6 +639,9 @@ void do_cpu_sipi(X86CPU *cpu)
 void cpu_load_efer(CPUX86State *env, uint64_t val)
 {
 #ifndef CONFIG_USER_ONLY
+    if ((env->efer ^ val) & MSR_EFER_LMA) {
+        hamt_flush_tlb_global_mmio();
+    }
     if (option_pcid && ((env->efer ^ val) & (MSR_EFER_NXE | MSR_EFER_LMA))) {
         tlb_flush(env_cpu(env));
     }

@@ -279,6 +279,11 @@ void helper_invpcid(CPUX86State *env, target_ulong addr, uint32_t reg,
     if (option_pcid_stats) {
         qatomic_inc(&env->pcid_stats.invpcid[type]);
     }
+    if (type == 0) {
+        hamt_flush_tlb_page_mmio(linear);
+    } else if (type == 2) {
+        hamt_flush_tlb_global_mmio();
+    }
     /* Over-invalidation is permitted for all four architectural types. */
     tlb_flush(env_cpu(env));
 }
@@ -308,6 +313,7 @@ void helper_wrmsr(CPUX86State *env)
         break;
     case MSR_IA32_APICBASE:
         cpu_set_apic_base(env_archcpu(env)->apic_state, val);
+        hamt_flush_tlb_global_mmio();
         break;
     case MSR_EFER:
         {

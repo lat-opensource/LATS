@@ -956,6 +956,7 @@ static void tlb_flush_page_by_mmuidx_async_0(CPUState *cpu,
     }
     if (hamt_enabled() && hamt_is_running()) {
         if (large_page) {
+            hamt_flush_tlb_global_mmio();
             hamt_flush_tlb_all();
         } else {
             hamt_flush_tlb_page(addr);

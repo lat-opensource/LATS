@@ -50,6 +50,9 @@
 #include "latx/include/latx-options.h"
 #include "hamt-dmw.h"
 #include "hamt/hamt.h"
+#ifndef CONFIG_USER_ONLY
+#include "hamt-tlb.h"
+#endif
 
 static void x86_cpu_realizefn(DeviceState *dev, Error **errp);
 
@@ -6723,6 +6726,7 @@ static void x86_cpu_reset_hold(Object *obj)
     }
 
 #ifndef CONFIG_USER_ONLY
+    hamt_flush_tlb_global_mmio();
     /*
      * Guest reboot rewrites kernel text during decompression. Drop old
      * translations up front instead of invalidating them page by page.

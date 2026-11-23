@@ -23,33 +23,85 @@
 #include "qemu/qtree.h"
 #include "sys-aot.h"
 
+#define LATX_MMIO_KERNEL_VADDR_BASE 0xffff800000000000ULL
+
 uint64_t guest_hpet_base_ppage = 0xfed00000;
 uint64_t guest_hpet_base_vpage;
 int guset_hpet_base_vpage_stat;
 #define HPET_VPAGE_SLOTS 8
 static uint64_t guest_hpet_vpages[HPET_VPAGE_SLOTS];
+static uint32_t guest_hpet_vpage_evict;
 uint64_t guest_apic_base_ppage = 0xfee00000;
 uint64_t guest_apic_base_vpage;
 int guset_apic_base_vpage_stat;
+#define APIC_VPAGE_SLOTS 8
+static uint64_t guest_apic_vpages[APIC_VPAGE_SLOTS];
+static uint32_t guest_apic_vpage_evict;
 
 void latxs_tb_jmp_unlink(TranslationBlock *dest);
 
-void latx_mem_set_hpet_vpage(uint64_t addr)
+static void mmio_vpage_set(uint64_t *slots, int nslots, uint32_t *evict,
+                           uint64_t page)
 {
-    uint64_t page = addr & ~0xfffULL;
     int i;
 
-    for (i = 0; i < HPET_VPAGE_SLOTS; i++) {
-        uint64_t old = qatomic_read(&guest_hpet_vpages[i]);
+    if (page == 0) {
+        return;
+    }
+    for (i = 0; i < nslots; i++) {
+        uint64_t old = qatomic_read(&slots[i]);
 
         if (old == page) {
             return;
         }
-        if (old == 0 &&
-            qatomic_cmpxchg(&guest_hpet_vpages[i], 0, page) == 0) {
-            break;
+        if (old == 0 && qatomic_cmpxchg(&slots[i], 0, page) == 0) {
+            return;
         }
     }
+    qatomic_set(&slots[qatomic_fetch_inc(evict) & (nslots - 1)], page);
+}
+
+static void mmio_vpage_clear(uint64_t *slots, int nslots, uint64_t page)
+{
+    int i;
+
+    for (i = 0; i < nslots; i++) {
+        if (qatomic_read(&slots[i]) == page) {
+            qatomic_cmpxchg(&slots[i], page, 0);
+        }
+    }
+}
+
+static void mmio_vpage_clear_all(uint64_t *slots, int nslots)
+{
+    int i;
+
+    for (i = 0; i < nslots; i++) {
+        if (qatomic_read(&slots[i]) != 0) {
+            qatomic_set(&slots[i], 0);
+        }
+    }
+}
+
+static void mmio_vpage_clear_non_global(uint64_t *slots, int nslots)
+{
+    int i;
+
+    for (i = 0; i < nslots; i++) {
+        uint64_t old = qatomic_read(&slots[i]);
+
+        if (old != 0 && old < LATX_MMIO_KERNEL_VADDR_BASE) {
+            qatomic_cmpxchg(&slots[i], old, 0);
+        }
+    }
+}
+
+void latx_mem_set_hpet_vpage(uint64_t addr)
+{
+    uint64_t page = addr & ~0xfffULL;
+
+    mmio_vpage_set(guest_hpet_vpages, HPET_VPAGE_SLOTS,
+                   &guest_hpet_vpage_evict, page);
     if (guset_hpet_base_vpage_stat == 0) {
         guset_hpet_base_vpage_stat = 1;
         guest_hpet_base_vpage = page;
@@ -68,26 +120,25 @@ void latx_mem_set_hpet_vpage(uint64_t addr)
 
 void latx_mem_clear_hpet_vpage(uint64_t addr)
 {
-    uint64_t page = addr & ~0xfffULL;
-    int i;
-
-    for (i = 0; i < HPET_VPAGE_SLOTS; i++) {
-        qatomic_cmpxchg(&guest_hpet_vpages[i], page, 0);
-    }
+    mmio_vpage_clear(guest_hpet_vpages, HPET_VPAGE_SLOTS, addr & ~0xfffULL);
 }
 
 void latx_mem_clear_hpet_vpages(void)
 {
-    int i;
+    mmio_vpage_clear_all(guest_hpet_vpages, HPET_VPAGE_SLOTS);
+}
 
-    for (i = 0; i < HPET_VPAGE_SLOTS; i++) {
-        qatomic_set(&guest_hpet_vpages[i], 0);
-    }
+void latx_mem_clear_hpet_vpages_non_global(void)
+{
+    mmio_vpage_clear_non_global(guest_hpet_vpages, HPET_VPAGE_SLOTS);
 }
 
 void latx_mem_set_apic_vpage(uint64_t addr)
 {
     uint64_t page = addr & ~0xfffULL;
+
+    mmio_vpage_set(guest_apic_vpages, APIC_VPAGE_SLOTS,
+                   &guest_apic_vpage_evict, page);
     if (guset_apic_base_vpage_stat == 0) {
         guset_apic_base_vpage_stat = 1;
         guest_apic_base_vpage = page;
@@ -102,6 +153,31 @@ void latx_mem_set_apic_vpage(uint64_t addr)
                 guest_apic_base_vpage, page);
     }
 #endif
+}
+
+void latx_mem_clear_apic_vpage(uint64_t addr)
+{
+    mmio_vpage_clear(guest_apic_vpages, APIC_VPAGE_SLOTS, addr & ~0xfffULL);
+}
+
+void latx_mem_clear_apic_vpages(void)
+{
+    mmio_vpage_clear_all(guest_apic_vpages, APIC_VPAGE_SLOTS);
+}
+
+void latx_mem_clear_apic_vpages_non_global(void)
+{
+    mmio_vpage_clear_non_global(guest_apic_vpages, APIC_VPAGE_SLOTS);
+}
+
+uint64_t *latx_mem_get_hpet_vpages(void)
+{
+    return guest_hpet_vpages;
+}
+
+uint64_t *latx_mem_get_apic_vpages(void)
+{
+    return guest_apic_vpages;
 }
 
 void latx_do_mmio_detected_tb_invalidate(TranslationBlock *tb);
@@ -322,6 +398,16 @@ void latx_do_mmio_detected_tb_invalidate(TranslationBlock *tb)
 
 extern QemuMutex qemu_global_mutex;
 
+static void emit_global_mutex_unlock(IR2_OPND *t0)
+{
+    la_outi(LISA_DBAR, 0x0);
+    la_out2i(LISA_LD_D, t0, &la_env, offsetof(CPUX86State, qemu_global_mutex_ptr));
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_fix_mem(t0);
+    }
+    la_out2i(LISA_ST_W, &la_zero, t0, 0);
+}
+
 static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
 {
     IR2_OPND t0 = la_new_itmp();
@@ -329,27 +415,27 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
     IR2_OPND t2 = la_new_itmp();
     IR2_OPND t3 = la_new_itmp();
     IR2_OPND t4 = la_new_itmp();
+    IR2_OPND out_unlock = la_new_label();
+    IR2_OPND s2 = la_new_label();
 
-// (0) spin lock
-//    printf("%s:%d global mutex spin at %p\n", __func__, __LINE__,
-//            (void *)&(qemu_global_mutex.spin));
+// (0) spin lock (TTAS)
     IR2_OPND loop = la_new_label();
-    //la_imm(&t0, (uint64_t)(&(qemu_global_mutex.spin)));
     la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, qemu_global_mutex_ptr));
     if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t0);
-    la_label_name(loop, "LOOP: global mutex spin lock");
-    la_out2i(LISA_ADDI_D, &t1, &la_zero, 0x0);
     la_out2i(LISA_ADDI_D, &t2, &la_zero, 0x1);
+    la_label_name(loop, "LOOP: global mutex spin lock");
+    la_out2i(LISA_LD_W, &t1, &t0, 0);
+    la_out2(LISA_BNEZ, &t1, &loop);
     la_out3(LISA_AMSWAP_DB_W, &t1, &t0, &t2);
     la_out2(LISA_BNEZ, &t1, &loop);
     la_comment("back to LOOP if lock fail");
 
     // t0 = &apic_state
     la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, apic_state));
+    la_out2(LISA_BEQZ, &t0, &out_unlock);
     if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t0);
-
-    IR2_OPND out_unlock = la_new_label();
-    IR2_OPND s2 = la_new_label();
+    la_out2i(LISA_LD_D, &t2, &t0, offsetof(APICCommonState, vapic_paddr));
+    la_out2(LISA_BNEZ, &t2, label_exit);
 
 // (1) int isrv = get_highest_priority_int(s->isr);
     la_out2i(LISA_ADDI_D, &t2, &la_zero, 32);
@@ -457,13 +543,40 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
 
 // (-) apic_sync_vapic(s, SYNC_FROM_VAPIC | SYNC_TO_VAPIC);
 
-// (5)  apic_update_irq(s);
+// (5)  apic_update_irq(s) when irr[] != 0 or CPU_INTERRUPT_HARD is set
+    IR2_OPND need_poll = la_new_label();
+
+    la_out2i(LISA_LD_WU, &t1, &t0, offsetof(APICCommonState, irr[0]));
+    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[1]));
+    la_out3(LISA_OR, &t1, &t1, &t2);
+    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[2]));
+    la_out3(LISA_OR, &t1, &t1, &t2);
+    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[3]));
+    la_out3(LISA_OR, &t1, &t1, &t2);
+    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[4]));
+    la_out3(LISA_OR, &t1, &t1, &t2);
+    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[5]));
+    la_out3(LISA_OR, &t1, &t1, &t2);
+    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[6]));
+    la_out3(LISA_OR, &t1, &t1, &t2);
+    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[7]));
+    la_out3(LISA_OR, &t1, &t1, &t2);
+
     la_out2i(LISA_LD_D, &t2, &la_env, offsetof(CPUX86State, interrupt_request_ptr));
     if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t2);
     la_out2i(LISA_LD_WU, &t4, &t2, 0);
-    la_out2i(LISA_ORI,   &t4, &t4, 0x10); // CPU_INTERRUPT_POLL
-    la_out2i(LISA_ST_W,  &t4, &t2, 0);
-    la_comment("cpu->interrupt_requset |= CPU_INTERRUPT_POLL");
+    la_out2(LISA_BNEZ, &t1, &need_poll);
+    la_out2i(LISA_ANDI, &t3, &t4, CPU_INTERRUPT_HARD);
+    la_out2(LISA_BNEZ, &t3, &need_poll);
+
+    la_out2i(LISA_ADDI_D, &t3, &la_zero, -1);
+    la_out2i(LISA_ST_W, &t3, &la_env, lsenv_offset_of_irrv(lsenv));
+    la_out1(LISA_B, &out_unlock);
+
+    la_label_name(need_poll, "EOI pending IRQ -> trigger poll");
+    la_out2i(LISA_ORI, &t4, &t4, CPU_INTERRUPT_POLL);
+    la_out2i(LISA_ST_W, &t4, &t2, 0);
+    la_comment("cpu->interrupt_request |= CPU_INTERRUPT_POLL");
     la_out2i(LISA_ADDI_D, &t4, &la_zero, -1);
     la_out2i(LISA_ST_W, &t4, &la_env,
                              (int)offsetof(X86CPU, neg.icount_decr.u32) -
@@ -472,11 +585,7 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
 
 // (6)  spin unlock
     la_label_name(out_unlock, "spin unlock and out");
-    la_outi(LISA_DBAR, 0x0);
-    //la_imm(&t0, (uint64_t)(&(qemu_global_mutex.spin)));
-    la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, qemu_global_mutex_ptr));
-    if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t0);
-    la_out2i(LISA_ST_W, &la_zero, &t0, 0);
+    emit_global_mutex_unlock(&t0);
 
     la_tmp_free(t0);
     la_tmp_free(t1);
@@ -485,6 +594,179 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
     la_tmp_free(t4);
 }
 
+#endif
+
+static void emit_apic_vpage_check(IR2_OPND *vaddr, int offset,
+                                  IR2_OPND *fast_label,
+                                  IR2_OPND *fallback_label,
+                                  IR2_OPND *t0, IR2_OPND *t1,
+                                  IR2_OPND *t2, IR2_OPND *t3)
+{
+    int i;
+
+    la_imm(t1, ~0xfffULL);
+    la_out3(LISA_AND, t3, vaddr, t1);
+    la_out2(LISA_BEQZ, t3, fallback_label);
+    la_out2i(LISA_ANDI, t2, vaddr, 0xfff);
+    la_out2i(LISA_ADDI_D, t1, &la_zero, offset);
+    la_out3(LISA_BNE, t2, t1, fallback_label);
+    la_out2i(LISA_LD_D, t0, &la_env, offsetof(CPUX86State, apic_vpages));
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_fix_mem(t0);
+    }
+    for (i = 0; i < APIC_VPAGE_SLOTS; i++) {
+        la_out2i(LISA_LD_D, t2, t0, i * sizeof(uint64_t));
+        la_out3(LISA_BEQ, t3, t2, fast_label);
+    }
+    la_out1(LISA_B, fallback_label);
+}
+
+static void emit_apic_mem_write_helper(IR1_OPND *src, int os, uint64_t vaddr)
+{
+    IR2_OPND tmp = la_new_itmp();
+
+    latxs_load_ir1_to_ir2(&tmp, src, EXMode_N);
+    latxs_tr_gen_call_to_helper_prologue_cfg(default_helper_cfg);
+    la_imm(&la_a0, vaddr);
+    la_out2_(lisa_mov, &la_a1, &tmp);
+    la_out2i(LISA_ORI, &la_a2, &la_zero, os);
+    la_out1i(LISA_PCADDI, &la_a3, 0);
+    latxs_tr_gen_call_to_helper((ADDR)latx_apic_mem_write, LATX_APIC_MEM_WRITE);
+    latxs_tr_gen_call_to_helper_epilogue_cfg(default_helper_cfg);
+    la_tmp_free(tmp);
+}
+
+static void latxs_translate_mov_from_apic_icr(IR1_OPND *dst, IR1_OPND *src,
+                                              int offset)
+{
+    IR2_OPND apic_fast = la_new_label();
+    IR2_OPND apic_fallback = la_new_label();
+    IR2_OPND apic_done = la_new_label();
+    IR2_OPND t4 = la_new_itmp();
+
+    latxs_convert_mem_opnd_no_offset(&t4, src);
+
+    IR2_OPND t0 = la_new_itmp();
+    IR2_OPND t1 = la_new_itmp();
+    IR2_OPND t2 = la_new_itmp();
+    IR2_OPND t3 = la_new_itmp();
+
+    emit_apic_vpage_check(&t4, offset, &apic_fast, &apic_fallback,
+                          &t0, &t1, &t2, &t3);
+
+    la_label_name(apic_fast, "inline APIC ICR read");
+    la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, apic_state));
+    la_out2(LISA_BEQZ, &t0, &apic_fallback);
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_fix_mem(&t0);
+    }
+    la_out2i(LISA_LD_WU, &t1, &t0,
+             offset == 0x300 ? offsetof(APICCommonState, icr[0]) :
+                               offsetof(APICCommonState, icr[1]));
+    latxs_store_ir2_to_ir1(&t1, dst);
+    la_out1(LISA_B, &apic_done);
+
+    la_tmp_free(t0);
+    la_tmp_free(t2);
+    la_tmp_free(t3);
+    la_tmp_free(t4);
+
+    la_label_name(apic_fallback, "non-APIC ICR read fallback");
+    lsenv->tr_data->inst_do_opt_mmio = 0;
+    latxs_load_ir1_to_ir2(&t1, src, EXMode_N);
+    latxs_store_ir2_to_ir1(&t1, dst);
+
+    la_label_name(apic_done, "APIC ICR read done");
+    la_tmp_free(t1);
+}
+
+static void latxs_translate_mov_to_apic_icr_hi(IR1_OPND *dst, IR1_OPND *src)
+{
+    IR2_OPND apic_fast = la_new_label();
+    IR2_OPND apic_fallback = la_new_label();
+    IR2_OPND apic_done = la_new_label();
+    IR2_OPND t4 = la_new_itmp();
+
+    latxs_convert_mem_opnd_no_offset(&t4, dst);
+
+    IR2_OPND t0 = la_new_itmp();
+    IR2_OPND t1 = la_new_itmp();
+    IR2_OPND t2 = la_new_itmp();
+    IR2_OPND t3 = la_new_itmp();
+
+    emit_apic_vpage_check(&t4, 0x310, &apic_fast, &apic_fallback,
+                          &t0, &t1, &t2, &t3);
+
+    la_tmp_free(t2);
+    la_tmp_free(t3);
+    la_tmp_free(t4);
+
+    la_label_name(apic_fast, "inline APIC ICR-hi write");
+    la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, apic_state));
+    la_out2(LISA_BEQZ, &t0, &apic_fallback);
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_fix_mem(&t0);
+    }
+    latxs_load_ir1_to_ir2(&t1, src, EXMode_N);
+    la_out2i(LISA_ST_W, &t1, &t0, offsetof(APICCommonState, icr[1]));
+    la_out1(LISA_B, &apic_done);
+
+    la_tmp_free(t0);
+
+    la_label_name(apic_fallback, "non-APIC ICR-hi write fallback");
+    lsenv->tr_data->inst_do_opt_mmio = 0;
+    latxs_load_ir1_to_ir2(&t1, src, EXMode_N);
+    latxs_store_ir2_to_ir1(&t1, dst);
+
+    la_label_name(apic_done, "APIC ICR-hi write done");
+    la_tmp_free(t1);
+}
+
+#ifdef CONFIG_LATX_OPT_BQL
+static void latxs_translate_mov_to_apic_eoi_mem(IR1_OPND *dst, IR1_OPND *src)
+{
+    IR2_OPND eoi_fast = la_new_label();
+    IR2_OPND eoi_slow_unlock = la_new_label();
+    IR2_OPND apic_fallback = la_new_label();
+    IR2_OPND eoi_done = la_new_label();
+    IR2_OPND t4 = la_new_itmp();
+
+    latxs_convert_mem_opnd_no_offset(&t4, dst);
+
+    IR2_OPND t0 = la_new_itmp();
+    IR2_OPND t1 = la_new_itmp();
+    IR2_OPND t2 = la_new_itmp();
+    IR2_OPND t3 = la_new_itmp();
+
+    emit_apic_vpage_check(&t4, 0xb0, &eoi_fast, &apic_fallback,
+                          &t0, &t1, &t2, &t3);
+
+    la_tmp_free(t0);
+    la_tmp_free(t1);
+    la_tmp_free(t2);
+    la_tmp_free(t3);
+    la_tmp_free(t4);
+
+    la_label_name(eoi_fast, "inline APIC [reg+0xb0] EOI");
+    latxs_translate_mov_to_apic_eoi(&eoi_slow_unlock);
+    la_out1(LISA_B, &eoi_done);
+
+    la_label_name(eoi_slow_unlock, "APIC [reg+0xb0] EOI slowpath unlock");
+    IR2_OPND utmp = la_new_itmp();
+    emit_global_mutex_unlock(&utmp);
+    la_tmp_free(utmp);
+    emit_apic_mem_write_helper(src, ir1_opnd_size(dst), 0xb0);
+    la_out1(LISA_B, &eoi_done);
+
+    la_label_name(apic_fallback, "non-APIC EOI write fallback");
+    lsenv->tr_data->inst_do_opt_mmio = 0;
+    IR2_OPND ftmp = la_new_itmp();
+    latxs_load_ir1_to_ir2(&ftmp, src, EXMode_N);
+    latxs_store_ir2_to_ir1(&ftmp, dst);
+    la_tmp_free(ftmp);
+
+    la_label_name(eoi_done, "APIC [reg+0xb0] EOI done");
+}
 #endif
 
 bool latxs_translate_mov_opt_apic(IR1_INST *pir1)
@@ -509,6 +791,31 @@ bool latxs_translate_mov_opt_apic(IR1_INST *pir1)
         return false;
     }
 
+    /* APIC [reg+0x300] / [reg+0x310] ICR lockless read fastpath */
+    if (ir1_opnd_is_gpr(opnd0) && ir1_opnd_is_mem(opnd1) &&
+        ir1_opnd_size(opnd0) == 32 && ir1_opnd_size(opnd1) == 32) {
+        int offset = ir1_opnd_simm(opnd1);
+        if (offset == 0x300 || offset == 0x310) {
+            latxs_translate_mov_from_apic_icr(opnd0, opnd1, offset);
+            return true;
+        }
+    }
+    /* APIC [reg+0x310] ICR-high lockless write & [reg+0xb0] EOI fastpath */
+    if (ir1_opnd_is_mem(opnd0) && ir1_opnd_has_base(opnd0) &&
+        ir1_opnd_size(opnd0) == 32) {
+        int offset = ir1_opnd_simm(opnd0);
+        if (offset == 0x310) {
+            latxs_translate_mov_to_apic_icr_hi(opnd0, opnd1);
+            return true;
+        }
+#ifdef CONFIG_LATX_OPT_BQL
+        if (offset == 0xb0 && option_int_opt != IRQ_CHECK_ASYNC_NOTIFY) {
+            latxs_translate_mov_to_apic_eoi_mem(opnd0, opnd1);
+            return true;
+        }
+#endif
+    }
+
     if (!ir1_opnd_is_mem(opnd0))   return false;
     if (ir1_opnd_has_base(opnd0))  return false;
     if (ir1_opnd_has_index(opnd0)) return false;
@@ -530,7 +837,7 @@ bool latxs_translate_mov_opt_apic(IR1_INST *pir1)
     int id = (vaddr & 0xfff);
     IR2_OPND eoi_opt_ok = la_new_label();
     int do_eoi_opt = 0;
-    if (id == 0xb0) {
+    if (id == 0xb0 && option_int_opt != IRQ_CHECK_ASYNC_NOTIFY) {
         do_eoi_opt = 1;
 #ifdef LATX_SYS_DEBUG_OPT_MMIO
         printf("%s:%d TB %p opt apic eoi\n",
@@ -543,33 +850,13 @@ bool latxs_translate_mov_opt_apic(IR1_INST *pir1)
 
         la_label_name(label_exit, "EOI opt fail, fallback");
         IR2_OPND t0 = la_new_itmp();
-        la_outi(LISA_DBAR, 0x0);
-        //la_imm(&t0, (uint64_t)(&(qemu_global_mutex.spin)));
-        la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, qemu_global_mutex_ptr));
-        if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t0);
-        la_out2i(LISA_ST_W, &la_zero, &t0, 0);
+        emit_global_mutex_unlock(&t0);
         la_comment("global mutex spin unlock");
         la_tmp_free(t0);
     }
 #endif
 
-    IR2_OPND tmp = la_new_itmp();
-    latxs_load_ir1_to_ir2(&tmp, opnd1, EXMode_N);
-    int os = ir1_opnd_size(opnd0);
-
-    latxs_tr_gen_call_to_helper_prologue_cfg(default_helper_cfg);
-
-//    la_out2i(LISA_ORI, &la_a0, &la_zero, id);
-    la_imm(&la_a0, vaddr);
-    la_out2_(lisa_mov, &la_a1, &tmp);
-    la_out2i(LISA_ORI, &la_a2, &la_zero, os);
-    la_out1i(LISA_PCADDI, &la_a3, 0);
-
-    latxs_tr_gen_call_to_helper((ADDR)latx_apic_mem_write, LATX_APIC_MEM_WRITE);
-
-    latxs_tr_gen_call_to_helper_epilogue_cfg(default_helper_cfg);
-
-    la_tmp_free(tmp);
+    emit_apic_mem_write_helper(opnd1, ir1_opnd_size(opnd0), vaddr);
 
 #ifdef CONFIG_LATX_OPT_BQL
     if (do_eoi_opt) {
@@ -646,7 +933,7 @@ bool latxs_translate_mov_opt_hpet(IR1_INST *pir1)
     int offset;
     int i;
 
-    if (!option_opt_mmio_hpet() || option_aot_save) {
+    if (!option_opt_mmio_hpet()) {
         return false;
     }
 
@@ -686,7 +973,7 @@ bool latxs_translate_mov_opt_hpet(IR1_INST *pir1)
     la_out2i(LISA_ANDI, &t2, &t4, 0xfff);
     la_out2i(LISA_ADDI_D, &t1, &la_zero, offset);
     la_out3(LISA_BNE, &t2, &t1, &hpet_fallback);
-    la_imm(&t0, (uint64_t)guest_hpet_vpages);
+    la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, hpet_vpages));
     if (hamt_enabled()) {
         latxs_tr_dmw_in_fix_mem(&t0);
     }

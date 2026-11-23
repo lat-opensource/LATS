@@ -111,7 +111,8 @@ static inline void local_flush_tlb_all(void)
         ".word ((0x6498000) | (0 << 10) | (0 << 5) | 0x3)\n\t"
         );
     enable_pg();
-    latx_mem_clear_hpet_vpages();
+    latx_mem_clear_hpet_vpages_non_global();
+    latx_mem_clear_apic_vpages_non_global();
 }
 
 static inline uint32_t guest_asid(void)
@@ -153,7 +154,8 @@ bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
         }
     }
     env->hamt_guest_asid = asid;
-    latx_mem_clear_hpet_vpages();
+    latx_mem_clear_hpet_vpages_non_global();
+    latx_mem_clear_apic_vpages_non_global();
     return true;
 }
 
@@ -225,6 +227,9 @@ void hamt_flush_tlb_page(uint64_t vaddr)
 {
     CPUX86State *env = current_cpu->env_ptr;
 
+    latx_mem_clear_hpet_vpage(vaddr);
+    latx_mem_clear_apic_vpage(vaddr);
+
     /* Tagged or shared hardware contexts may contain other copies. */
     if (option_pcid_asid || !qemu_tcg_mttcg_enabled() ||
         (env->hamt_large_page_bits & hamt_large_page_bit(vaddr))) {
@@ -233,7 +238,18 @@ void hamt_flush_tlb_page(uint64_t vaddr)
     }
     hamt_set_tlb((current_cpu->env_ptr),
             vaddr, 0x0, 0x0, false);
+}
+
+void hamt_flush_tlb_global_mmio(void)
+{
+    latx_mem_clear_hpet_vpages();
+    latx_mem_clear_apic_vpages();
+}
+
+void hamt_flush_tlb_page_mmio(uint64_t vaddr)
+{
     latx_mem_clear_hpet_vpage(vaddr);
+    latx_mem_clear_apic_vpage(vaddr);
 }
 
 static void hamt_set_tlbr(uint64_t vaddr, uint64_t paddr,
