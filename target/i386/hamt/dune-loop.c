@@ -48,6 +48,7 @@
 #include "latx-options.h"
 #include "qemu/error-report.h"
 #include "tcg/tcg.h"
+#include "accel/tcg/internal.h"
 
 #ifdef LOONGARCH_NEW_WORLD
 #undef KVM_REG_LOONGARCH
@@ -276,6 +277,8 @@ static void dune_capture_native_interrupt(struct dune_kvm_cpu *vcpu)
 void dune_loop(struct dune_kvm_cpu *vcpu)
 {
     while (true) {
+        /* No PageDesc lock may be held while guest code runs. */
+        tb_release_ctx_page_locks();
         hamt_start_running();
         long err = dune_kvm_run(vcpu->vcpu_fd);
         int run_errno = err < 0 ? -err : 0;

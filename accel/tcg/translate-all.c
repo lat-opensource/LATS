@@ -1021,6 +1021,12 @@ relock:
         tb_unlock_ctx_pages(1);
         goto relock;
     case GENCODE_ERR_TB_ONESHOT: /* generate one-shot TB without caching it */
+        /*
+         * A one-shot TB has no cached page (page_addr0 == -1); either the
+         * first page was MMIO (phys_pc == -1) or translator_access() already
+         * called tb_unlock_pages() before clearing page_addr0.  So no page
+         * lock is held here.
+         */
         return tb;
     default:
         g_assert_not_reached();

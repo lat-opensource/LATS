@@ -72,6 +72,8 @@ i386_ss.add(files(
 ))
 
 i386_ss.add(capStone)
+# sys-tr-farith.c calls sin()/cos()/atan2() directly when not using softfloat.
+i386_ss.add(libm)
 
 subdir('ir1')
 subdir('ir2')
