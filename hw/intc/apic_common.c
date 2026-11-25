@@ -269,8 +269,16 @@ static void apic_common_realize(DeviceState *dev, Error **errp)
     info = APIC_COMMON_GET_CLASS(s);
     info->realize(dev, errp);
 
-    /* Note: We need at least 1M to map the VAPIC option ROM */
-    if (!vapic && s->vapic_control & VAPIC_ENABLE_MASK &&
+    /*
+     * The VAPIC option ROM is a KVM-in-kernel TPR optimization.  It is not
+     * usable when the x86 APIC is emulated in userspace (TCG/LATS): the ROM
+     * code and its VAPIC data page share one physical page, so every APIC
+     * update would invalidate the ROM's own code and can livelock SMP guests
+     * (notably Windows XP setup).
+     *
+     * Note: We need at least 1M to map the VAPIC option ROM.
+     */
+    if (!vapic && kvm_enabled() && s->vapic_control & VAPIC_ENABLE_MASK &&
         !hax_enabled() && current_machine->ram_size >= 1024 * 1024) {
         vapic = sysbus_create_simple("kvmvapic", -1, NULL);
     }
