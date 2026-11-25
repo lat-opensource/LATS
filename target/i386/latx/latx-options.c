@@ -2408,11 +2408,12 @@ void latxs_options_init(void)
 #ifdef CONFIG_SOFTMMU
     option_opt_syscall = 2; // opt_syscall
     option_opt_sysret = 1; // opt_sysret
+    option_opt_iret = 1; // opt_iret
 #else /* user mode */
     option_opt_syscall = 0; // opt_syscall
     option_opt_sysret = 0; // opt_sysret
-#endif
     option_opt_iret = 0; // opt_iret
+#endif
     option_opt_rdtsc_rdtscp = 1; //use rdtime_d for rdtsc
 #ifdef CONFIG_TSC_FREQ
     option_opt_rdtsc_freq = probe_cpu_max_freq();

@@ -1990,23 +1990,6 @@ static inline void fast_get_seg_limit(IR2_OPND *e1, IR2_OPND *e2, IR2_OPND *limi
     la_out1(LISA_LABEL, &label_end);
 }
 
-static inline void fast_get_seg_base(IR2_OPND *e1, IR2_OPND *e2, IR2_OPND *base)
-{
-    IR2_OPND tmp0 = latxs_arg0_ir2_opnd;
-
-    /* (e1 >> 16) | ((e2 & 0xff) << 16) | (e2 & 0xff000000) */
-    la_out2i(LISA_SRLI_D, base, e1, 16);
-    la_out2i(LISA_ANDI, &tmp0, e2, 0xff);
-    la_out2i(LISA_SLLI_D, &tmp0, &tmp0, 16);
-
-    la_out3(LISA_OR, base, base, &tmp0);
-
-    latxs_load_imm64(&tmp0, 0xff000000);
-    la_out3(LISA_AND, &tmp0, e2, &tmp0);
-
-    la_out3(LISA_OR, base, base, &tmp0);
-}
-
 /*
  * copy from cpu_sync_bndcs_hflags(CPUX86State *env),
  *
@@ -2121,72 +2104,6 @@ static inline void fast_cpu_x86_load_seg_cache(
         lsenv_offset_of_hflags(lsenv));
 }
 
-static inline void fast_validate_seg(X86Seg seg_reg, IR2_OPND *cpl)
-{
-    IR2_OPND dpl = latxs_arg0_ir2_opnd;
-    IR2_OPND tmp0 = latxs_arg1_ir2_opnd;
-    IR2_OPND tmp1 = latxs_arg2_ir2_opnd;
-
-    IR2_OPND end = latxs_ir2_opnd_new_label();
-    IR2_OPND label_normal = latxs_ir2_opnd_new_label();
-
-    if (seg_reg != R_FS && seg_reg != R_GS) {
-        la_out1(LISA_B, &label_normal);
-    }
-
-    /* if ((env->segs[seg_reg].selector & 0xfffc) == 0), return */
-    la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_selector(lsenv, seg_reg));
-    latxs_load_imm64(&tmp1, 0xfffc);
-    la_out3(LISA_AND, &tmp0, &tmp0, &tmp1);
-    la_out2(LISA_BEQZ, &tmp0, &end);
-
-    la_out1(LISA_LABEL, &label_normal);
-
-    IR2_OPND base = latxs_ra_alloc_itemp();
-    IR2_OPND limit = latxs_ra_alloc_itemp();
-    IR2_OPND flags = latxs_ra_alloc_itemp();
-
-    la_out2i(LISA_LD_WU, &flags, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_flags(lsenv, seg_reg));
-
-    la_out2i(LISA_SRLI_D, &dpl, &flags, DESC_DPL_SHIFT);
-    la_out2i(LISA_ANDI, &dpl, &dpl, 3);
-
-    /* if ((e2 & DESC_CS_MASK) && (e2 & DESC_C_MASK)), goto end */
-    la_out2i(LISA_ANDI, &tmp0, &flags, DESC_C_MASK | DESC_CS_MASK);
-    latxs_load_imm64(&tmp1, DESC_C_MASK | DESC_CS_MASK);
-    la_out3(LISA_BEQ, &tmp0, &tmp1, &end);
-
-    /* if (dpl >= cpl), goto end */
-    la_out3(LISA_BGE, &dpl, cpl, &end);
-
-    /*
-     * cpu_x86_load_seg_cache_latx(env, seg_reg, 0,
-     *                        env->segs[seg_reg].base,
-     *                        env->segs[seg_reg].limit,
-     *                        env->segs[seg_reg].flags & ~DESC_P_MASK);
-     */
-    la_out2i(LISA_LD_D, &base, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_base(lsenv, seg_reg));
-    la_out2i(LISA_LD_WU, &limit, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_limit(lsenv, seg_reg));
-    la_out2i(LISA_LD_WU, &flags, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_flags(lsenv, seg_reg));
-
-    latxs_load_imm64(&tmp0, DESC_P_MASK);
-    la_out3(LISA_ANDN, &flags, &flags, &tmp0);
-
-    fast_cpu_x86_load_seg_cache(seg_reg,
-                                &la_zero, &base, &limit, &flags);
-
-    la_out1(LISA_LABEL, &end);
-
-    latxs_ra_free_temp(&flags);
-    latxs_ra_free_temp(&base);
-    latxs_ra_free_temp(&limit);
-}
-
 static void latxs_iret_save_native_xmms(void)
 {
 #if defined(CONFIG_LATX_HACK_MEM) && defined(CONFIG_SOFTMMU)
@@ -2207,6 +2124,45 @@ static void latxs_iret_save_native_xmms(void)
 #endif
 }
 
+#ifdef CONFIG_SOFTMMU
+static void latxs_iret_validate_data_seg(X86Seg seg_reg,
+                                        IR2_OPND *tmp0, IR2_OPND *tmp1)
+{
+    IR2_OPND done = latxs_ir2_opnd_new_label();
+
+    if (seg_reg == R_FS || seg_reg == R_GS) {
+        la_out2i(LISA_LD_WU, tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_seg_selector(lsenv, seg_reg));
+        latxs_load_imm64(tmp1, 0xfffc);
+        la_out3(LISA_AND, tmp0, tmp0, tmp1);
+        la_out2(LISA_BEQZ, tmp0, &done);
+    }
+
+    la_out2i(LISA_LD_WU, tmp0, &latxs_env_ir2_opnd,
+             lsenv_offset_of_seg_flags(lsenv, seg_reg));
+    /* Conforming code segment or DPL == 3 needs no clearing */
+    la_out2i(LISA_ANDI, tmp1, tmp0, DESC_CS_MASK | DESC_C_MASK);
+    la_out2i(LISA_XORI, tmp1, tmp1, DESC_CS_MASK | DESC_C_MASK);
+    la_out2(LISA_BEQZ, tmp1, &done);
+
+    la_out2ii(LISA_BSTRPICK_D, tmp1, tmp0, DESC_DPL_SHIFT + 1, DESC_DPL_SHIFT);
+    la_out2i(LISA_ADDI_D, tmp1, tmp1, -3);
+    la_out2(LISA_BEQZ, tmp1, &done);
+
+    /* DPL < 3: clear selector to 0 and clear DESC_P_MASK in cached flags */
+    la_out2i(LISA_ST_W, &la_zero, &latxs_env_ir2_opnd,
+             lsenv_offset_of_seg_selector(lsenv, seg_reg));
+    latxs_load_imm64(tmp1, DESC_P_MASK);
+    la_out3(LISA_ANDN, tmp0, tmp0, tmp1);
+    la_out2i(LISA_ST_W, tmp0, &latxs_env_ir2_opnd,
+             lsenv_offset_of_seg_flags(lsenv, seg_reg));
+
+    la_out1(LISA_LABEL, &done);
+}
+
+/* The common 64-bit kernel returns use checked HAMT loads. Other modes and
+ * exceptional frames retain the helper, including its native-resume handling.
+ * Both paths leave through the normal state-changing-instruction EOB. */
 static bool latxs_do_fast_iret(IR1_INST *pir1, int size)
 {
     TRANSLATION_DATA *td = lsenv->tr_data;
@@ -2214,379 +2170,421 @@ static bool latxs_do_fast_iret(IR1_INST *pir1, int size)
 
     ADDRX next_eip = ir1_addr_next(pir1);
     ADDRX next_eip_offset = 0;
-    /* pcrel, we should avoid directly storing next_eip */
-    if (option_tb_pcrel)
+    if (option_tb_pcrel) {
         next_eip_offset = td->pc_next - td->pc_save;
-    else if (option_page_pcrel)
+    } else if (option_page_pcrel) {
         next_eip_offset = td->pc_next - td->curr_page;
+    }
 
     IR2_OPND label_helper = latxs_ir2_opnd_new_label();
     IR2_OPND label_end = latxs_ir2_opnd_new_label();
+    IR2_OPND label_fast_done = latxs_ir2_opnd_new_label();
 
-    IR2_OPND new_cs = latxs_ra_alloc_itemp();
-    //IR2_OPND new_ss = latxs_ra_alloc_itemp();
-
-    /* arg0 - arg3 should not be across mem access */
-    IR2_OPND tmp0 = latxs_arg0_ir2_opnd;
-    IR2_OPND tmp1 = latxs_arg1_ir2_opnd;
-    IR2_OPND tmp2 = latxs_arg2_ir2_opnd;
-    IR2_OPND tmp3 = latxs_arg3_ir2_opnd;
+    if (!td->sys.pe || td->sys.vm86 || !td->sys.code64 || td->sys.cpl != 0 ||
+        !hamt_enabled() || !can_do_hamt(lsenv->cpu_state)) {
+        latxs_append_ir2_opnd1(LISA_B, &label_helper);
+    } else {
+        IR2_OPND tmp0 = latxs_arg0_ir2_opnd;
+        IR2_OPND tmp1 = latxs_arg1_ir2_opnd;
+        IR2_OPND tmp2 = latxs_arg2_ir2_opnd;
+        IR2_OPND tmp3 = latxs_arg3_ir2_opnd;
+        IR2_OPND ir2_esp = latxs_ra_alloc_gpr(rsp_index);
 
 #if defined(CONFIG_LATX_HACK_MEM) && defined(CONFIG_SOFTMMU)
-    if (hamt_enabled() && hamt_mode_dmw()) {
-        /* Only an active demand-page context needs the full IRET helper. */
-        size_t offset = offsetof(CPUX86State, aot_native_fault_active);
-        g_assert(!(offset & 3) && offset <= 32764);
-        la_out2i(LISA_LDPTR_D, &tmp0, &latxs_env_ir2_opnd, offset >> 2);
-        la_out2(LISA_BNEZ, &tmp0, &label_helper);
-    }
+        if (hamt_mode_dmw()) {
+            /* Native demand-page recovery must retain the full helper path. */
+            size_t offset = offsetof(CPUX86State, aot_native_fault_active);
+            g_assert(!(offset & 3) && offset <= 32764);
+            la_out2i(LISA_LDPTR_D, &tmp0, &latxs_env_ir2_opnd, offset >> 2);
+            la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        }
 #endif
 
-    /* sp = env->regs[R_ESP] */
-    IR2_OPND ir2_esp = latxs_ra_alloc_gpr(rsp_index);
+        IR2_OPND new_eip = latxs_ra_alloc_itemp();
+        IR2_OPND new_cs = latxs_ra_alloc_itemp();
+        IR2_OPND new_eflags = latxs_ra_alloc_itemp();
+        IR2_OPND new_esp = latxs_ra_alloc_itemp();
+        IR2_OPND new_ss = latxs_ra_alloc_itemp();
 
-    if (!td->sys.pe || td->sys.vm86) {
-        latxs_append_ir2_opnd1(LISA_B, &label_helper);
+        IR2_OPND label_rpl0 = latxs_ir2_opnd_new_label();
+        IR2_OPND label_rpl0_nonnull_ss = latxs_ir2_opnd_new_label();
+        IR2_OPND label_rpl0_ss_ok = latxs_ir2_opnd_new_label();
+
+        /* 1. Require CPL==0, LMA==1, CS64==1, and MPX_EN/TF/VM==0 */
+        la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_hflags(lsenv));
+        latxs_load_imm64(&tmp1,
+                         HF_CPL_MASK | HF_LMA_MASK | HF_CS64_MASK |
+                         HF_MPX_EN_MASK | HF_TF_MASK | HF_VM_MASK);
+        la_out3(LISA_AND, &tmp0, &tmp0, &tmp1);
+        latxs_load_imm64(&tmp1, HF_LMA_MASK | HF_CS64_MASK);
+        la_out3(LISA_BNE, &tmp0, &tmp1, &label_helper);
+
+        /* 2. Require current eflags has NT/VM/TF == 0 */
+        la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_eflags(lsenv));
+        latxs_load_imm64(&tmp1, NT_MASK | VM_MASK | TF_MASK);
+        la_out3(LISA_AND, &tmp0, &tmp0, &tmp1);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+
+        /* 3. Require canonical kernel RSP and [RSP..RSP+39] within one 4KB page */
+        la_out2i(LISA_SRAI_D, &tmp0, &ir2_esp, 47);
+        la_out2i(LISA_ADDI_D, &tmp0, &tmp0, 1);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        la_out2ii(LISA_BSTRPICK_D, &tmp0, &ir2_esp, 11, 0);
+        latxs_load_imm64(&tmp1, TARGET_PAGE_SIZE - 40);
+        la_out3(LISA_BLTU, &tmp1, &tmp0, &label_helper);
+
+        /* Read the first three fields without modifying the guest stack. */
+        gen_ldst_softmmu_helper(LISA_LD_D, &new_eip, &ir2_esp, 0, 1);
+        gen_ldst_softmmu_helper(LISA_LD_WU, &new_cs, &ir2_esp, 8, 1);
+        la_out2ii(LISA_BSTRPICK_D, &new_cs, &new_cs, 15, 0);
+        gen_ldst_softmmu_helper(LISA_LD_WU, &new_eflags, &ir2_esp, 16, 1);
+
+        /* 5. Reject special eflags bits (TF/AC/IOPL/VM/RF/NT) -> helper */
+        latxs_load_imm64(&tmp1,
+                         TF_MASK | AC_MASK | IOPL_MASK | VM_MASK |
+                         RF_MASK | NT_MASK);
+        la_out3(LISA_AND, &tmp0, &new_eflags, &tmp1);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+
+        /* 6. Require non-null GDT CS selector within GDT limit */
+        latxs_load_imm64(&tmp1, 0xfffc);
+        la_out3(LISA_AND, &tmp0, &new_cs, &tmp1);
+        la_out2(LISA_BEQZ, &tmp0, &label_helper);
+        la_out2i(LISA_ANDI, &tmp0, &new_cs, 4);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+
+        la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_gdt_limit(lsenv));
+        la_out2i(LISA_LD_D, &tmp1, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_gdt_base(lsenv));
+        /* Require canonical kernel GDT base */
+        la_out2i(LISA_SRAI_D, &tmp2, &tmp1, 47);
+        la_out2i(LISA_ADDI_D, &tmp2, &tmp2, 1);
+        la_out2(LISA_BNEZ, &tmp2, &label_helper);
+
+        latxs_load_imm64(&tmp2, ~7ULL);
+        la_out3(LISA_AND, &tmp2, &new_cs, &tmp2);
+        la_out2i(LISA_ADDI_D, &tmp3, &tmp2, 7);
+        la_out3(LISA_BLTU, &tmp0, &tmp3, &label_helper);
+        la_out3(LISA_ADD_D, &tmp2, &tmp1, &tmp2);
+        /* tmp2 = 64-bit CS descriptor (e1 in [31:0], e2 in [63:32]) */
+        gen_ldst_softmmu_helper(LISA_LD_D, &tmp2, &tmp2, 0, 1);
+
+        /* Dispatch between RPL==0 and RPL==3 (RPL 1/2 -> helper) */
+        la_out2i(LISA_ANDI, &tmp3, &new_cs, 3);
+        la_out2(LISA_BEQZ, &tmp3, &label_rpl0);
+        la_out2i(LISA_ADDI_D, &tmp3, &tmp3, -3);
+        la_out2(LISA_BNEZ, &tmp3, &label_helper);
+
+        /* ================= CASE A: CPL0 -> CPL3 64-bit user return ================= */
+        /* Require user canonical new_eip (bits [63:47] == 0) */
+        la_out2i(LISA_SRLI_D, &tmp3, &new_eip, 47);
+        la_out2(LISA_BNEZ, &tmp3, &label_helper);
+
+        /* Validate CS descriptor: base == 0 and flat 64-bit DPL=3 non-conforming code */
+        la_out2ii(LISA_BSTRPICK_D, &tmp3, &tmp2, 39, 16);
+        la_out2(LISA_BNEZ, &tmp3, &label_helper);
+        la_out2ii(LISA_BSTRPICK_D, &tmp3, &tmp2, 63, 56);
+        la_out2(LISA_BNEZ, &tmp3, &label_helper);
+        la_out2i(LISA_SRLI_D, &tmp3, &tmp2, 32);
+        {
+            IR2_OPND mask_reg = latxs_ra_alloc_itemp();
+            latxs_load_imm64(&mask_reg,
+                             DESC_S_MASK | DESC_CS_MASK | DESC_C_MASK |
+                             DESC_P_MASK | DESC_L_MASK | DESC_B_MASK |
+                             (3 << DESC_DPL_SHIFT));
+            la_out3(LISA_AND, &mask_reg, &tmp3, &mask_reg);
+            latxs_load_imm64(&tmp0,
+                             DESC_S_MASK | DESC_CS_MASK | DESC_P_MASK |
+                             DESC_L_MASK | (3 << DESC_DPL_SHIFT));
+            la_out3(LISA_BNE, &mask_reg, &tmp0, &label_helper);
+            latxs_ra_free_temp(&mask_reg);
+        }
+
+        /* A CPL change selects BNDCFGU; current MPX flags are insufficient. */
+        g_assert(!(offsetof(CPUX86State, bndcs_regs.cfgu) & 3));
+        la_out2i(LISA_LDPTR_D, &tmp0, &latxs_env_ir2_opnd,
+                 offsetof(CPUX86State, bndcs_regs.cfgu) >> 2);
+        la_out2i(LISA_ANDI, &tmp0, &tmp0,
+                 BNDCFG_ENABLE | BNDCFG_BNDPRESERVE);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+
+        gen_ldst_softmmu_helper(LISA_LD_D, &new_esp, &ir2_esp, 24, 1);
+        gen_ldst_softmmu_helper(LISA_LD_WU, &new_ss, &ir2_esp, 32, 1);
+        la_out2ii(LISA_BSTRPICK_D, &new_ss, &new_ss, 15, 0);
+
+        /* Validate non-null GDT SS selector with RPL==3 within GDT limit */
+        la_out2i(LISA_ANDI, &tmp0, &new_ss, 7);
+        la_out2i(LISA_ADDI_D, &tmp0, &tmp0, -3);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        latxs_load_imm64(&tmp0, 0xfffc);
+        la_out3(LISA_AND, &tmp0, &new_ss, &tmp0);
+        la_out2(LISA_BEQZ, &tmp0, &label_helper);
+
+        la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_gdt_limit(lsenv));
+        latxs_load_imm64(&tmp3, ~7ULL);
+        la_out3(LISA_AND, &tmp3, &new_ss, &tmp3);
+        la_out2i(LISA_ADDI_D, &tmp3, &tmp3, 7);
+        la_out3(LISA_BLTU, &tmp0, &tmp3, &label_helper);
+        la_out2i(LISA_ADDI_D, &tmp3, &tmp3, -7);
+        la_out3(LISA_ADD_D, &tmp3, &tmp1, &tmp3);
+        /* tmp3 = 64-bit SS descriptor */
+        gen_ldst_softmmu_helper(LISA_LD_D, &tmp3, &tmp3, 0, 1);
+
+        /* Require SS base == 0 and writable present DPL=3 data segment with DESC_B_MASK */
+        la_out2ii(LISA_BSTRPICK_D, &tmp0, &tmp3, 39, 16);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        la_out2ii(LISA_BSTRPICK_D, &tmp0, &tmp3, 63, 56);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        la_out2i(LISA_SRLI_D, &tmp0, &tmp3, 32);
+        {
+            IR2_OPND mask_reg = latxs_ra_alloc_itemp();
+            latxs_load_imm64(&mask_reg,
+                             DESC_S_MASK | DESC_CS_MASK | DESC_W_MASK |
+                             DESC_P_MASK | DESC_B_MASK | (3 << DESC_DPL_SHIFT));
+            la_out3(LISA_AND, &mask_reg, &tmp0, &mask_reg);
+            latxs_load_imm64(&tmp1,
+                             DESC_S_MASK | DESC_W_MASK | DESC_P_MASK |
+                             DESC_B_MASK | (3 << DESC_DPL_SHIFT));
+            la_out3(LISA_BNE, &mask_reg, &tmp1, &label_helper);
+            latxs_ra_free_temp(&mask_reg);
+        }
+
+        /* All guest reads and fallback checks are complete before state stores. */
+        {
+            IR2_OPND seg_lim = latxs_ra_alloc_itemp();
+            /* SS limit & flags */
+            la_out2ii(LISA_BSTRPICK_D, &tmp1, &tmp3, 31, 0);
+            la_out2i(LISA_SRLI_D, &tmp3, &tmp3, 32);
+            fast_get_seg_limit(&tmp1, &tmp3, &seg_lim);
+            la_out2i(LISA_ST_W, &new_ss, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_selector(lsenv, R_SS));
+            la_out2i(LISA_ST_D, &la_zero, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_base(lsenv, R_SS));
+            la_out2i(LISA_ST_W, &seg_lim, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_limit(lsenv, R_SS));
+            la_out2i(LISA_ST_W, &tmp3, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_flags(lsenv, R_SS));
+
+            /* CS limit & flags */
+            la_out2ii(LISA_BSTRPICK_D, &tmp1, &tmp2, 31, 0);
+            la_out2i(LISA_SRLI_D, &tmp3, &tmp2, 32);
+            fast_get_seg_limit(&tmp1, &tmp3, &seg_lim);
+            la_out2i(LISA_ST_W, &new_cs, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_selector(lsenv, R_CS));
+            la_out2i(LISA_ST_D, &la_zero, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_base(lsenv, R_CS));
+            la_out2i(LISA_ST_W, &seg_lim, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_limit(lsenv, R_CS));
+            la_out2i(LISA_ST_W, &tmp3, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_flags(lsenv, R_CS));
+            latxs_ra_free_temp(&seg_lim);
+        }
+
+        /* Update hflags: CPL=3, CS32=1, SS32=1, CS64=1, clear ADDSEG */
+        la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_hflags(lsenv));
+        latxs_load_imm64(&tmp1, HF_ADDSEG_MASK);
+        la_out3(LISA_ANDN, &tmp0, &tmp0, &tmp1);
+        latxs_load_imm64(&tmp1,
+                         HF_CS32_MASK | HF_SS32_MASK | HF_CS64_MASK | 3);
+        la_out3(LISA_OR, &tmp0, &tmp0, &tmp1);
+        la_out2i(LISA_ST_W, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_hflags(lsenv));
+
+        /* Validate ES/DS/FS/GS for RPL==3 */
+        latxs_iret_validate_data_seg(R_ES, &tmp0, &tmp1);
+        latxs_iret_validate_data_seg(R_DS, &tmp0, &tmp1);
+        latxs_iret_validate_data_seg(R_FS, &tmp0, &tmp1);
+        latxs_iret_validate_data_seg(R_GS, &tmp0, &tmp1);
+
+        /* Commit EIP, RSP, and EFLAGS (old CPL==0 -> mask includes IOPL|IF) */
+        la_out2i(LISA_ST_D, &new_eip, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_eip(lsenv));
+        la_out3(LISA_OR, &ir2_esp, &new_esp, &la_zero);
+        {
+            IR2_OPND ef_mask = latxs_ra_alloc_itemp();
+            la_out3(LISA_OR, &tmp2, &new_eflags, &la_zero);
+            latxs_load_imm64(&ef_mask,
+                             TF_MASK | AC_MASK | ID_MASK | IF_MASK |
+                             IOPL_MASK | RF_MASK | NT_MASK);
+            latx_cpu_load_eflags(&tmp2, &ef_mask);
+            latxs_ra_free_temp(&ef_mask);
+        }
+
+        la_out1(LISA_B, &label_fast_done);
+
+        /* ================= CASE B: CPL0 -> CPL0 64-bit kernel return ================= */
+        la_out1(LISA_LABEL, &label_rpl0);
+
+        /* Require canonical new_eip ((new_eip >> 47) == -1 or 0) */
+        la_out2i(LISA_SRAI_D, &tmp3, &new_eip, 47);
+        la_out2i(LISA_ADDI_D, &tmp0, &tmp3, 1);
+        /* ok if tmp3 == -1 (tmp0 == 0) or tmp3 == 0 (tmp0 == 1) => tmp0 <= 1U */
+        la_out2i(LISA_ORI, &tmp3, &la_zero, 1);
+        la_out3(LISA_BLTU, &tmp3, &tmp0, &label_helper);
+
+        /* Validate CS descriptor: base == 0 and flat 64-bit DPL=0 non-conforming code */
+        la_out2ii(LISA_BSTRPICK_D, &tmp3, &tmp2, 39, 16);
+        la_out2(LISA_BNEZ, &tmp3, &label_helper);
+        la_out2ii(LISA_BSTRPICK_D, &tmp3, &tmp2, 63, 56);
+        la_out2(LISA_BNEZ, &tmp3, &label_helper);
+        la_out2i(LISA_SRLI_D, &tmp3, &tmp2, 32);
+        {
+            IR2_OPND mask_reg = latxs_ra_alloc_itemp();
+            latxs_load_imm64(&mask_reg,
+                             DESC_S_MASK | DESC_CS_MASK | DESC_C_MASK |
+                             DESC_P_MASK | DESC_L_MASK | DESC_B_MASK |
+                             (3 << DESC_DPL_SHIFT));
+            la_out3(LISA_AND, &mask_reg, &tmp3, &mask_reg);
+            latxs_load_imm64(&tmp0,
+                             DESC_S_MASK | DESC_CS_MASK | DESC_P_MASK |
+                             DESC_L_MASK);
+            la_out3(LISA_BNE, &mask_reg, &tmp0, &label_helper);
+            latxs_ra_free_temp(&mask_reg);
+        }
+
+        g_assert(!(offsetof(CPUX86State, msr_bndcfgs) & 3));
+        la_out2i(LISA_LDPTR_D, &tmp0, &latxs_env_ir2_opnd,
+                 offsetof(CPUX86State, msr_bndcfgs) >> 2);
+        la_out2i(LISA_ANDI, &tmp0, &tmp0,
+                 BNDCFG_ENABLE | BNDCFG_BNDPRESERVE);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+
+        gen_ldst_softmmu_helper(LISA_LD_D, &new_esp, &ir2_esp, 24, 1);
+        gen_ldst_softmmu_helper(LISA_LD_WU, &new_ss, &ir2_esp, 32, 1);
+        la_out2ii(LISA_BSTRPICK_D, &new_ss, &new_ss, 15, 0);
+
+        /* Handle NULL SS ((new_ss & 0xfffc) == 0) vs non-null DPL=0 GDT SS */
+        latxs_load_imm64(&tmp0, 0xfffc);
+        la_out3(LISA_AND, &tmp0, &new_ss, &tmp0);
+        la_out2(LISA_BNEZ, &tmp0, &label_rpl0_nonnull_ss);
+
+        /* NULL SS in long mode CPL0: limit=0xffffffff, flags=G|B|P|S|W|A */
+        la_out2i(LISA_ST_W, &new_ss, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_seg_selector(lsenv, R_SS));
+        la_out2i(LISA_ST_D, &la_zero, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_seg_base(lsenv, R_SS));
+        latxs_load_imm64(&tmp0, 0xffffffff);
+        la_out2i(LISA_ST_W, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_seg_limit(lsenv, R_SS));
+        latxs_load_imm64(&tmp0,
+                         DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
+                         DESC_S_MASK | DESC_W_MASK | DESC_A_MASK);
+        la_out2i(LISA_ST_W, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_seg_flags(lsenv, R_SS));
+        la_out1(LISA_B, &label_rpl0_ss_ok);
+
+        la_out1(LISA_LABEL, &label_rpl0_nonnull_ss);
+        /* Require (new_ss & 7) == 0 and within GDT limit */
+        la_out2i(LISA_ANDI, &tmp0, &new_ss, 7);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_gdt_limit(lsenv));
+        la_out2i(LISA_ADDI_D, &tmp3, &new_ss, 7);
+        la_out3(LISA_BLTU, &tmp0, &tmp3, &label_helper);
+        la_out3(LISA_ADD_D, &tmp3, &tmp1, &new_ss);
+        gen_ldst_softmmu_helper(LISA_LD_D, &tmp3, &tmp3, 0, 1);
+
+        la_out2ii(LISA_BSTRPICK_D, &tmp0, &tmp3, 39, 16);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        la_out2ii(LISA_BSTRPICK_D, &tmp0, &tmp3, 63, 56);
+        la_out2(LISA_BNEZ, &tmp0, &label_helper);
+        la_out2i(LISA_SRLI_D, &tmp0, &tmp3, 32);
+        {
+            IR2_OPND mask_reg = latxs_ra_alloc_itemp();
+            latxs_load_imm64(&mask_reg,
+                             DESC_S_MASK | DESC_CS_MASK | DESC_W_MASK |
+                             DESC_P_MASK | DESC_B_MASK | (3 << DESC_DPL_SHIFT));
+            la_out3(LISA_AND, &mask_reg, &tmp0, &mask_reg);
+            latxs_load_imm64(&tmp1,
+                             DESC_S_MASK | DESC_W_MASK | DESC_P_MASK |
+                             DESC_B_MASK);
+            la_out3(LISA_BNE, &mask_reg, &tmp1, &label_helper);
+            latxs_ra_free_temp(&mask_reg);
+        }
+        {
+            IR2_OPND seg_lim = latxs_ra_alloc_itemp();
+            la_out2ii(LISA_BSTRPICK_D, &tmp1, &tmp3, 31, 0);
+            la_out2i(LISA_SRLI_D, &tmp3, &tmp3, 32);
+            fast_get_seg_limit(&tmp1, &tmp3, &seg_lim);
+            la_out2i(LISA_ST_W, &new_ss, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_selector(lsenv, R_SS));
+            la_out2i(LISA_ST_D, &la_zero, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_base(lsenv, R_SS));
+            la_out2i(LISA_ST_W, &seg_lim, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_limit(lsenv, R_SS));
+            la_out2i(LISA_ST_W, &tmp3, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_flags(lsenv, R_SS));
+            latxs_ra_free_temp(&seg_lim);
+        }
+
+        la_out1(LISA_LABEL, &label_rpl0_ss_ok);
+        /* Commit R_CS (tmp2 = cs_desc) */
+        {
+            IR2_OPND seg_lim = latxs_ra_alloc_itemp();
+            la_out2ii(LISA_BSTRPICK_D, &tmp1, &tmp2, 31, 0);
+            la_out2i(LISA_SRLI_D, &tmp3, &tmp2, 32);
+            fast_get_seg_limit(&tmp1, &tmp3, &seg_lim);
+            la_out2i(LISA_ST_W, &new_cs, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_selector(lsenv, R_CS));
+            la_out2i(LISA_ST_D, &la_zero, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_base(lsenv, R_CS));
+            la_out2i(LISA_ST_W, &seg_lim, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_limit(lsenv, R_CS));
+            la_out2i(LISA_ST_W, &tmp3, &latxs_env_ir2_opnd,
+                     lsenv_offset_of_seg_flags(lsenv, R_CS));
+            latxs_ra_free_temp(&seg_lim);
+        }
+
+        /* Update hflags: CPL=0, CS32=1, SS32=1, CS64=1, clear ADDSEG */
+        la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_hflags(lsenv));
+        latxs_load_imm64(&tmp1,
+                         HF_CPL_MASK | HF_ADDSEG_MASK);
+        la_out3(LISA_ANDN, &tmp0, &tmp0, &tmp1);
+        latxs_load_imm64(&tmp1, HF_CS32_MASK | HF_SS32_MASK | HF_CS64_MASK);
+        la_out3(LISA_OR, &tmp0, &tmp0, &tmp1);
+        la_out2i(LISA_ST_W, &tmp0, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_hflags(lsenv));
+
+        /* Commit EIP, RSP, and EFLAGS */
+        la_out2i(LISA_ST_D, &new_eip, &latxs_env_ir2_opnd,
+                 lsenv_offset_of_eip(lsenv));
+        la_out3(LISA_OR, &ir2_esp, &new_esp, &la_zero);
+        {
+            IR2_OPND ef_mask = latxs_ra_alloc_itemp();
+            la_out3(LISA_OR, &tmp2, &new_eflags, &la_zero);
+            latxs_load_imm64(&ef_mask,
+                             TF_MASK | AC_MASK | ID_MASK | IF_MASK |
+                             IOPL_MASK | RF_MASK | NT_MASK);
+            latx_cpu_load_eflags(&tmp2, &ef_mask);
+            latxs_ra_free_temp(&ef_mask);
+        }
+
+        la_out1(LISA_LABEL, &label_fast_done);
+
+        /* Preserve concurrent hflags2 updates, as in the original fast path. */
+        latxs_load_imm64(&tmp0, ~(HF2_NMI_MASK | HF2_MPX_PR_MASK));
+        latxs_load_imm64(&tmp1, lsenv_offset_of_hflags2(lsenv));
+        la_out3(LISA_ADD_D, &tmp1, &tmp1, &latxs_env_ir2_opnd);
+        la_out3(LISA_AMAND_W, &la_zero, &tmp1, &tmp0);
+#ifdef HAMT_PROT_ADD_PLV
+        if (hamt_enabled()) {
+            latxs_tr_dmw_in_plv_env_break(&tmp0, &latxs_env_ir2_opnd);
+        }
+#endif
+        la_out1(LISA_B, &label_end);
+
+        latxs_ra_free_temp(&new_ss);
+        latxs_ra_free_temp(&new_esp);
+        latxs_ra_free_temp(&new_eflags);
+        latxs_ra_free_temp(&new_cs);
+        latxs_ra_free_temp(&new_eip);
     }
-
-    /* !(env->hflags & HF_LMA_MASK) */
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
-       lsenv_offset_of_hflags(lsenv));
-    latxs_load_imm64(&new_cs, HF_LMA_MASK);
-    la_out3(LISA_AND, &new_cs, &tmp0, &new_cs);
-
-    la_out2(LISA_BEQZ, &new_cs, &label_helper);
-
-    /* !(env->hflags & HF_CS64_MASK) */
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
-       lsenv_offset_of_hflags(lsenv));
-    latxs_load_imm64(&new_cs, HF_CS64_MASK);
-    la_out3(LISA_AND, &new_cs, &tmp0, &new_cs);
-
-    la_out2(LISA_BEQZ, &new_cs, &label_helper);
-
-    /* ssp = env->segs[R_SS].base; */
-    //la_out2i(LISA_LD_D, &tmp0, &latxs_env_ir2_opnd,
-    //    lsenv_offset_of_seg_base(lsenv, R_SS));
-
-    /* POPQ_RA(sp, new_eip, retaddr) */
-    //gen_ldst_softmmu_helper(LISA_LD_D, &tmp0, &ir2_esp, 0, 1);
-    //la_out2i(LISA_ADDI_D, &ir2_esp, &ir2_esp, 8);
-
-    /* POPQ_RA(sp, new_cs, retaddr) */
-    gen_ldst_softmmu_helper(LISA_LD_WU, &new_cs, &ir2_esp, 8, 1);
-    //la_out2i(LISA_ADDI_D, &ir2_esp, &ir2_esp, 8);
-
-    la_out2i(LISA_ST_W, &new_cs, &latxs_env_ir2_opnd,
-            lsenv_offset_of_new_cs(lsenv));
-
-    /* new_cs &= 0xffff */
-    latxs_load_imm64_to_ir2(&tmp2, 0xffff);
-    la_out3(LISA_AND, &new_cs, &new_cs, &tmp2);
-
-    /* POPQ_RA(sp, new_eflags, retaddr); */
-    //gen_ldst_softmmu_helper(LISA_LD_D, &tmp2, &ir2_esp, 16, 1);
-    //la_out2i(LISA_ADDI_D, &ir2_esp, &ir2_esp, 8);
-
-    /* if (new_cs & 0xfffc) == 0, goto helper */
-    latxs_load_imm64_to_ir2(&tmp3, 0xfffc);
-    la_out3(LISA_AND, &tmp3, &new_cs, &tmp3);
-    la_out2(LISA_BEQZ, &tmp3, &label_helper);
-
-    IR2_OPND cpl = latxs_ra_alloc_itemp();
-    /* cpl = env->hflags & HF_CPL_MASK */
-    la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
-            lsenv_offset_of_hflags(lsenv));
-    la_out2i(LISA_ANDI, &cpl, &tmp0, HF_CPL_MASK);
-
-    /* store cpl to env for future use */
-    la_out2i(LISA_ST_W, &cpl, &latxs_env_ir2_opnd,
-            lsenv_offset_of_old_cpl(lsenv));
-
-    /* rpl = new_cs & 3 */
-    la_out2i(LISA_ANDI, &tmp2, &new_cs, 3);
-
-    /* if (rpl < cpl), goto helper */
-    la_out3(LISA_BLTU, &tmp2, &cpl, &label_helper);
-    latxs_ra_free_temp(&cpl);
-
-    IR2_OPND e1 = latxs_ra_alloc_itemp();
-    IR2_OPND e2 = latxs_ra_alloc_itemp();
-
-    /* load_segment_ra(e1_ptr, e2_ptr, selector, lebel_helper) */
-    /* The fast_load_segment_ra function contains x86 registers,
-     * which will use the a0-a3 registers, so we can't use the
-     * a0-a3 registers.
-     */
-
-    fast_load_segment_ra(&e1, &e2, &new_cs,
-                           &label_helper);
-    /* save e1 & e2 for future use */
-    la_out2i(LISA_ST_W, &e1, &latxs_env_ir2_opnd,
-            lsenv_offset_of_cs_e1(lsenv));
-    la_out2i(LISA_ST_W, &e2, &latxs_env_ir2_opnd,
-            lsenv_offset_of_cs_e2(lsenv));
-
-    /* if (!(e2 & DESC_S_MASK) || !(e2 & DESC_CS_MASK)), goto helper */
-    latxs_load_imm64_to_ir2(&tmp3, DESC_S_MASK);
-    la_out3(LISA_AND, &tmp3, &e2, &tmp3);
-    la_out2(LISA_BEQZ, &tmp3, &label_helper);
-
-    la_out2i(LISA_ANDI, &tmp3, &e2, DESC_CS_MASK);
-    la_out2(LISA_BEQZ, &tmp3, &label_helper);
-
-    /* if (!(e2 & DESC_P_MASK)), goto helper  */
-    latxs_load_imm64_to_ir2(&tmp3, DESC_P_MASK);
-    la_out3(LISA_AND, &tmp3, &e2, &tmp3);
-    la_out2(LISA_BEQZ, &tmp3, &label_helper);
-
-    IR2_OPND dpl = latxs_ra_alloc_itemp();
-    IR2_OPND not_eq = latxs_ir2_opnd_new_label();
-    IR2_OPND end_dpl_rpl = latxs_ir2_opnd_new_label();
-
-    /* dpl = (e2 >> DESC_DPL_SHIFT) & 3; */
-    la_out2i(LISA_SRLI_D, &dpl, &e2, DESC_DPL_SHIFT);
-    la_out2i(LISA_ANDI, &dpl, &dpl, 3);
-
-    /* if (e2 & DESC_C_MASK) */
-    la_out2i(LISA_AND, &tmp3, &e2, DESC_C_MASK);
-    la_out2(LISA_BNEZ, &tmp3, &not_eq);
-
-    /* rpl = new_cs & 3 */
-    la_out2i(LISA_ANDI, &tmp3, &new_cs, 3);
-    /* if (dpl > rpl) */
-    la_out3(LISA_BLT, &tmp3, &dpl, &label_helper);
-    la_out1(LISA_B, &end_dpl_rpl);
-
-    /* if (dpl != rpl) */
-    la_out1(LISA_LABEL, &not_eq);
-    /* rpl = new_cs & 3 */
-    la_out2i(LISA_ANDI, &tmp3, &new_cs, 3);
-    la_out3(LISA_BNE, &dpl, &tmp3, &label_helper);
-
-    la_out1(LISA_LABEL, &end_dpl_rpl);
-
-    latxs_ra_free_temp(&dpl);
-
-    /* if (!(e2 & DESC_P_MASK)), goto helper */
-    latxs_load_imm64_to_ir2(&tmp3, DESC_P_MASK);
-    la_out3(LISA_AND, &tmp3, &e2, &tmp3);
-    la_out2(LISA_BEQZ, &tmp3, &label_helper);
-
-    latxs_ra_free_temp(&e1);
-    latxs_ra_free_temp(&e2);
-
-    IR2_OPND new_ss = latxs_ra_alloc_itemp();
-    /* POPQ_RA(sp, new_esp, retaddr); */
-    //gen_ldst_softmmu_helper(LISA_LD_D, &new_esp, &ir2_esp, 24, 1);
-
-    /* POPQ_RA(sp, new_ss, retaddr); */
-    gen_ldst_softmmu_helper(LISA_LD_WU, &new_ss, &ir2_esp, 32, 1);
-
-    latxs_load_imm64_to_ir2(&tmp0, 0xffff);
-    la_out3(LISA_AND, &new_ss, &new_ss, &tmp0);
-
-    IR2_OPND diff_plv = latxs_ir2_opnd_new_label();
-    IR2_OPND newss_end = latxs_ir2_opnd_new_label();
-
-    /* if ((new_ss & 0xfffc) == 0) */
-    latxs_load_imm64_to_ir2(&tmp0, 0xfffc);
-    la_out3(LISA_AND, &tmp1, &new_ss, &tmp0);
-    la_out2(LISA_BNEZ, &tmp1, &diff_plv);
-
-    /* if ((env->hflags & HF_LMA_MASK) && rpl != 3) */
-    latxs_load_imm64_to_ir2(&tmp0, 3);
-    /* rpl = new_cs & 3 */
-    la_out2i(LISA_ANDI, &tmp1, &new_cs, 3);
-    la_out3(LISA_BEQ, &tmp0, &tmp1, &label_helper);
-
-    IR2_OPND ss1_limit = latxs_ra_alloc_itemp();
-    IR2_OPND ss1_flags = latxs_ra_alloc_itemp();
-    /*
-     * cpu_x86_load_seg_cache(env, R_SS, new_ss,
-     *                        0, 0xffffffff,
-     *                        DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
-     *                        DESC_S_MASK | (rpl << DESC_DPL_SHIFT) |
-     *                        DESC_W_MASK | DESC_A_MASK);
-     */
-
-    latxs_load_imm64_to_ir2(&ss1_limit, 0xffffffff);
-    latxs_load_imm64_to_ir2(&ss1_flags, DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
-                           DESC_S_MASK | DESC_W_MASK | DESC_A_MASK);
-    la_out2i(LISA_SLLI_D, &tmp1, &tmp1, DESC_DPL_SHIFT);
-    la_out3(LISA_OR, &ss1_flags, &ss1_flags, &tmp1);
-    fast_cpu_x86_load_seg_cache(R_SS, &new_ss, &la_zero, &ss1_limit, &ss1_flags);
-
-    latxs_ra_free_temp(&ss1_limit);
-    latxs_ra_free_temp(&ss1_flags);
-
-    /* ss_e2 = DESC_B_MASK, ss_e2 not used for (new_ss & 0xfffc) == 0 */
-    la_out1(LISA_B, &newss_end);
-
-    /* if ((new_ss & 3) != rpl), goto helper */
-    la_out1(LISA_LABEL, &diff_plv);
-
-    la_out2i(LISA_ANDI, &tmp0, &new_ss, 3);
-    la_out2i(LISA_ANDI, &tmp1, &new_cs, 3);
-    la_out3(LISA_BNE, &tmp0, &tmp1, &label_helper);
-
-    IR2_OPND ss_e1 = latxs_ra_alloc_itemp();
-    IR2_OPND ss_e2 = latxs_ra_alloc_itemp();
-    /*IR2_OPND ss_normal = latxs_ir2_opnd_new_label();*/
-
-    fast_load_segment_ra(&ss_e1, &ss_e2, &new_ss, &label_helper);
-
-    /*
-     * if (!(ss_e2 & DESC_S_MASK) ||
-     *     (ss_e2 & DESC_CS_MASK) ||
-     *     !(ss_e2 & DESC_W_MASK))
-     * {
-     *     goto helper
-     * }
-     */
-
-    latxs_load_imm64_to_ir2(&tmp3, DESC_S_MASK);
-    la_out3(LISA_AND, &tmp0, &ss_e2, &tmp3);
-    la_out2(LISA_BEQZ, &tmp0, &label_helper);
-
-    la_out2i(LISA_ANDI, &tmp0, &ss_e2, DESC_CS_MASK);
-    la_out2(LISA_BNEZ, &tmp0, &label_helper);
-
-    la_out2i(LISA_ANDI, &tmp0, &ss_e2, DESC_W_MASK);
-    la_out2(LISA_BEQZ, &tmp0, &label_helper);
-
-    /* dpl = (ss_e2 >> DESC_DPL_SHIFT) & 3 */
-    la_out2i(LISA_SRLI_D, &tmp0, &ss_e2, DESC_DPL_SHIFT);
-    la_out2i(LISA_ANDI, &tmp0, &tmp0, 3);
-
-    /* if (dpl != rpl) */
-    la_out2i(LISA_ANDI, &tmp1, &new_cs, 3);
-    la_out3(LISA_BNE, &tmp0, &tmp1, &label_helper);
-
-    /* if (!(ss_e2 & DESC_P_MASK)) */
-    latxs_load_imm64(&tmp0, DESC_P_MASK);
-    la_out3(LISA_AND, &tmp0, &ss_e2, &tmp0);
-    la_out2(LISA_BEQZ, &tmp0, &label_helper);
-
-    /*
-     * cpu_x86_load_seg_cache(env, R_SS, new_ss,
-     *                    get_seg_base(ss_e1, ss_e2),
-     *                    get_seg_limit(ss_e1, ss_e2),
-     *                    ss_e2);
-     */
-
-    IR2_OPND ss_base = latxs_ra_alloc_itemp();
-    IR2_OPND ss2_limit = latxs_ra_alloc_itemp();
-
-    fast_get_seg_base(&ss_e1, &ss_e2, &ss_base);
-    fast_get_seg_limit(&ss_e1, &ss_e2, &ss2_limit);
-
-    fast_cpu_x86_load_seg_cache(R_SS, &new_ss, &ss_base, &ss2_limit, &ss_e2);
-
-    latxs_ra_free_temp(&ss_e1);
-    latxs_ra_free_temp(&ss_e2);
-    latxs_ra_free_temp(&ss_base);
-    latxs_ra_free_temp(&ss2_limit);
-
-    la_out1(LISA_LABEL, &newss_end);
-    /*
-     * cpu_x86_load_seg_cache(env, R_CS, new_cs,
-     *                get_seg_base(e1, e2),
-     *                get_seg_limit(e1, e2),
-     *                e2);
-     */
-
-    IR2_OPND cs_e1 = latxs_ra_alloc_itemp();
-    IR2_OPND cs_e2 = latxs_ra_alloc_itemp();
-    IR2_OPND cs_base = latxs_ra_alloc_itemp();
-    IR2_OPND cs_limit = latxs_ra_alloc_itemp();
-
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &cs_e1, &latxs_env_ir2_opnd,
-       lsenv_offset_of_cs_e1(lsenv));
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &cs_e2, &latxs_env_ir2_opnd,
-       lsenv_offset_of_cs_e2(lsenv));
-
-    fast_get_seg_base(&cs_e1, &cs_e2, &cs_base);
-    fast_get_seg_base(&cs_e1, &cs_e2, &cs_limit);
-
-    fast_cpu_x86_load_seg_cache(R_CS, &new_cs, &cs_base, &cs_limit, &cs_e2);
-
-    latxs_ra_free_temp(&cs_e1);
-    latxs_ra_free_temp(&cs_e2);
-    latxs_ra_free_temp(&ss_base);
-    latxs_ra_free_temp(&cs_limit);
-
-    latxs_ra_free_temp(&new_ss);
-
-    /* rpl = new_cs & 3 */
-    la_out2i(LISA_ANDI, &new_cs, &new_cs, 3);
-
-    fast_validate_seg(R_ES, &new_cs);
-    fast_validate_seg(R_DS, &new_cs);
-    fast_validate_seg(R_FS, &new_cs);
-    fast_validate_seg(R_GS, &new_cs);
-
-    latxs_ra_free_temp(&new_cs);
-
-    /* env->eip = new_eip */
-    IR2_OPND new_eip = latxs_ra_alloc_itemp();
-    gen_ldst_softmmu_helper(LISA_LD_D, &new_eip, &ir2_esp, 0, 1);
-    latxs_append_ir2_opnd2i(LISA_ST_D, &new_eip, &latxs_env_ir2_opnd,
-        lsenv_offset_of_eip(lsenv));
-    latxs_ra_free_temp(&new_eip);
-
-    /* POPQ_RA(sp, new_eflags, retaddr); */
-    IR2_OPND new_eflags = latxs_ra_alloc_itemp();
-    gen_ldst_softmmu_helper(LISA_LD_WU, &new_eflags, &ir2_esp, 16, 1);
-
-    /* SET_ESP(sp, sp_mask) */
-    IR2_OPND new_esp = latxs_ra_alloc_itemp();
-    gen_ldst_softmmu_helper(LISA_LD_D, &new_esp, &ir2_esp, 24, 1);
-    la_out3(LISA_OR, &ir2_esp, &new_esp, &la_zero);
-    latxs_ra_free_temp(&new_esp);
-
-    IR2_OPND eflags_mask = latxs_ra_alloc_itemp();
-    IR2_OPND old_cpl = latxs_ra_alloc_itemp();
-
-    latxs_load_imm64(&eflags_mask,
-        TF_MASK | AC_MASK | ID_MASK | RF_MASK | NT_MASK);
-    la_out2i(LISA_LD_W, &old_cpl, &latxs_env_ir2_opnd,
-            lsenv_offset_of_old_cpl(lsenv));
-
-    latxs_load_imm64(&tmp0, IOPL_MASK);
-    la_out3(LISA_MASKNEZ, &tmp1, &tmp0, &old_cpl);
-    la_out3(LISA_OR, &eflags_mask, &eflags_mask, &tmp1);
-
-    /* iopl = (env->eflags >> IOPL_SHIFT) & 3; */
-    la_out2i(LISA_LD_WU, &tmp0, &latxs_env_ir2_opnd,
-        lsenv_offset_of_eflags(lsenv));
-    la_out2i(LISA_SRLI_D, &tmp0, &tmp0, IOPL_SHIFT);
-    la_out2i(LISA_ANDI, &tmp0, &tmp0, 3);
-
-    /*
-     * if (cpl <= iopl) {
-     *     eflags_mask |= IF_MASK;
-     * }
-     */
-
-    IR2_OPND label_cpl_lt_iopl = latxs_ir2_opnd_new_label();
-    la_out3(LISA_BLT, &tmp0, &old_cpl, &label_cpl_lt_iopl);
-    la_out2i(LISA_ORI, &eflags_mask, &eflags_mask, IF_MASK);
-    latxs_append_ir2_opnd1(LISA_LABEL, &label_cpl_lt_iopl);
-
-    /* cpu_load_eflags(env, new_eflags, eflags_mask); */
-    latx_cpu_load_eflags(&new_eflags, &eflags_mask);
-
-    /* env->hflags2 &= ~HF2_NMI_MASK; */
-    latxs_load_imm64(&old_cpl, ~HF2_NMI_MASK);
-    latxs_load_imm64(&new_eflags, lsenv_offset_of_hflags2(lsenv));
-    la_out3(LISA_ADD_D, &new_eflags, &new_eflags, &latxs_env_ir2_opnd);
-    la_out3(LISA_AMAND_W, &old_cpl, &new_eflags, &old_cpl);
-
-    la_out1(LISA_B, &label_end);
-
-    latxs_ra_free_temp(&old_cpl);
-    latxs_ra_free_temp(&new_eflags);
 
     latxs_append_ir2_opnd1(LISA_LABEL, &label_helper);
 
@@ -2595,57 +2593,29 @@ static bool latxs_do_fast_iret(IR1_INST *pir1, int size)
     latxs_tr_gen_call_to_helper_prologue_cfg(nofp_helper_cfg);
 
     if (td->sys.pe && !td->sys.vm86) {
-        /*
-         * 2. protected mode iret
-         *
-         * target/i386/seg_helper.c
-         * void helper_iret_protected(
-         *      CPUX86State *env,
-         *      int shift,
-         *      int next_eip)
-         */
-
-        latxs_tr_gen_add_curr_eip_to_ir2(&latxs_arg2_ir2_opnd, next_eip_offset, next_eip, false);
-
-        /* 2.1 arg2: next eip */
-        /* 2.2 arg1: size */
+        latxs_tr_gen_add_curr_eip_to_ir2(&latxs_arg2_ir2_opnd,
+                                         next_eip_offset, next_eip, false);
         latxs_append_ir2_opnd2i(LISA_ORI, &latxs_arg1_ir2_opnd,
-                &latxs_zero_ir2_opnd, size);
-        /* 2.3 arg0: env */
+                                &latxs_zero_ir2_opnd, size);
         latxs_append_ir2_opnd3(LISA_OR, &latxs_arg0_ir2_opnd,
-                &latxs_env_ir2_opnd, &latxs_zero_ir2_opnd);
+                               &latxs_env_ir2_opnd, &latxs_zero_ir2_opnd);
         if (hamt_enabled()) {
             latxs_tr_dmw_out_fix_mem(&latxs_arg0_ir2_opnd);
         }
-        /* 2.4 call helper_iret_protected : might generate exception  */
-        latxs_tr_gen_call_to_helper((ADDR)helper_iret_protected, HELPER_IRET_PROTECTED);
+        latxs_tr_gen_call_to_helper((ADDR)helper_iret_protected,
+                                    HELPER_IRET_PROTECTED);
     } else {
-        /*
-         * 2. real and vm86 mode iret
-         *
-         * target/i386/seg_helper.c
-         * void helper_iret_real(
-         *      CPUX86State *env,
-         *      int shift)
-         */
-        /* 2.1 arg0: env */
         latxs_append_ir2_opnd3(LISA_OR, &latxs_arg0_ir2_opnd,
-                &latxs_env_ir2_opnd, &latxs_zero_ir2_opnd);
+                               &latxs_env_ir2_opnd, &latxs_zero_ir2_opnd);
         if (hamt_enabled()) {
             latxs_tr_dmw_out_fix_mem(&latxs_arg0_ir2_opnd);
         }
-        /* 2.2 arg1: size */
         latxs_append_ir2_opnd2i(LISA_ORI, &latxs_arg1_ir2_opnd,
-                &latxs_zero_ir2_opnd, size);
-        /* 2.3 call helper_iret_real : ESP is updated, */
-        /* so we must save all gpr */
+                                &latxs_zero_ir2_opnd, size);
         latxs_tr_gen_call_to_helper((ADDR)helper_iret_real, HELPER_IRET_REAL);
     }
 
-    /* 3. restore native context */
     latxs_tr_gen_call_to_helper_epilogue_cfg(nofp_helper_cfg);
-
-    /* 5. disable eip update, since the helper modify eip */
     td->ignore_eip_update = 1;
 
     la_out1(LISA_LABEL, &label_end);
@@ -2653,15 +2623,19 @@ static bool latxs_do_fast_iret(IR1_INST *pir1, int size)
     return true;
 }
 
+#endif /* CONFIG_SOFTMMU */
+
 static bool latxs_do_translate_iret(IR1_INST *pir1, int size)
 {
     TRANSLATION_DATA *td = lsenv->tr_data;
     CHECK_EXCP_IRET(pir1);
 
+#ifdef CONFIG_SOFTMMU
     if (option_opt_iret && (size == 2)) {
         latxs_do_fast_iret(pir1, size);
         return true;
     }
+#endif
 
     ADDRX next_eip = ir1_addr_next(pir1);
     ADDRX next_eip_offset = 0;
