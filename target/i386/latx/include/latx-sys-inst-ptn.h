@@ -159,9 +159,15 @@ bool try_translate_instptn(IR1_INST *pir1);
 #endif
 
 #ifdef LATXS_INSTPTN_CPL_FILTER
-#define latxs_instptn_cpl_filter_void(tb) do {      \
-    uint32_t cpl = (tb)->flags & HF_CPL_MASK;       \
-    if (cpl != 3 && cpl != 0) return;               \
+#define latxs_instptn_cpl_filter_void(tb) do {          \
+    uint32_t cpl = (tb)->flags & HF_CPL_MASK;           \
+    if (cpl == 0) {                                     \
+        if (!(option_instptn & INSTPTN_OPT_CPL0)) {     \
+            return;                                     \
+        }                                               \
+    } else if (cpl != 3) {                              \
+        return;                                         \
+    }                                                   \
 } while (0)
 #else
 #define latxs_instptn_cpl_filter_void(tb)
