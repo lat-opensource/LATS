@@ -133,6 +133,8 @@
 #include "block/qdict.h"
 #include "qapi/qmp/qerror.h"
 #include "sysemu/iothread.h"
+#include "sysemu/block-backend.h"
+#include "sysemu/reset.h"
 #include "qemu/guest-random.h"
 #include "qemu/keyval.h"
 
@@ -729,6 +731,11 @@ static bool vl_is_qtest_requested(void)
 static void configure_blockdev(BlockdevOptionsQueue *bdo_queue,
                                MachineClass *machine_class, int snapshot)
 {
+    if (!vl_is_qtest_requested()) {
+        blockdev_set_auto_direct_drives(true);
+        qemu_register_reset(blk_reset_all_boot_read_pace, NULL);
+    }
+
     /*
      * If the currently selected machine wishes to override the
      * units-per-bus property of its default HBA interface type, do so

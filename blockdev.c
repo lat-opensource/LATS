@@ -464,6 +464,13 @@ static void extract_common_blockdev_options(QemuOpts *opts, int *bdrv_flags,
     }
 }
 
+static bool auto_direct_drives;
+
+void blockdev_set_auto_direct_drives(bool enable)
+{
+    auto_direct_drives = enable;
+}
+
 static OnOffAuto account_get_opt(QemuOpts *opts, const char *name)
 {
     if (!qemu_opt_find(opts, name)) {
@@ -579,6 +586,10 @@ static BlockBackend *blockdev_init(const char *file, QDict *bs_opts,
     }
 
     read_only = qemu_opt_get_bool(opts, BDRV_OPT_READ_ONLY, false);
+    if (qdict_get_try_bool(bs_opts, "x-auto-direct", false)) {
+        bdrv_flags |= BDRV_O_AUTO_DIRECT;
+    }
+    qdict_del(bs_opts, "x-auto-direct");
 
     /* init */
     if ((!file || !*file) && !qdict_size(bs_opts)) {
@@ -795,6 +806,8 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type,
     const char *werror, *rerror;
     bool read_only = false;
     bool copy_on_read;
+    bool explicit_cache;
+    bool is_hd_bus;
     const char *filename;
     int i;
 
@@ -834,6 +847,10 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type,
             return NULL;
         }
     }
+
+    explicit_cache = qemu_opt_find(all_opts, "cache") ||
+                     qemu_opt_find(all_opts, BDRV_OPT_CACHE_DIRECT) ||
+                     qemu_opt_find(all_opts, "file.cache.direct");
 
     value = qemu_opt_get(all_opts, "cache");
     if (value) {
@@ -1003,10 +1020,19 @@ DriveInfo *drive_new(QemuOpts *all_opts, BlockInterfaceType block_default_type,
     }
 
     /* Actual block device init: Functionality shared with blockdev-add */
+    is_hd_bus = (type == IF_IDE || type == IF_SCSI ||
+                 type == IF_VIRTIO || type == IF_NONE);
+    if (auto_direct_drives && media == MEDIA_DISK && is_hd_bus &&
+        !explicit_cache) {
+        qdict_put_bool(bs_opts, "x-auto-direct", true);
+    }
     blk = blockdev_init(filename, bs_opts, errp);
     bs_opts = NULL;
     if (!blk) {
         goto fail;
+    }
+    if (auto_direct_drives && media == MEDIA_DISK && is_hd_bus) {
+        blk_set_boot_read_pace_enabled(blk, true);
     }
 
     /* Create legacy DriveInfo */

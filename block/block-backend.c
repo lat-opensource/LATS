@@ -25,6 +25,7 @@
 #include "qemu/id.h"
 #include "qemu/main-loop.h"
 #include "qemu/option.h"
+#include "qemu/units.h"
 #include "trace.h"
 #include "migration/misc.h"
 
@@ -87,6 +88,17 @@ struct BlockBackend {
 
     VMChangeStateEntry *vmsh;
     bool force_allow_inactivate;
+
+    /*
+     * Boot-window buffered read pacer: smooths host page-cache burst reads
+     * during the initial 1 GiB after reset when O_DIRECT is not active, so
+     * guest ReadyBoot prefetch cannot outrun slow translated-vCPU PnP volume
+     * enumeration.
+     */
+    QemuSpin boot_pace_lock;
+    bool boot_pace_enabled;
+    uint64_t boot_pace_rd_bytes;
+    int64_t boot_pace_next_ns;
 
     /* Number of in-flight aio requests.  BlockDriverState also counts
      * in-flight requests but aio requests can exist even when blk->root is
@@ -370,6 +382,7 @@ BlockBackend *blk_new(AioContext *ctx, uint64_t perm, uint64_t shared_perm)
     block_acct_init(&blk->stats);
 
     qemu_mutex_init(&blk->queued_requests_lock);
+    qemu_spin_init(&blk->boot_pace_lock);
     qemu_co_queue_init(&blk->queued_requests);
     notifier_list_init(&blk->remove_bs_notifiers);
     notifier_list_init(&blk->insert_bs_notifiers);
@@ -1314,6 +1327,77 @@ static void coroutine_fn blk_wait_while_drained(BlockBackend *blk)
     }
 }
 
+#define BOOT_READ_PACE_WINDOW_BYTES (1ULL * GiB)
+#define BOOT_READ_PACE_RATE_BPS     (180ULL * MiB)
+#define BOOT_READ_PACE_BURST_NS     (NANOSECONDS_PER_SECOND / 45)
+
+void blk_set_boot_read_pace_enabled(BlockBackend *blk, bool enable)
+{
+    GLOBAL_STATE_CODE();
+    blk->boot_pace_enabled = enable;
+}
+
+void blk_reset_all_boot_read_pace(void *opaque)
+{
+    BlockBackend *blk;
+
+    GLOBAL_STATE_CODE();
+    QTAILQ_FOREACH(blk, &block_backends, link) {
+        qemu_spin_lock(&blk->boot_pace_lock);
+        qatomic_set(&blk->boot_pace_rd_bytes, 0);
+        blk->boot_pace_next_ns = 0;
+        qemu_spin_unlock(&blk->boot_pace_lock);
+    }
+}
+
+static bool GRAPH_RDLOCK bdrv_chain_has_buffered_protocol(BlockDriverState *bs)
+{
+    BlockDriverState *cur;
+
+    for (cur = bs; cur; cur = bdrv_filter_or_cow_bs(cur)) {
+        BlockDriverState *proto = cur->file ? cur->file->bs : cur;
+        if (proto && !(proto->open_flags & BDRV_O_NOCACHE)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int64_t GRAPH_RDLOCK blk_calc_boot_read_pace_ns(BlockBackend *blk,
+                                                       BlockDriverState *bs,
+                                                       int64_t bytes)
+{
+    int64_t now_ns, min_start_ns, base_ns, target_ns, wait_ns = 0;
+
+    if (likely(!blk->boot_pace_enabled || bytes <= 0 ||
+               qatomic_read(&blk->boot_pace_rd_bytes) >=
+                   BOOT_READ_PACE_WINDOW_BYTES ||
+               blk->public.throttle_group_member.throttle_state)) {
+        return 0;
+    }
+    if (!bdrv_chain_has_buffered_protocol(bs)) {
+        return 0;
+    }
+
+    now_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    qemu_spin_lock(&blk->boot_pace_lock);
+    if (blk->boot_pace_rd_bytes < BOOT_READ_PACE_WINDOW_BYTES) {
+        qatomic_set(&blk->boot_pace_rd_bytes,
+                    blk->boot_pace_rd_bytes + (uint64_t)bytes);
+        min_start_ns = now_ns - BOOT_READ_PACE_BURST_NS;
+        base_ns = MAX(blk->boot_pace_next_ns, min_start_ns);
+        target_ns = base_ns +
+                    muldiv64(bytes, NANOSECONDS_PER_SECOND,
+                             BOOT_READ_PACE_RATE_BPS);
+        blk->boot_pace_next_ns = target_ns;
+        if (target_ns > now_ns) {
+            wait_ns = target_ns - now_ns;
+        }
+    }
+    qemu_spin_unlock(&blk->boot_pace_lock);
+    return wait_ns;
+}
+
 /* To be called between exactly one pair of blk_inc/dec_in_flight() */
 static int coroutine_fn
 blk_co_do_preadv_part(BlockBackend *blk, int64_t offset, int64_t bytes,
@@ -1321,6 +1405,7 @@ blk_co_do_preadv_part(BlockBackend *blk, int64_t offset, int64_t bytes,
                       BdrvRequestFlags flags)
 {
     int ret;
+    int64_t pace_ns;
     BlockDriverState *bs;
     IO_CODE();
 
@@ -1342,6 +1427,11 @@ blk_co_do_preadv_part(BlockBackend *blk, int64_t offset, int64_t bytes,
     if (blk->public.throttle_group_member.throttle_state) {
         throttle_group_co_io_limits_intercept(&blk->public.throttle_group_member,
                 bytes, false);
+    } else {
+        pace_ns = blk_calc_boot_read_pace_ns(blk, bs, bytes);
+        if (unlikely(pace_ns > 0)) {
+            qemu_co_sleep_ns(QEMU_CLOCK_REALTIME, pace_ns);
+        }
     }
 
     ret = bdrv_co_preadv_part(blk->root, offset, bytes, qiov, qiov_offset,

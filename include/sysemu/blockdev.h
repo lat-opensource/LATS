@@ -44,6 +44,7 @@ struct DriveInfo {
 
 void blockdev_mark_auto_del(BlockBackend *blk);
 void blockdev_auto_del(BlockBackend *blk);
+void blockdev_set_auto_direct_drives(bool enable);
 
 DriveInfo *blk_legacy_dinfo(BlockBackend *blk);
 DriveInfo *blk_set_legacy_dinfo(BlockBackend *blk, DriveInfo *dinfo);

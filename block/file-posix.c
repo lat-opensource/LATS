@@ -355,6 +355,19 @@ static bool dio_byte_aligned(int fd)
     return false;
 }
 
+static bool raw_is_ram_backed_fs(int fd)
+{
+#ifdef __linux__
+    struct statfs buf;
+
+    if (fstatfs(fd, &buf) == 0 &&
+        (buf.f_type == TMPFS_MAGIC || buf.f_type == RAMFS_MAGIC)) {
+        return true;
+    }
+#endif
+    return false;
+}
+
 static bool raw_needs_alignment(BlockDriverState *bs)
 {
     BDRVRawState *s = bs->opaque;
@@ -687,14 +700,54 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
     raw_parse_flags(bdrv_flags, &s->open_flags, false);
 
     s->fd = -1;
-    fd = qemu_open(filename, s->open_flags, errp);
-    ret = fd < 0 ? -errno : 0;
-
-    if (ret < 0) {
-        if (ret == -EROFS) {
-            ret = -EACCES;
+    fd = -1;
+    if (!device && (bdrv_flags & BDRV_O_AUTO_DIRECT) &&
+        !(bdrv_flags & BDRV_O_NOCACHE) &&
+        (!bs->explicit_options ||
+         !qdict_haskey(bs->explicit_options, BDRV_OPT_CACHE_DIRECT))) {
+        Error *probe_err = NULL;
+        int direct_fd = qemu_open(filename, s->open_flags | O_DIRECT,
+                                  &probe_err);
+        if (direct_fd >= 0) {
+            struct stat probe_st;
+            if (fstat(direct_fd, &probe_st) == 0 &&
+                S_ISREG(probe_st.st_mode) &&
+                !raw_is_ram_backed_fs(direct_fd)) {
+                bs->open_flags |= BDRV_O_NOCACHE;
+                s->fd = direct_fd;
+                s->needs_alignment = raw_needs_alignment(bs);
+                raw_probe_alignment(bs, direct_fd, &probe_err);
+            } else {
+                error_setg(&probe_err,
+                           "auto-direct applies to disk-backed regular files");
+            }
+            if (!probe_err) {
+                fd = direct_fd;
+                s->open_flags |= O_DIRECT;
+                bdrv_flags |= BDRV_O_NOCACHE;
+                qdict_put_bool(bs->options, BDRV_OPT_CACHE_DIRECT, true);
+            } else {
+                bs->open_flags &= ~BDRV_O_NOCACHE;
+                s->fd = -1;
+                s->needs_alignment = false;
+                bs->bl.request_alignment = 0;
+                s->buf_align = 0;
+                qemu_close(direct_fd);
+            }
         }
-        goto fail;
+        error_free(probe_err);
+    }
+
+    if (fd < 0) {
+        fd = qemu_open(filename, s->open_flags, errp);
+        ret = fd < 0 ? -errno : 0;
+
+        if (ret < 0) {
+            if (ret == -EROFS) {
+                ret = -EACCES;
+            }
+            goto fail;
+        }
     }
     s->fd = fd;
 
@@ -709,6 +762,18 @@ static int raw_open_common(BlockDriverState *bs, QDict *options,
 
     s->perm = 0;
     s->shared_perm = BLK_PERM_ALL;
+
+#ifdef CONFIG_LINUX_AIO
+    if ((bdrv_flags & BDRV_O_AUTO_DIRECT) && (s->open_flags & O_DIRECT) &&
+        !qemu_opt_find(opts, "aio") &&
+        !(bdrv_flags & (BDRV_O_NATIVE_AIO | BDRV_O_IO_URING))) {
+        Error *laio_err = NULL;
+        if (aio_setup_linux_aio(bdrv_get_aio_context(bs), &laio_err)) {
+            s->use_linux_aio = true;
+        }
+        error_free(laio_err);
+    }
+#endif
 
 #ifdef CONFIG_LINUX_AIO
      /* Currently Linux does AIO only for files opened with O_DIRECT */

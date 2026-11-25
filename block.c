@@ -1243,7 +1243,7 @@ static void bdrv_temp_snapshot_options(int *child_flags, QDict *child_options,
 
     /* aio=native doesn't work for cache.direct=off, so disable it for the
      * temporary snapshot */
-    *child_flags &= ~BDRV_O_NATIVE_AIO;
+    *child_flags &= ~(BDRV_O_NATIVE_AIO | BDRV_O_AUTO_DIRECT);
 }
 
 static void bdrv_backing_attach(BdrvChild *c)
