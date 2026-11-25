@@ -43,3 +43,12 @@ if targetos == 'linux' and 'CONFIG_LATX_OPT_BQL' in config_host
   test('test-qemu-cond-bql', test_qemu_cond_bql,
        suite: ['unit', 'latx-thread'], timeout: 15)
 endif
+
+test('test-page-lock-release', python,
+     args: [join_paths(meson.current_source_dir(), 'test-page-lock-release.py'),
+            meson.project_source_root()],
+     suite: ['unit', 'latx-thread'], timeout: 60)
+test('test-latx-smp-defaults', python,
+     args: [join_paths(meson.current_source_dir(), 'test-latx-smp-defaults.py'),
+            meson.project_source_root()],
+     suite: ['unit', 'latx-system'], timeout: 30)

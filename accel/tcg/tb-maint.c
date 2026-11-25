@@ -224,6 +224,9 @@ typedef struct NativeSourceOwner {
 
 struct PageDesc {
     QemuSpin lock;
+    /* Thread that currently owns @lock, or -1.  Used only as a safety net
+     * for page locks that survive an aborted translation. */
+    int lock_owner;
     /* list of TBs intersecting this ram page */
     uintptr_t first_tb[MTCC_NR];
 #ifdef CONFIG_LATX_TU
@@ -297,6 +300,7 @@ static PageDesc *page_find_alloc(tb_page_addr_t index, bool alloc)
         pd = g_new0(PageDesc, V_L2_SIZE);
         for (int i = 0; i < V_L2_SIZE; i++) {
             qemu_spin_init(&pd[i].lock);
+            pd[i].lock_owner = -1;
             pd[i].aot_mesage = PAGE_NO_LOAD;
         }
 
@@ -473,10 +477,37 @@ static inline void assert_page_locked(const PageDesc *pd) { }
 
 #endif /* CONFIG_DEBUG_TCG */
 
+#define LATX_PAGE_LOCK_REGISTRY_MAX 256
+static __thread PageDesc *latx_page_lock_registry[LATX_PAGE_LOCK_REGISTRY_MAX];
+static __thread int latx_page_lock_registry_num;
+static __thread bool latx_page_lock_registry_overflow;
+
+static void page_lock_registry_add(PageDesc *pd)
+{
+    if (latx_page_lock_registry_num < LATX_PAGE_LOCK_REGISTRY_MAX) {
+        latx_page_lock_registry[latx_page_lock_registry_num++] = pd;
+    } else {
+        latx_page_lock_registry_overflow = true;
+    }
+}
+
+static void page_lock_registry_del(PageDesc *pd)
+{
+    for (int i = latx_page_lock_registry_num - 1; i >= 0; i--) {
+        if (latx_page_lock_registry[i] == pd) {
+            latx_page_lock_registry[i] =
+                latx_page_lock_registry[--latx_page_lock_registry_num];
+            return;
+        }
+    }
+}
+
 static void page_lock(PageDesc *pd)
 {
     page_lock__debug(pd);
     qemu_spin_lock(&pd->lock);
+    pd->lock_owner = qemu_get_thread_id();
+    page_lock_registry_add(pd);
 }
 
 /* Like qemu_spin_trylock, returns false on success */
@@ -484,6 +515,8 @@ static bool page_trylock(PageDesc *pd)
 {
     bool busy = qemu_spin_trylock(&pd->lock);
     if (!busy) {
+        pd->lock_owner = qemu_get_thread_id();
+        page_lock_registry_add(pd);
         page_lock__debug(pd);
     }
     return busy;
@@ -491,6 +524,8 @@ static bool page_trylock(PageDesc *pd)
 
 static void page_unlock(PageDesc *pd)
 {
+    page_lock_registry_del(pd);
+    pd->lock_owner = -1;
     qemu_spin_unlock(&pd->lock);
     page_unlock__debug(pd);
 }
@@ -679,19 +714,34 @@ void tb_unlock_pages(TranslationBlock *tb)
         page_unlock(page_find_alloc(pindex1, false));
     }
     page_unlock(page_find_alloc(pindex0, false));
+
+    /*
+     * If these pages were also recorded in the LAT translation context,
+     * drop the bookkeeping so a later tb_unlock_ctx_pages() cannot release
+     * a page that is no longer owned by this vCPU.
+     */
+    if (tcg_ctx->pre_locked_page0 == paddr0 ||
+        tcg_ctx->pre_locked_page0 == paddr1) {
+        tcg_ctx->pre_locked_page0 = -1;
+    }
+    if (tcg_ctx->pre_locked_page1 == paddr1 ||
+        tcg_ctx->pre_locked_page1 == paddr0) {
+        tcg_ctx->pre_locked_page1 = -1;
+    }
 }
 
 void tb_unlock_tu_pages(void);
 
 void tb_unlock_ctx_pages(int reset)
 {
+    /*
+     * A translation may have moved between TU and JIT mode (for example a
+     * TU fallback or a nested RAS translation).  TU-managed locks and the
+     * directly locked pre_locked_pageX pages are independent: release both
+     * sets instead of choosing one based on the current mode.
+     */
     if (lsenv->tr_data->is_tu_mode && cp_tu_pages()) {
         tb_unlock_tu_pages();
-        if (reset) {
-            tcg_ctx->pre_locked_page0 = -1;
-            tcg_ctx->pre_locked_page1 = -1;
-        }
-        return;
     }
     if (tcg_ctx->pre_locked_page1 != -1) {
         if (tcg_ctx->pre_locked_page1 != tcg_ctx->pre_locked_page0) {
@@ -703,6 +753,65 @@ void tb_unlock_ctx_pages(int reset)
         tb_unlock_page0(tcg_ctx->pre_locked_page0);
         if (reset) tcg_ctx->pre_locked_page0 = -1;
     }
+}
+
+/*
+ * Final safety net: no page lock may survive across guest execution.
+ * Aborted translations can longjmp through paths that bypass the normal
+ * pre_locked_page bookkeeping; release only locks that this thread owns.
+ */
+bool tb_release_ctx_page_locks(void)
+{
+    bool released = false;
+
+    /*
+     * dune_loop() is also used by helper threads that never registered a
+     * TCG context (fake-fork/system call paths).  Only the per-thread lock
+     * registry is valid there.
+     */
+    if (tcg_ctx) {
+        tb_page_addr_t pages[2] = { tcg_ctx->pre_locked_page0,
+                                    tcg_ctx->pre_locked_page1 };
+
+        if (lsenv && lsenv->tr_data &&
+            lsenv->tr_data->is_tu_mode && cp_tu_pages()) {
+            tb_unlock_tu_pages();
+        }
+        for (int i = 0; i < 2; i++) {
+            PageDesc *pd;
+            if (pages[i] == (tb_page_addr_t)-1 ||
+                (i == 1 && pages[i] == pages[0])) {
+                continue;
+            }
+            pd = page_find_alloc(pages[i] >> TARGET_PAGE_BITS, false);
+            if (pd && pd->lock_owner == qemu_get_thread_id()) {
+                page_unlock(pd);
+                released = true;
+            }
+        }
+        tcg_ctx->pre_locked_page0 = -1;
+        tcg_ctx->pre_locked_page1 = -1;
+    }
+
+    /*
+     * The pre_locked_pageX/TU lists do not cover every acquisition path
+     * (AOT loading, SMC invalidation, or a TU list that was already reset).
+     * Sweep the per-thread registry as well.
+     */
+    while (latx_page_lock_registry_num > 0) {
+        PageDesc *pd =
+            latx_page_lock_registry[latx_page_lock_registry_num - 1];
+        if (pd->lock_owner == qemu_get_thread_id()) {
+            page_unlock(pd);
+            released = true;
+        } else {
+            latx_page_lock_registry_num--;
+        }
+    }
+    if (latx_page_lock_registry_overflow) {
+        latx_page_lock_registry_overflow = false;
+    }
+    return released;
 }
 
 void unlock_page(uint64 addr)

@@ -1371,11 +1371,18 @@ static TranslationBlock *tb_explore(CPUState *cpu,
             if (waited) {
                 lookup_after_lock = lal_level(1);
             }
-        } else if (tb_trylock_page0(phys_pc)) {
-            tb_lock_page0(phys_pc);
-            lookup_after_lock = lal_level(1);
+            /*
+             * The lock is owned by tu_data->locked_pages and released by
+             * tb_unlock_tu_pages().  Do not also record it as a directly
+             * held page, or tb_unlock_ctx_pages() would release it twice.
+             */
+        } else {
+            if (tb_trylock_page0(phys_pc)) {
+                tb_lock_page0(phys_pc);
+                lookup_after_lock = lal_level(1);
+            }
+            tcg_ctx->pre_locked_page0 = phys_pc;
         }
-        tcg_ctx->pre_locked_page0 = phys_pc;
         /* page is busy, lookup again after get the lock
          * to avoid useless translation */
         if (lookup_after_lock) {

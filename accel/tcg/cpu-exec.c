@@ -1825,6 +1825,7 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 #else
     tb_unlock_ctx_pages(1);
 #endif
+    tb_release_ctx_page_locks();
 #endif
     if (qemu_mutex_iothread_locked()) {
         qemu_mutex_unlock_iothread();
@@ -1883,6 +1884,7 @@ void cpu_exec_step_atomic(CPUState *cpu)
             tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
             mmap_unlock();
         }
+        tb_release_ctx_page_locks();
 
         cpu_exec_enter(cpu);
         exec_entered = true;
@@ -2551,6 +2553,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
 #else
                 tb = tb_gen_code(cpu, pc, cs_base, flags, cflags);
 #endif
+                tb_release_ctx_page_locks();
                 mmap_unlock();
 
                 /*

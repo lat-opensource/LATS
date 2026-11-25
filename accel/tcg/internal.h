@@ -71,6 +71,7 @@ void tb_lock_page1(tb_page_addr_t, tb_page_addr_t);
 void tb_unlock_page1(tb_page_addr_t, tb_page_addr_t);
 void tb_unlock_pages(TranslationBlock *);
 void tb_unlock_ctx_pages(int reset);
+bool tb_release_ctx_page_locks(void);
 void unlock_page(uint64_t addr);
 #endif
 
