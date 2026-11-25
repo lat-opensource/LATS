@@ -42,11 +42,12 @@ if (ir1_need_calculate_any_flag(pir1))
 #endif /* LATXS_FLAGRDTN_OPTION_CHECK */
 
 #ifdef LATXS_FLAGRDTN_CPL_FILTER_
-#define latxs_flag_cpl_filter(tb) do {  \
-    if ((tb->flags & 0x3) != 3)  {      \
-        tb_flag(tb);                    \
-        return;                         \
-    }                                   \
+#define latxs_flag_cpl_filter(tb) do {              \
+    uint32_t cpl = (tb)->flags & HF_CPL_MASK;       \
+    if (cpl != 3 && cpl != 0) {                     \
+        tb_flag(tb);                                \
+        return;                                     \
+    }                                               \
 } while (0)
 #else /* no LATXS_FLAGRDTN_CPL_FILTER_ */
 #define latxs_flag_cpl_filter(tb)

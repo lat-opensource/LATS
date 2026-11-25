@@ -336,6 +336,9 @@ static int inst_pattern(TranslationBlock *tb,
         }
     case WRAP(UCOMISD):
         SCAN_CHECK(scan, 0);
+        if (tb->flags & (HF_TS_MASK | HF_EM_MASK)) {
+            return 0;
+        }
         latxs_instptn_check_ucomisd_seta_0();
 
         ir1 = SCAN_IR1(list, scan, 0);
@@ -755,6 +758,9 @@ static bool inst_pattern_scan_jcc_end(TranslationBlock *tb,
         }
     case WRAP(BT):
         SCAN_CHECK(scan, 0);
+        if (td->opt_mmio && td->opt_mmio_type == TB_OPT_MMIO_APIC) {
+            return false;
+        }
         ir1_jcc = SCAN_IR1(list, scan, 0);
         switch (ir1_opcode(ir1_jcc)) {
         case WRAP(JB):
@@ -778,6 +784,9 @@ static bool inst_pattern_scan_jcc_end(TranslationBlock *tb,
         }
     case WRAP(COMISD):
         SCAN_CHECK(scan, 0);
+        if (tb->flags & (HF_TS_MASK | HF_EM_MASK)) {
+            return false;
+        }
         ir1_jcc = SCAN_IR1(list, scan, 0);
         switch (ir1_opcode(ir1_jcc)) {
         case WRAP(JA):
@@ -810,6 +819,9 @@ static bool inst_pattern_scan_jcc_end(TranslationBlock *tb,
         }
     case WRAP(COMISS):
         SCAN_CHECK(scan, 0);
+        if (tb->flags & (HF_TS_MASK | HF_EM_MASK)) {
+            return false;
+        }
         ir1_jcc = SCAN_IR1(list, scan, 0);
         switch (ir1_opcode(ir1_jcc)) {
         case WRAP(JA):
@@ -842,6 +854,9 @@ static bool inst_pattern_scan_jcc_end(TranslationBlock *tb,
         }
     case WRAP(UCOMISD):
         SCAN_CHECK(scan, 0);
+        if (tb->flags & (HF_TS_MASK | HF_EM_MASK)) {
+            return false;
+        }
         ir1_jcc = SCAN_IR1(list, scan, 0);
         switch (ir1_opcode(ir1_jcc)) {
         case WRAP(JA):
@@ -874,6 +889,9 @@ static bool inst_pattern_scan_jcc_end(TranslationBlock *tb,
         }
     case WRAP(UCOMISS):
         SCAN_CHECK(scan, 0);
+        if (tb->flags & (HF_TS_MASK | HF_EM_MASK)) {
+            return false;
+        }
         ir1_jcc = SCAN_IR1(list, scan, 0);
         switch (ir1_opcode(ir1_jcc)) {
         case WRAP(JA):
@@ -1046,24 +1064,37 @@ static bool inst_pattern_scan_jcc_end(TranslationBlock *tb,
             return false;
         }
     }
+    case WRAP(MOV):
+        if (td->opt_mmio) {
+            return false;
+        }
+        opnd0 = ir1_get_opnd(pir1, 0);
+        opnd1 = ir1_get_opnd(pir1, 1);
+        return (ir1_opnd_is_gpr(opnd0) || ir1_opnd_is_mem(opnd0)) &&
+               (ir1_opnd_is_gpr(opnd1) || ir1_opnd_is_mem(opnd1) ||
+                ir1_opnd_is_imm(opnd1));
+    case WRAP(MOVSD):
+        if (pir1->info->detail->x86.opcode[0] == 0xa5) {
+            return false;
+        }
+        return !(tb->flags & (HF_TS_MASK | HF_EM_MASK));
     case WRAP(ADDSD):
     case WRAP(ADDSS):
-    case WRAP(LEA):
-    case WRAP(MOV):
     case WRAP(MOVAPD):
     case WRAP(MOVHPS):
     case WRAP(MOVLPS):
-    case WRAP(MOVSD):
     case WRAP(MOVSS):
-    case WRAP(MOVSX):
-    case WRAP(MOVSXD):
-    case WRAP(MOVZX):
     case WRAP(MULPS):
     case WRAP(MULSD):
     case WRAP(MULSS):
-    case WRAP(NOP):
     case WRAP(PSHUFD):
     case WRAP(PUNPCKLWD):
+        return !(tb->flags & (HF_TS_MASK | HF_EM_MASK));
+    case WRAP(LEA):
+    case WRAP(MOVSX):
+    case WRAP(MOVSXD):
+    case WRAP(MOVZX):
+    case WRAP(NOP):
     case WRAP(PUSH):
         return true;
     default:
