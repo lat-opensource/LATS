@@ -694,6 +694,38 @@ static void default_drive(int enable, int snapshot, BlockInterfaceType type,
 
 }
 
+static int accel_opt_is_qtest(void *opaque, QemuOpts *opts, Error **errp)
+{
+    const char *acc = qemu_opt_get(opts, "accel");
+
+    if (acc && g_str_equal(acc, "qtest")) {
+        *(bool *)opaque = true;
+        return 1;
+    }
+    return 0;
+}
+
+static bool vl_is_qtest_requested(void)
+{
+    bool is_qtest = false;
+    const char *m_accel;
+
+    if (qtest_chrdev != NULL) {
+        return true;
+    }
+    if (accelerators && strstr(accelerators, "qtest") != NULL) {
+        return true;
+    }
+    m_accel = machine_opts_dict ?
+              qdict_get_try_str(machine_opts_dict, "accel") : NULL;
+    if (m_accel && strstr(m_accel, "qtest") != NULL) {
+        return true;
+    }
+    qemu_opts_foreach(qemu_find_opts("accel"), accel_opt_is_qtest,
+                      &is_qtest, NULL);
+    return is_qtest;
+}
+
 static void configure_blockdev(BlockdevOptionsQueue *bdo_queue,
                                MachineClass *machine_class, int snapshot)
 {
@@ -1305,7 +1337,10 @@ static void qemu_disable_default_devices(void)
     if (!has_defaults || machine_class->no_parallel) {
         default_parallel = 0;
     }
-    if (!has_defaults || machine_class->no_floppy) {
+    if (!has_defaults ||
+        (machine_class->no_floppy &&
+         !(vl_is_qtest_requested() &&
+           g_str_equal(machine_class->name, "pc-i440fx-8.1")))) {
         default_floppy = 0;
     }
     if (!has_defaults || machine_class->no_cdrom) {

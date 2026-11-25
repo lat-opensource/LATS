@@ -46,6 +46,7 @@
 #include "hw/ide/piix.h"
 #include "hw/irq.h"
 #include "sysemu/kvm.h"
+#include "sysemu/qtest.h"
 #include "hw/kvm/clock.h"
 #include "hw/sysbus.h"
 #include "hw/i2c/smbus_eeprom.h"
@@ -318,7 +319,8 @@ static void pc_init1(MachineState *machine,
     }
 
     /* init basic PC hardware */
-    pc_basic_device_init(pcms, isa_bus, x86ms->gsi, rtc_state, true,
+    pc_basic_device_init(pcms, isa_bus, x86ms->gsi, rtc_state,
+                         !MACHINE_GET_CLASS(pcms)->no_floppy || qtest_enabled(),
                          0x4);
 
     pc_nic_init(pcmc, isa_bus, pci_bus);
@@ -509,6 +511,7 @@ static void pc_i440fx_8_1_machine_options(MachineClass *m)
     pc_i440fx_machine_options(m);
     m->alias = "pc";
     m->is_default = true;
+    m->no_floppy = 1;
 }
 
 DEFINE_I440FX_MACHINE(v8_1, "pc-i440fx-8.1", NULL,
@@ -521,6 +524,7 @@ static void pc_i440fx_8_0_machine_options(MachineClass *m)
     pc_i440fx_8_1_machine_options(m);
     m->alias = NULL;
     m->is_default = false;
+    m->no_floppy = 0;
     compat_props_add(m->compat_props, hw_compat_8_0, hw_compat_8_0_len);
     compat_props_add(m->compat_props, pc_compat_8_0, pc_compat_8_0_len);
 
