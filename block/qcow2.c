@@ -876,6 +876,27 @@ static void qcow2_attach_aio_context(BlockDriverState *bs,
     cache_clean_timer_init(bs, new_context);
 }
 
+static uint64_t qcow2_default_l2_cache_max_size(void)
+{
+#if defined(CONFIG_LINUX) && HOST_LONG_BITS == 64
+    static size_t cached_max;
+
+    if (g_once_init_enter(&cached_max)) {
+        size_t max_sz = DEFAULT_L2_CACHE_MAX_SIZE;
+        long pages = sysconf(_SC_PHYS_PAGES);
+        size_t page_sz = qemu_real_host_page_size();
+
+        if (pages > 0 && (uint64_t)pages * page_sz >= 16ULL * GiB) {
+            max_sz = DEFAULT_L2_CACHE_LARGE_RAM_MAX_SIZE;
+        }
+        g_once_init_leave(&cached_max, max_sz);
+    }
+    return cached_max;
+#else
+    return DEFAULT_L2_CACHE_MAX_SIZE;
+#endif
+}
+
 static bool read_cache_sizes(BlockDriverState *bs, QemuOpts *opts,
                              uint64_t *l2_cache_size,
                              uint64_t *l2_cache_entry_size,
@@ -900,7 +921,7 @@ static bool read_cache_sizes(BlockDriverState *bs, QemuOpts *opts,
 
     combined_cache_size = qemu_opt_get_size(opts, QCOW2_OPT_CACHE_SIZE, 0);
     l2_cache_max_setting = qemu_opt_get_size(opts, QCOW2_OPT_L2_CACHE_SIZE,
-                                             DEFAULT_L2_CACHE_MAX_SIZE);
+                                             qcow2_default_l2_cache_max_size());
     *refcount_cache_size = qemu_opt_get_size(opts,
                                              QCOW2_OPT_REFCOUNT_CACHE_SIZE, 0);
 

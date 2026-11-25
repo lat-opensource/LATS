@@ -43,6 +43,7 @@ GlobalProperty hw_compat_8_0[] = {
     { "migration", "multifd-flush-after-each-section", "on"},
     { TYPE_PCI_DEVICE, "x-pcie-ari-nextfn-1", "on" },
     { "virtio-gpu-device", "x-scanout-vmstate-version", "1" },
+    { "ide-hd", "rotation_rate", "0" },
 };
 const size_t hw_compat_8_0_len = G_N_ELEMENTS(hw_compat_8_0);
 
