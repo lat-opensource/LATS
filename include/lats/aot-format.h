@@ -473,6 +473,8 @@ typedef enum aot_rel_kind {
     AOT_NATIVE_SYSTEM,
     /* Source-TB owned direct BL to another guarded direct-entry LLVM function. */
     AOT_NATIVE_LINKED_CALL,
+    /* Returning software-INT delivery; appended to preserve existing IDs. */
+    LOAD_SOFTWARE_INTERRUPT_HELPER,
 } aot_rel_kind;
 
 #define AOT_NATIVE_CALL_STUB_SIZE 64

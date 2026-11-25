@@ -1,6 +1,7 @@
-# IRETQ system test
+# IRETQ and software INT system test
 
-This 64 KiB x86-64 firmware tests actual privileged `IRETQ` instructions.
+This 64 KiB x86-64 firmware tests actual privileged `IRETQ` instructions and
+long-mode software `INT` delivery.
 It needs no guest disk, guest OS, bootloader, or runtime libraries. Select the
 emulator and its IRET optimization options outside the test.
 
@@ -38,6 +39,11 @@ host CPU cycles or isolated IRET instruction costs. Compare the same firmware,
 CPU model, and emulator settings, repeating measurements externally.
 
 `build.py --iterations 2 /tmp/iret-trace.bin` builds a short diagnostic run.
+`--int-loop` instead prints `IRET INT LOOP` and repeatedly enters the same
+software interrupt, resetting RSP without an IRET or ordinary branch. It never
+prints PASS: an external controller must check that QMP stop, resume and quit
+are acknowledged while the guest is looping. This checks polling at the INT
+exit itself, which an ordinary INT/IRET benchmark cannot isolate.
 `--bench-only` skips the correctness matrix and runs only the two timed loops;
 it prints `IRET BENCH ONLY (matrix skipped)`. This can measure an existing
 implementation that fails a later matrix case, and cannot replace the full
@@ -82,12 +88,33 @@ The cases are:
 | 27 | CPL3 invalidates supervisor DS/ES, while null FS/GS preserve their distinct 64-bit bases |
 | 28–29 | With XSAVE+MPX, opposite BNDCFGS/BNDCFGU preserve settings switch correctly at CPL3; XSAVE checks the bounds after a conditional branch |
 | 30 | DPL0 conforming readable code loaded into DS/ES/FS/GS retains all selectors at CPL3; non-null FS/GS also retain their distinct bases (runs before optional MPX cases) |
+| 31–32 | CPL0 software INT through interrupt/trap gates: all 15 GPRs, 16 XMM registers, complete saved frame, returned RFLAGS, and distinct handler IF behavior |
+| 33 | CPL3 software INT switches to TSS.RSP0, preserves integer/SIMD state, saves user CS/SS/RSP/RFLAGS, and returns to the next user instruction |
+| 34 | CPL0 software INT switches to an IST stack despite unchanged privilege |
+| 35–36 | `INT $8` and `INT $14` build ordinary software-interrupt frames without the hardware exception error code; saved RIP points after the INT |
+| 37–42 | Invalid IDT gate type, nonpresent gate, IDT limit, null/data/nonpresent target CS: correct #GP/#NP error code and original instruction/state |
+| 43 | CPL3 cannot invoke a DPL0 gate |
+| 44 | CPL3 entry faults while writing a missing TSS.RSP0 stack page; #PF reports supervisor write and exact CR2 |
+| 45–46 | Invalid gate type takes precedence over a missing destination stack; gate DPL check takes precedence over its not-present bit |
+| 47 | CPL0 IST entry faults while writing a missing destination stack page; original CPL0 state remains visible |
+| 48 | INT entry and subsequent #PF entry both fail on the same missing TSS.RSP0 stack; #DF uses a separate valid IST stack and reports vector 8/error 0 |
+| 49–50 | An invalid gate for software INT 8/14 produces #GP with error 0x42/0x72, rather than treating the software INT as an existing hardware exception and incorrectly escalating |
+| 51 | Prime a user-mode CLI translation at a low executable address, then enter that exact PC through a CPL3 INT ending at a 4 KiB page boundary; CLI must execute with kernel privilege and the full saved frame must be correct |
 
 Expected exceptions check vector, error code, faulting IRET RIP, original
 RSP/CS/SS/RFLAGS, and preserved RBX/R12; page faults also check CR2. Separate
 interrupt-stack-table stacks permit checking an inaccessible IRET stack.
 Exception recovery restores the fixture page mappings and GDT before resuming.
 The test checks the existing QEMU helper's #NP behavior for a nonpresent SS.
+The INT fault cases additionally check all 15 GPRs and 16 XMM registers, using
+an independent IST page-fault stack for a missing destination stack. Cases
+31–51 run before the optional MPX cases and print `IRET INT PASS` when complete;
+this intermediate marker alone does not mean the complete ROM passed. The #DF
+case checks the saved CS/SS/RSP/RFLAGS and integer/SIMD registers, but deliberately
+does not require a particular saved RIP because #DF is an abort. Case 51
+primes the user translation by requiring a CLI #GP at the handler PC; its
+recovery avoids CR3/page-table writes, and the code stays unchanged before
+the page-ending INT invokes the same PC at CPL0.
 
 The APIC and SIMD checks require an APIC/SSE2-capable CPU model, such as
 `qemu64`. The MPX cases additionally require CPUID XSAVE and MPX; the firmware
@@ -96,4 +123,7 @@ prints an explicit skip otherwise. Reference QEMU's `-cpu max` runs them;
 without external emulator-state changes.
 
 This firmware does not cover 16/32-bit IRET, VM86/task returns, SVM interception,
-or debugging traps. Existing general x86 system tests and OS boots remain necessary.
+or debugging traps. The INT matrix covers long-mode interrupt/trap gates; it
+does not cover 16/32-bit delivery, task gates, virtualization interception,
+INTO, INT3 debugging semantics, or triple-fault reset. Existing general x86
+system tests and OS boots remain necessary.

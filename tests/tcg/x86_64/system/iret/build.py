@@ -11,10 +11,16 @@ parser.add_argument('--iterations', type=int, default=100000,
                     help='iterations per timed loop; use 2 for helper tracing')
 parser.add_argument('--bench-only', action='store_true',
                     help='skip the correctness matrix; run the two timed loops')
+parser.add_argument('--int-loop', action='store_true',
+                    help='loop through INT without IRET; externally test stop/resume')
 args = parser.parse_args()
 if not 1 <= args.iterations <= 1000000000:
     parser.error('--iterations must be in 1..1000000000')
 defines = ['-DIRET_BENCH_ONLY'] if args.bench_only else []
+if args.int_loop:
+    if args.bench_only:
+        parser.error('--int-loop and --bench-only are mutually exclusive')
+    defines.append('-DIRET_INT_LOOP')
 source = Path(__file__).with_name('iret.S')
 args.output.parent.mkdir(parents=True, exist_ok=True)
 obj = args.output.with_suffix('.o')

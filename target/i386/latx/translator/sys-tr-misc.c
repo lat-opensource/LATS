@@ -16,6 +16,7 @@
 #include "latx-ras.h"
 #include "latx-sys-hamt-dmw.h"
 #include "latx-misc.h"
+#include "latx-helper.h"
 #include "hamt-data.h"
 #ifdef CONFIG_LATX_TU
 #include "latx-tu.h"
@@ -1990,120 +1991,6 @@ static inline void fast_get_seg_limit(IR2_OPND *e1, IR2_OPND *e2, IR2_OPND *limi
     la_out1(LISA_LABEL, &label_end);
 }
 
-/*
- * copy from cpu_sync_bndcs_hflags(CPUX86State *env),
- *
- */
-static inline void latx_cpu_sync_bndcs_hflags(
-                IR2_OPND *hflags, IR2_OPND *hflags2)
-{
-    /*
-     * hflags &= ~HF_MPX_EN_MASK;
-     * env->hflags = hflags;
-     */
-    latxs_load_imm64(hflags2, HF_MPX_EN_MASK);
-    la_out3(LISA_ANDN, hflags, hflags, hflags2);
-    latxs_append_ir2_opnd2i(LISA_ST_W, hflags, &latxs_env_ir2_opnd,
-        lsenv_offset_of_hflags(lsenv));
-
-    /*
-     * hflags2 &= ~HF2_MPX_PR_MASK;
-     * env->hflags2 = hflags2;
-     */
-    latxs_append_ir2_opnd2i(LISA_LD_WU, hflags2, &latxs_env_ir2_opnd,
-        lsenv_offset_of_hflags2(lsenv));
-    latxs_load_imm64(hflags, HF2_MPX_PR_MASK);
-    la_out3(LISA_ANDN, hflags2, hflags2, hflags);
-    latxs_append_ir2_opnd2i(LISA_ST_W, hflags2, &latxs_env_ir2_opnd,
-        lsenv_offset_of_hflags2(lsenv));
-}
-
-static inline void fast_cpu_x86_load_seg_cache(
-                X86Seg seg_reg, IR2_OPND *selector,
-                IR2_OPND *base, IR2_OPND *limit,
-                IR2_OPND *flags)
-{
-    IR2_OPND tmp = latxs_arg0_ir2_opnd;
-    IR2_OPND tmp1 = latxs_arg1_ir2_opnd;
-    IR2_OPND tmp2 = latxs_arg2_ir2_opnd;
-
-    /* sc->selector = selector */
-    //latxs_load_imm64(&tmp, selector);
-    la_out2i(LISA_ST_W, selector, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_selector(lsenv, seg_reg));
-
-    /* sc->base = base */
-    //latxs_load_imm64(&tmp, base);
-    la_out2i(LISA_ST_D, base, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_base(lsenv, seg_reg));
-
-    /* sc->limit = limit */
-    //latxs_load_imm64(&tmp, limit);
-    la_out2i(LISA_ST_W, limit, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_limit(lsenv, seg_reg));
-
-    /* sc->flags = flags */
-    //latxs_load_imm64(&tmp, flags);
-    la_out2i(LISA_ST_W, flags, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_flags(lsenv, seg_reg));
-
-    if (seg_reg == R_CS) {
-        /* env->hflags |= HF_CS32_MASK | HF_SS32_MASK | HF_CS64_MASK; */
-        latxs_load_imm64(&tmp, HF_CS32_MASK | HF_SS32_MASK | HF_CS64_MASK);
-        la_out2i(LISA_LD_WU, &tmp1, &latxs_env_ir2_opnd,
-            lsenv_offset_of_hflags(lsenv));
-        la_out3(LISA_OR, &tmp1, &tmp1, &tmp);
-
-        /* env->hflags &= ~(HF_ADDSEG_MASK); */
-        latxs_load_imm64(&tmp, HF_ADDSEG_MASK);
-        la_out3(LISA_ANDN, &tmp1, &tmp1, &tmp);
-        la_out2i(LISA_ST_W, &tmp1, &latxs_env_ir2_opnd,
-            lsenv_offset_of_hflags(lsenv));
-    }
-
-    if (seg_reg == R_SS) {
-        /* env->hflags = (env->hflags & ~HF_CPL_MASK) | cpl; */
-        la_out2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-            lsenv_offset_of_hflags(lsenv));
-        latxs_load_imm64(&tmp1, HF_CPL_MASK);
-        la_out3(LISA_ANDN, &tmp, &tmp, &tmp1);
-
-        /* cpl = (flags >> DESC_DPL_SHIFT) & 3; */
-        la_out2i(LISA_SRLI_D, &tmp1, flags, DESC_DPL_SHIFT);
-        la_out2i(LISA_ANDI, &tmp1, &tmp1, 3);
-        la_out3(LISA_OR, &tmp, &tmp1, &tmp);
-
-        la_out2i(LISA_ST_W, &tmp, &latxs_env_ir2_opnd,
-            lsenv_offset_of_hflags(lsenv));
-
-        latx_cpu_sync_bndcs_hflags(&tmp, &tmp1);
-    }
-
-    /*
-     *  new_hflags = (env->segs[R_SS].flags & DESC_B_MASK)
-     *      >> (DESC_B_SHIFT - HF_SS32_SHIFT);
-     */
-    la_out2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_seg_flags(lsenv, R_SS));
-
-    latxs_load_imm64(&tmp1, DESC_B_MASK);
-    la_out3(LISA_AND, &tmp, &tmp, &tmp1);
-    la_out2i(LISA_SRLI_D, &tmp, &tmp, DESC_B_SHIFT - HF_SS32_SHIFT);
-
-    /* env->hflags = (env->hflags &
-     *                 ~(HF_SS32_MASK | HF_ADDSEG_MASK)) | new_hflags;
-     */
-    la_out2i(LISA_LD_WU, &tmp1, &latxs_env_ir2_opnd,
-        lsenv_offset_of_hflags(lsenv));
-
-    latxs_load_imm64(&tmp2, HF_SS32_MASK | HF_ADDSEG_MASK);
-    la_out3(LISA_ANDN, &tmp1, &tmp1, &tmp2);
-    la_out3(LISA_OR, &tmp, &tmp, &tmp1);
-
-    la_out2i(LISA_ST_W, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_hflags(lsenv));
-}
-
 static void latxs_iret_save_native_xmms(void)
 {
 #if defined(CONFIG_LATX_HACK_MEM) && defined(CONFIG_SOFTMMU)
@@ -2745,6 +2632,22 @@ bool latxs_translate_int(IR1_INST *pir1)
 
     /* 0. save current instruciton's EIP to env */
     latxs_tr_gen_save_curr_eip();
+
+#ifdef CONFIG_SOFTMMU
+    if (td->sys.code64 && !td->sys.tf &&
+        !(td->sys.cflags & CF_USE_ICOUNT) &&
+        !(td->sys.flags & HF_GUEST_MASK)) {
+        latxs_tr_gen_call_to_helper3_cfg((ADDR)latx_helper_software_interrupt,
+                ir1_opnd_simm(ir1_get_opnd(pir1, 0)),
+                latxs_ir1_inst_size(pir1), default_helper_cfg,
+                LOAD_SOFTWARE_INTERRUPT_HELPER);
+        td->ignore_eip_update = 1;
+        td->sys_eob_pir1 = pir1;
+        td->sys_eob_can_link = 1;
+        td->sys_eob_is_indir = 1;
+        return true;
+    }
+#endif
 
     /* 1. save complete context */
     helper_cfg_t cfg = default_helper_cfg;
@@ -4248,410 +4151,361 @@ bool latxs_translate_sfence(IR1_INST *pir1)
     return true;
 }
 
-/* End of TB in system-mode */
+#ifdef CONFIG_SOFTMMU
+/* Segment caches for SYSCALL/SYSRET and SYSENTER/SYSEXIT are synthesized by
+ * the CPU, not loaded from the GDT. Commit both caches and the resulting
+ * execution flags together, after every helper fallback check. */
+static void latxs_transition_segments(IR2_OPND *cs, IR2_OPND *ss,
+                                      bool code64, bool user, bool cs_b)
+{
+    IR2_OPND flags = latxs_arg0_ir2_opnd;
+    IR2_OPND tmp = latxs_arg1_ir2_opnd;
+    IR2_OPND tmp1 = latxs_arg2_ir2_opnd;
+    uint32_t common = DESC_G_MASK | DESC_P_MASK | DESC_S_MASK | DESC_A_MASK |
+                      (user ? 3 << DESC_DPL_SHIFT : 0);
+    uint32_t csflags = common | DESC_CS_MASK | DESC_R_MASK |
+                       (code64 ? DESC_L_MASK : 0) | (cs_b ? DESC_B_MASK : 0);
+    uint32_t ssflags = common | DESC_B_MASK | DESC_W_MASK;
+
+    la_out2i(LISA_ST_W, cs, &la_env, offsetof(CPUX86State, segs[R_CS].selector));
+    la_out2i(LISA_ST_D, &la_zero, &la_env, offsetof(CPUX86State, segs[R_CS].base));
+    latxs_load_imm64(&flags, UINT32_MAX);
+    la_out2i(LISA_ST_W, &flags, &la_env, offsetof(CPUX86State, segs[R_CS].limit));
+    la_out2i(LISA_ST_W, &flags, &la_env, offsetof(CPUX86State, segs[R_SS].limit));
+    latxs_load_imm64(&flags, csflags);
+    la_out2i(LISA_ST_W, &flags, &la_env, offsetof(CPUX86State, segs[R_CS].flags));
+    la_out2i(LISA_ST_W, ss, &la_env, offsetof(CPUX86State, segs[R_SS].selector));
+    la_out2i(LISA_ST_D, &la_zero, &la_env, offsetof(CPUX86State, segs[R_SS].base));
+    latxs_load_imm64(&flags, ssflags);
+    la_out2i(LISA_ST_W, &flags, &la_env, offsetof(CPUX86State, segs[R_SS].flags));
+
+    la_out2i(LISA_LD_WU, &tmp, &la_env, offsetof(CPUX86State, hflags));
+    latxs_load_imm64(&flags, HF_CPL_MASK | HF_CS32_MASK | HF_CS64_MASK |
+                            HF_SS32_MASK | HF_ADDSEG_MASK | HF_MPX_EN_MASK);
+    la_out3(LISA_ANDN, &tmp, &tmp, &flags);
+    latxs_load_imm64(&flags, HF_CS32_MASK | HF_SS32_MASK |
+                            (code64 ? HF_CS64_MASK : 0) | (user ? 3 : 0));
+    la_out3(LISA_OR, &tmp, &tmp, &flags);
+    if (!code64) {
+        /* A 32-bit flat CS/SS still uses the unchanged DS/ES bases. */
+        la_out2i(LISA_LD_D, &flags, &la_env, offsetof(CPUX86State, segs[R_DS].base));
+        la_out2i(LISA_LD_D, &tmp1, &la_env, offsetof(CPUX86State, segs[R_ES].base));
+        la_out3(LISA_OR, &flags, &flags, &tmp1);
+        la_out3(LISA_SLTU, &flags, &la_zero, &flags);
+        la_out2i(LISA_SLLI_D, &flags, &flags, HF_ADDSEG_SHIFT);
+        la_out3(LISA_OR, &tmp, &tmp, &flags);
+    }
+    la_out2i(LISA_ST_W, &tmp, &la_env, offsetof(CPUX86State, hflags));
+    /* Target MPX configuration was checked before commit. Do not lose an
+     * asynchronous NMI update while clearing only MPX preserve state. */
+    latxs_load_imm64(&flags, ~(uint32_t)HF2_MPX_PR_MASK);
+    latxs_load_imm64(&tmp, offsetof(CPUX86State, hflags2));
+    la_out3(LISA_ADD_D, &tmp, &la_env, &tmp);
+    la_out3(LISA_AMAND_W, &la_zero, &tmp, &flags);
+#ifdef HAMT_PROT_ADD_PLV
+    if (hamt_enabled()) {
+        if (user) {
+            latxs_tr_dmw_in_plv3_break();
+        } else {
+            latxs_tr_dmw_in_plv0_break();
+        }
+    }
+#endif
+}
+
+static void latxs_transition_guard(IR2_OPND *helper, bool user)
+{
+    TRANSLATION_DATA *td = lsenv->tr_data;
+    IR2_OPND tmp = latxs_ra_alloc_itemp();
+    if (!td->sys.pe || td->sys.vm86 || td->sys.tf ||
+        (td->sys.flags & (HF_GUEST_MASK | HF_SMM_MASK))) {
+        la_out1(LISA_B, helper);
+    }
+    size_t offset = user ? offsetof(CPUX86State, bndcs_regs.cfgu) :
+                           offsetof(CPUX86State, msr_bndcfgs);
+    la_out2i(LISA_LDPTR_D, &tmp, &la_env, offset >> 2);
+    la_out2i(LISA_ANDI, &tmp, &tmp, BNDCFG_ENABLE | BNDCFG_BNDPRESERVE);
+    la_out2(LISA_BNEZ, &tmp, helper);
+#if defined(CONFIG_LATX_HACK_MEM)
+    if (hamt_enabled() && hamt_mode_dmw()) {
+        offset = offsetof(CPUX86State, aot_native_fault_active);
+        la_out2i(LISA_LDPTR_D, &tmp, &la_env, offset >> 2);
+        la_out2(LISA_BNEZ, &tmp, helper);
+    }
+#endif
+    latxs_ra_free_temp(&tmp);
+}
+
+static void latxs_transition_end(void)
+{
+    TRANSLATION_DATA *td = lsenv->tr_data;
+    td->ignore_eip_update = 1;
+    td->sys_eob_can_link = 1;
+    td->sys_eob_is_indir = 1;
+}
+
+static void latxs_transition_selector(IR2_OPND *dst, IR2_OPND *selector,
+                                      unsigned add, bool user)
+{
+    la_out2i(LISA_ADDI_D, dst, selector, add);
+    la_out2ii(LISA_BSTRPICK_D, dst, dst, 15, 2);
+    la_out2i(LISA_SLLI_D, dst, dst, 2);
+    if (user) {
+        la_out2i(LISA_ORI, dst, dst, 3);
+    }
+}
+#endif
+
 bool latxs_translate_sysenter(IR1_INST *pir1)
 {
+    latxs_tr_gen_save_curr_eip();
     TRANSLATION_DATA *td = lsenv->tr_data;
+#ifdef CONFIG_SOFTMMU
+    if (td->sys.lma && ((CPUX86State *)lsenv->cpu_state)->cpuid_vendor1 != CPUID_VENDOR_INTEL_1) {
+        latxs_tr_gen_excp_illegal_op(pir1, 1);
+        return true;
+    }
+#endif
     CHECK_EXCP_SYSENTER(pir1);
-
-    /*
-     * target/i386/seg_helper.c
-     * void helper_sysenter(CPUX86State *env)
-     * >> EIP is updated
-     */
-    helper_cfg_t cfg = default_helper_cfg;
-    latxs_tr_gen_call_to_helper1_cfg((ADDR)helper_sysenter, cfg, HELPER_SYSENTER);
-
-    /* 2. disable EIP update in the added jmp */
+#ifdef CONFIG_SOFTMMU
+    IR2_OPND helper = la_new_label();
+    IR2_OPND done = la_new_label();
+    IR2_OPND cs = latxs_ra_alloc_itemp();
+    IR2_OPND ss = latxs_ra_alloc_itemp();
+    IR2_OPND tmp = latxs_ra_alloc_itemp();
+    latxs_transition_guard(&helper, false);
+    la_out2i(LISA_LDPTR_W, &cs, &la_env, offsetof(CPUX86State, sysenter_cs) >> 2);
+    la_out2(LISA_BEQZ, &cs, &helper);
+    latxs_transition_selector(&ss, &cs, 8, false);
+    latxs_transition_selector(&cs, &cs, 0, false);
+    /* No guest memory access or failing check follows these stores. */
+    la_out2i(LISA_LD_WU, &tmp, &la_env, offsetof(CPUX86State, eflags));
+    latxs_load_imm64(&ss, VM_MASK | IF_MASK | RF_MASK);
+    la_out3(LISA_ANDN, &tmp, &tmp, &ss);
+    la_out2i(LISA_ST_W, &tmp, &la_env, offsetof(CPUX86State, eflags));
+    latxs_transition_selector(&ss, &cs, 8, false);
+    latxs_transition_segments(&cs, &ss, td->sys.lma, false, true);
+    IR2_OPND rsp = latxs_ra_alloc_gpr(rsp_index);
+    la_out2i(LISA_LDPTR_D, &rsp, &la_env, offsetof(CPUX86State, sysenter_esp) >> 2);
+    la_out2i(LISA_LDPTR_D, &tmp, &la_env, offsetof(CPUX86State, sysenter_eip) >> 2);
+    la_out2i(LISA_ST_D, &tmp, &la_env, offsetof(CPUX86State, eip));
+    la_out1(LISA_B, &done);
+    la_out1(LISA_LABEL, &helper);
+#endif
+    latxs_tr_gen_call_to_helper1_cfg((ADDR)helper_sysenter,
+                                    default_helper_cfg, HELPER_SYSENTER);
+#ifdef CONFIG_SOFTMMU
+    la_out1(LISA_LABEL, &done);
+    latxs_ra_free_temp(&cs);
+    latxs_ra_free_temp(&ss);
+    latxs_ra_free_temp(&tmp);
+    latxs_transition_end();
+#else
     td->ignore_eip_update = 1;
-
+#endif
     return true;
 }
 
-/* End of TB in system-mode */
 bool latxs_translate_sysexit(IR1_INST *pir1)
 {
+    latxs_tr_gen_save_curr_eip();
     TRANSLATION_DATA *td = lsenv->tr_data;
+#ifdef CONFIG_SOFTMMU
+    if (td->sys.lma && ((CPUX86State *)lsenv->cpu_state)->cpuid_vendor1 != CPUID_VENDOR_INTEL_1) {
+        latxs_tr_gen_excp_illegal_op(pir1, 1);
+        return true;
+    }
+#endif
     CHECK_EXCP_SYSEXIT(pir1);
-
     int data_size = latxs_ir1_data_size(pir1);
-    lsassert(data_size == 16 || data_size == 32);
-
-    /*
-     * target/i386/seg_helper.c
-     * void helper_sysexit(
-     *      CPUX86State *env,
-     *      int dflag)
-     */
-    helper_cfg_t cfg = default_helper_cfg;
-
-    /* 1.1 dflag = 0 : 16-bit */
-    /*     dflag = 1 : 32-bit */
-    int dflag = (data_size >> 4) - 1;
-    lsassert(!(dflag >> 1));
-
-    /* 1.2 call helper_sysexit*/
-    latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_sysexit, dflag, cfg, HELPER_SYSEXIT);
-
-    /* 2. disable EIP update in the added jmp */
-    td->ignore_eip_update = 1;
-
-    return true;
-}
-
-static bool latxs_translate_opt_syscall(IR1_INST *pir1)
-{
-    /* pcrel, we should avoid directly storing next_eip */
-    TRANSLATION_DATA *td = lsenv->tr_data;
-    TranslationBlock *tb = td->curr_tb;
-    int next_eip_offset = 0;
-    IR2_OPND label_helper = latxs_ir2_opnd_new_label();
-    IR2_OPND label_end = latxs_ir2_opnd_new_label();
-
-    IR2_OPND ir2_r11 = latxs_ra_alloc_gpr(r11_index);
-    IR2_OPND ir2_rcx = latxs_ra_alloc_gpr(rcx_index);
-
+    int dflag = data_size / 32;
+#ifdef CONFIG_SOFTMMU
+    IR2_OPND helper = la_new_label();
+    IR2_OPND done = la_new_label();
+    IR2_OPND cs = latxs_ra_alloc_itemp();
+    IR2_OPND ss = latxs_ra_alloc_itemp();
     IR2_OPND tmp = latxs_ra_alloc_itemp();
-    IR2_OPND tmp1 = latxs_ra_alloc_itemp();
-    IR2_OPND tmp2 = latxs_ra_alloc_itemp();
-
-    //latxs_append_ir2_opnd1(LISA_B, &label_helper);
-
-    latxs_append_ir2_opnd2i(LISA_LD_D, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_efer(lsenv));
-
-    /* !(env->efer & MSR_EFER_SCE)*/
-    la_out2i(LISA_ANDI, &tmp, &tmp, MSR_EFER_SCE);
-    la_out2(LISA_BEQZ, &tmp, &label_helper);
-
-    /* if !(env->hflags & HF_LMA_MASK), call helper */
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-       lsenv_offset_of_hflags(lsenv));
-    latxs_load_imm64(&tmp1, HF_LMA_MASK);
-    la_out3(LISA_AND, &tmp1, &tmp, &tmp1);
-    la_out2(LISA_BEQZ, &tmp1, &label_helper);
-
-    /* if !(env->hflags & HF_CS64_MASK), call helper */
-    latxs_load_imm64(&tmp1, HF_CS64_MASK);
-    la_out3(LISA_AND, &tmp1, &tmp, &tmp1);
-    la_out2(LISA_BEQZ, &tmp1, &label_helper);
-
-    latxs_tr_gen_add_st_curr_eip(&tmp, next_eip_offset, ir1_addr(pir1));
-
-    /* env->regs[R_ECX] = env->eip + next_eip_addend; */
-    la_out2i(LISA_LD_D, &ir2_rcx, &latxs_env_ir2_opnd,
-        lsenv_offset_of_eip(lsenv));
-    la_out2i(LISA_ADDI_D, &ir2_rcx, &ir2_rcx, latxs_ir1_inst_size(pir1));
-
-    /* env->regs[11] = cpu_compute_eflags(env) & ~RF_MASK; */
-    la_out1i(LISA_X86MFFLAG, &ir2_r11, 0x3f);
-    la_out2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_eflags(lsenv));
-
-    latxs_load_imm64(&tmp1, (CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C));
-    la_out3(LISA_ANDN, &tmp2, &tmp, &tmp1);
-    la_out3(LISA_OR, &ir2_r11, &tmp2, &ir2_r11);
-
-    /* eflags |= cpu_cc_compute_all(env, CC_OP) | (env->df & DF_MASK); */
-    la_out2i(LISA_LD_W, &tmp, &latxs_env_ir2_opnd,
-       lsenv_offset_of_df(lsenv));
-    la_out2i(LISA_ANDI, &tmp, &tmp, DF_MASK);
-    la_out3(LISA_OR, &ir2_r11, &tmp, &ir2_r11);
-
-    latxs_load_imm64(&tmp1, RF_MASK);
-    la_out3(LISA_ANDN, &ir2_r11, &ir2_r11, &tmp1);
-
-    /* env->eflags &= ~(env->fmask | RF_MASK); */
-    la_out2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_eflags(lsenv));
-    la_out2i(LISA_LD_D, &tmp2, &latxs_env_ir2_opnd,
-        lsenv_offset_of_fmask(lsenv));
-    la_out3(LISA_OR, &tmp2, &tmp2, &tmp1);
-    la_out3(LISA_ANDN, &tmp, &tmp, &tmp2);
-    la_out2i(LISA_ST_W, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_eflags(lsenv));
-
-    /* cpu_x86_load_seg_cache */
-    latx_cpu_load_eflags(&tmp, &la_zero);
-
-    /* selector = (env->star >> 32) & 0xffff */
-    //la_out2i(LISA_LD_D, &tmp, &latxs_env_ir2_opnd,
-    //    lsenv_offset_of_star(lsenv));
-    latxs_load_imm64(&tmp1, lsenv_offset_of_star(lsenv));
-    la_out3(LISA_LDX_D, &tmp, &latxs_env_ir2_opnd, &tmp1);
-
-    la_out2i(LISA_SRLI_D, &tmp, &tmp, 32);
-    latxs_load_imm64(&tmp1, 0xffff);
-    la_out3(LISA_AND, &tmp2, &tmp, &tmp1);
-
-    /* selector = selector & 0xfffc */
-    latxs_load_imm64(&tmp1, 0xfffc);
-    la_out3(LISA_AND, &tmp, &tmp2, &tmp1);
-
-    /*
-     * cpu_x86_load_seg_cache(env, R_CS, selector & 0xfffc,
-     *                    0, 0xffffffff,
-     *                        DESC_G_MASK | DESC_P_MASK |
-     *                        DESC_S_MASK |
-     *                        DESC_CS_MASK | DESC_R_MASK | DESC_A_MASK |
-     *                        DESC_L_MASK);
-     */
-
-    IR2_OPND flags = latxs_ra_alloc_itemp();
-    IR2_OPND limit = latxs_ra_alloc_itemp();
-
-    latxs_load_imm64(&flags, DESC_G_MASK | DESC_P_MASK |
-                           DESC_S_MASK |
-                           DESC_CS_MASK | DESC_R_MASK | DESC_A_MASK |
-                           DESC_L_MASK);
-
-    latxs_load_imm64(&limit, 0xffffffff);
-    fast_cpu_x86_load_seg_cache(R_CS, &tmp,
-                       &la_zero, &limit, &flags);
-
-    /* selector = (selector + 8) & 0xfffc */
-    la_out2i(LISA_ADDI_D, &tmp2, &tmp2, 8);
-    la_out3(LISA_AND, &tmp, &tmp2, &tmp1);
-
-    /*
-     *  cpu_x86_load_seg_cache(env, R_SS, (selector + 8) & 0xfffc,
-     *                         0, 0xffffffff,
-     *                         DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
-     *                         DESC_S_MASK |
-     *                         DESC_W_MASK | DESC_A_MASK);
-     */
-    latxs_load_imm64(&flags, DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
-                           DESC_S_MASK |
-                           DESC_W_MASK | DESC_A_MASK);
-
-    latxs_load_imm64(&limit, 0xffffffff);
-    fast_cpu_x86_load_seg_cache(R_SS, &tmp,
-                           &la_zero, &limit, &flags);
-    latxs_ra_free_temp(&flags);
-    latxs_ra_free_temp(&limit);
-
-    /* env->eip = env->lstar; */
-     la_out2i(LISA_LD_D, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_lstar(lsenv));
-     la_out2i(LISA_ST_D, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_eip(lsenv));
-
-    latxs_append_ir2_opnd1(LISA_B, &label_end);
-
+    latxs_transition_guard(&helper, true);
+    if (td->sys.cpl != 0 || (data_size != 32 && data_size != 64)) {
+        la_out1(LISA_B, &helper);
+    }
+    la_out2i(LISA_LDPTR_W, &tmp, &la_env, offsetof(CPUX86State, sysenter_cs) >> 2);
+    la_out2(LISA_BEQZ, &tmp, &helper);
+    latxs_transition_selector(&cs, &tmp, data_size == 64 ? 32 : 16, true);
+    latxs_transition_selector(&ss, &tmp, data_size == 64 ? 40 : 24, true);
+    latxs_transition_segments(&cs, &ss, data_size == 64, true, true);
+    IR2_OPND rcx = latxs_ra_alloc_gpr(rcx_index);
+    IR2_OPND rdx = latxs_ra_alloc_gpr(rdx_index);
+    IR2_OPND rsp = latxs_ra_alloc_gpr(rsp_index);
+    /* Match the existing helper, including its untruncated RCX/RDX state. */
+    la_out3(LISA_OR, &rsp, &rcx, &la_zero);
+    la_out2i(LISA_ST_D, &rdx, &la_env, offsetof(CPUX86State, eip));
+    la_out1(LISA_B, &done);
+    la_out1(LISA_LABEL, &helper);
+#endif
+    latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_sysexit, dflag,
+                                    default_helper_cfg, HELPER_SYSEXIT);
+#ifdef CONFIG_SOFTMMU
+    la_out1(LISA_LABEL, &done);
+    latxs_ra_free_temp(&cs);
+    latxs_ra_free_temp(&ss);
     latxs_ra_free_temp(&tmp);
-    latxs_ra_free_temp(&tmp1);
-    latxs_ra_free_temp(&tmp2);
-
-    latxs_append_ir2_opnd1(LISA_LABEL, &label_helper);
-
-    IR2_OPND cur_eip = latxs_ra_alloc_itemp();
-
-    if (option_tb_pcrel)
-        next_eip_offset = td->pc_curr - td->pc_save;
-    else if (option_page_pcrel)
-        next_eip_offset = td->pc_curr - td->curr_page;
-    latxs_tr_gen_add_st_curr_eip(&cur_eip, next_eip_offset, ir1_addr(pir1));
-    latxs_ra_free_temp(&cur_eip);
-
-    latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_syscall, latxs_ir1_inst_size(pir1),
-            nofp_helper_cfg, HELPER_SYSCALL);
-    lsenv->tr_data->ignore_eip_update = 1;
-
-    latxs_append_ir2_opnd1(LISA_LABEL, &label_end);
-
-    /* syscall tb link */
-    add_misc_flags(tb, MF_END_SYSCALL);
-
-    IR2_OPND syscall_tb = latxs_ra_alloc_itemp();
-    IR2_OPND tb_lookup = latxs_ir2_opnd_new_label();
-
-    if (option_opt_syscall == 1) {
-        la_out2i(LISA_LD_D, &syscall_tb, &latxs_env_ir2_opnd,
-                    lsenv_offset_of_syscall_tb(lsenv));
-        la_out2(LISA_BEQZ, &syscall_tb, &tb_lookup);
-        if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&syscall_tb);
-        la_out2i(LISA_JIRL, &la_zero, &syscall_tb, 0);
-    }
-
-    if (option_opt_syscall == 2) {
-        IR2_OPND pc = latxs_ra_alloc_itemp();
-        IR2_OPND tcptr = latxs_ra_alloc_itemp();
-        la_out2i(LISA_LD_D, &syscall_tb, &latxs_env_ir2_opnd,
-                    lsenv_offset_of_syscall_tb(lsenv));
-        la_out2(LISA_BEQZ, &syscall_tb, &tb_lookup);
-        if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&syscall_tb);
-
-        la_out2i(LISA_LD_D, &pc, &la_env, offsetof(CPUX86State, eip));
-        la_out2i(LISA_LD_D, &tcptr, &syscall_tb, offsetof(TranslationBlock, pc));
-        la_out3(LISA_BNE, &pc, &tcptr, &tb_lookup);
-
-        la_out2i(LISA_LD_D, &tcptr, &syscall_tb, offsetof(TranslationBlock, tc.ptr));
-        if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&tcptr);
-        la_out2i(LISA_JIRL, &la_zero, &tcptr, 0);
-    }
-
-    latxs_append_ir2_opnd1(LISA_LABEL, &tb_lookup);
-
-    latxs_ra_free_temp(&syscall_tb);
-
+    latxs_transition_end();
+#else
+    td->ignore_eip_update = 1;
+#endif
     return true;
 }
 
 bool latxs_translate_syscall(IR1_INST *pir1)
 {
-    /* pcrel, we should avoid directly storing next_eip */
     TRANSLATION_DATA *td = lsenv->tr_data;
-    /*TranslationBlock *tb = td->curr_tb;*/
-    int next_eip_offset = 0;
 
-    IR2_OPND cur_eip = latxs_ra_alloc_itemp();
-
-    if (option_opt_syscall && !td->sys.tf) {
-        latxs_translate_opt_syscall(pir1);
+    latxs_tr_gen_save_curr_eip();
+#ifdef CONFIG_SOFTMMU
+    if (!td->sys.code64 &&
+        ((CPUX86State *)lsenv->cpu_state)->cpuid_vendor1 == CPUID_VENDOR_INTEL_1) {
+        latxs_tr_gen_excp_illegal_op(pir1, 1);
+        return true;
+    }
+    /* A single-stepped SYSCALL uses the helper and the FMASK-aware exit. */
+    if (td->sys.tf) {
+        latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_syscall,
+                        latxs_ir1_inst_size(pir1), nofp_helper_cfg, HELPER_SYSCALL);
+        td->ignore_eip_update = 1;
         return true;
     }
 
-    if (option_tb_pcrel)
-        next_eip_offset = td->pc_curr - td->pc_save;
-    else if (option_page_pcrel)
-        next_eip_offset = td->pc_curr - td->curr_page;
-    latxs_tr_gen_add_st_curr_eip(&cur_eip, next_eip_offset, ir1_addr(pir1));
-    latxs_ra_free_temp(&cur_eip);
-
-    latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_syscall, latxs_ir1_inst_size(pir1),
-            nofp_helper_cfg, HELPER_SYSCALL);
-    lsenv->tr_data->ignore_eip_update = 1;
-
-    return true;
-}
-
-static bool latxs_translate_opt_sysret(IR1_INST *pir1)
-{
-    if (!lsenv->tr_data->sys.pe) {
-        /* TODO: should raise EXCP0D_GPF */
-        lsassert(0);
-    }
-
-    IR2_OPND label_helper = latxs_ir2_opnd_new_label();
-    IR2_OPND label_end = latxs_ir2_opnd_new_label();
-
-    IR2_OPND ir2_r11 = latxs_ra_alloc_gpr(r11_index);
-
+    IR2_OPND helper = la_new_label();
+    IR2_OPND done = la_new_label();
+    IR2_OPND cs = latxs_ra_alloc_itemp();
+    IR2_OPND ss = latxs_ra_alloc_itemp();
     IR2_OPND tmp = latxs_ra_alloc_itemp();
-    IR2_OPND tmp1 = latxs_ra_alloc_itemp();
-    IR2_OPND tmp2 = latxs_ra_alloc_itemp();
-
-    /* !(env->efer & MSR_EFER_SCE), call helper*/
+    IR2_OPND mask = latxs_ra_alloc_itemp();
+    if (!option_opt_syscall || !td->sys.code64) {
+        la_out1(LISA_B, &helper);
+    }
+    latxs_transition_guard(&helper, false);
+    la_out2i(LISA_LDPTR_D, &tmp, &la_env, offsetof(CPUX86State, efer) >> 2);
     la_out2i(LISA_ANDI, &tmp, &tmp, MSR_EFER_SCE);
-    la_out2(LISA_BEQZ, &tmp, &label_helper);
-
-    /* !(env->cr[0] & CR0_PE_MASK) || cpl != 0, call helper */
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_hflags(lsenv));
-    la_out2i(LISA_ANDI, &tmp, &tmp, HF_CPL_MASK);
-    la_out2(LISA_BNEZ, &tmp, &label_helper);
-
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_cr(lsenv, 0));
-    la_out2i(LISA_ANDI, &tmp, &tmp, CR0_PE_MASK);
-    la_out2(LISA_BNEZ, &tmp, &label_helper);
-
-    /* if !(env->hflags & HF_LMA_MASK), call helper */
-    latxs_append_ir2_opnd2i(LISA_LD_WU, &tmp, &latxs_env_ir2_opnd,
-        lsenv_offset_of_hflags(lsenv));
-    latxs_load_imm64(&tmp1, HF_LMA_MASK);
-    la_out3(LISA_AND, &tmp1, &tmp, &tmp1);
-    la_out2(LISA_BEQZ, &tmp1, &label_helper);
-
-    /* cpu_load_eflags */
-    latxs_load_imm64(&tmp2, TF_MASK | AC_MASK
-                        | ID_MASK | IF_MASK | IOPL_MASK | VM_MASK | RF_MASK |
-                        NT_MASK);
-    latx_cpu_load_eflags(&ir2_r11, &tmp2);
-    /* selector = (env->star >> 48) & 0xffff */
-    latxs_load_imm64(&tmp1, lsenv_offset_of_star(lsenv));
-    la_out3(LISA_LDX_D, &tmp, &latxs_env_ir2_opnd, &tmp1);
-
-    la_out2i(LISA_SRLI_D, &tmp, &tmp, 48);
-    latxs_load_imm64(&tmp1, 0xffff);
-    la_out3(LISA_AND, &tmp2, &tmp, &tmp1);
-
-    la_out2i(LISA_ADDI_D, &tmp, &tmp2, 16);
-    la_out2i(LISA_ANDI, &tmp, &tmp, 3);
-
-    IR2_OPND flags = latxs_ra_alloc_itemp();
-    IR2_OPND limit = latxs_ra_alloc_itemp();
-    /*
-     * cpu_x86_load_seg_cache(env, R_CS, (selector + 16) | 3,
-     *                        0, 0xffffffff,
-     *                        DESC_G_MASK | DESC_P_MASK |
-     *                        DESC_S_MASK | (3 << DESC_DPL_SHIFT) |
-     *                        DESC_CS_MASK | DESC_R_MASK | DESC_A_MASK |
-     *                        DESC_L_MASK);
-     */
-
-    latxs_load_imm64(&flags, DESC_G_MASK | DESC_P_MASK |
-                           DESC_S_MASK | (3 << DESC_DPL_SHIFT) |
-                           DESC_CS_MASK | DESC_R_MASK | DESC_A_MASK |
-                           DESC_L_MASK);
-    latxs_load_imm64(&limit, 0xffffffff);
-    fast_cpu_x86_load_seg_cache(R_CS, &tmp,
-                           &la_zero, &limit, &flags);
-
-    la_out2i(LISA_ADDI_D, &tmp, &tmp2, 8);
-    la_out2i(LISA_ANDI, &tmp, &tmp, 3);
-
-    /*
-     * cpu_x86_load_seg_cache(env, R_SS, (selector + 8) | 3,
-     *                      0, 0xffffffff,
-     *                      DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
-     *                      DESC_S_MASK | (3 << DESC_DPL_SHIFT) |
-     *                      DESC_W_MASK | DESC_A_MASK);
-     */
-    latxs_load_imm64(&flags, DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
-                         DESC_S_MASK | (3 << DESC_DPL_SHIFT) |
-                         DESC_W_MASK | DESC_A_MASK);
-    fast_cpu_x86_load_seg_cache(R_SS, &tmp,
-                         &la_zero, &limit, &flags);
-
-    latxs_append_ir2_opnd1(LISA_B, &label_end);
-
-    latxs_ra_free_temp(&flags);
-    latxs_ra_free_temp(&limit);
-
+    la_out2(LISA_BEQZ, &tmp, &helper);
+    IR2_OPND rcx = latxs_ra_alloc_gpr(rcx_index);
+    IR2_OPND r11 = latxs_ra_alloc_gpr(r11_index);
+    /* Saving the current PC once also handles a SYSCALL in the middle of a
+     * PC-relative TB; no absolute return address is embedded in its code. */
+    la_out2i(LISA_LD_D, &rcx, &la_env, offsetof(CPUX86State, eip));
+    la_out2i(LISA_ADDI_D, &rcx, &rcx, latxs_ir1_inst_size(pir1));
+    la_out1i(LISA_X86MFFLAG, &r11, 0x3f);
+    la_out2i(LISA_LD_WU, &tmp, &la_env, offsetof(CPUX86State, eflags));
+    latxs_load_imm64(&mask, CC_O | CC_S | CC_Z | CC_A | CC_P | CC_C | RF_MASK);
+    la_out3(LISA_ANDN, &tmp, &tmp, &mask);
+    la_out3(LISA_OR, &r11, &r11, &tmp);
+    la_out2i(LISA_LD_W, &tmp, &la_env, offsetof(CPUX86State, df));
+    la_out2i(LISA_ANDI, &tmp, &tmp, DF_MASK);
+    la_out3(LISA_OR, &r11, &r11, &tmp);
+    la_out2i(LISA_LD_WU, &tmp, &la_env, offsetof(CPUX86State, eflags));
+    la_out2i(LISA_LDPTR_D, &mask, &la_env, offsetof(CPUX86State, fmask) >> 2);
+    IR2_OPND rf = latxs_ra_alloc_itemp();
+    latxs_load_imm64(&rf, RF_MASK);
+    la_out3(LISA_OR, &mask, &mask, &rf);
+    la_out3(LISA_ANDN, &tmp, &tmp, &mask);
+    la_out2i(LISA_ST_W, &tmp, &la_env, offsetof(CPUX86State, eflags));
+    /* Match helper_syscall's cpu_load_eflags(env, env->eflags, 0), while
+     * preserving the separately captured original flags in R11. */
+    latx_cpu_load_eflags(&tmp, &la_zero);
+    latxs_ra_free_temp(&rf);
+    latxs_load_imm64(&tmp, offsetof(CPUX86State, star));
+    la_out3(LISA_LDX_D, &tmp, &la_env, &tmp);
+    la_out2i(LISA_SRLI_D, &tmp, &tmp, 32);
+    latxs_transition_selector(&cs, &tmp, 0, false);
+    latxs_transition_selector(&ss, &tmp, 8, false);
+    latxs_transition_segments(&cs, &ss, true, false, false);
+    la_out2i(LISA_LDPTR_D, &tmp, &la_env, offsetof(CPUX86State, lstar) >> 2);
+    la_out2i(LISA_ST_D, &tmp, &la_env, offsetof(CPUX86State, eip));
+    la_out1(LISA_B, &done);
+    la_out1(LISA_LABEL, &helper);
+#endif
+    latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_syscall,
+                    latxs_ir1_inst_size(pir1), nofp_helper_cfg, HELPER_SYSCALL);
+#ifdef CONFIG_SOFTMMU
+    la_out1(LISA_LABEL, &done);
+    latxs_ra_free_temp(&cs);
+    latxs_ra_free_temp(&ss);
     latxs_ra_free_temp(&tmp);
-    latxs_ra_free_temp(&tmp1);
-    latxs_ra_free_temp(&tmp2);
-
-    latxs_append_ir2_opnd1(LISA_LABEL, &label_helper);
-
-    int data_size = latxs_ir1_data_size(pir1);
-    latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_sysret, data_size / 32,
-                                     default_helper_cfg, HELPER_SYSRET);
-    lsenv->tr_data->ignore_eip_update = 1;
-
-    latxs_append_ir2_opnd1(LISA_LABEL, &label_end);
-
+    latxs_ra_free_temp(&mask);
+    latxs_transition_end();
+    if (option_opt_syscall) {
+        add_misc_flags(td->curr_tb, MF_END_SYSCALL);
+    }
+#else
+    td->ignore_eip_update = 1;
+#endif
     return true;
 }
 
 bool latxs_translate_sysret(IR1_INST *pir1)
 {
-    if (!lsenv->tr_data->sys.pe) {
-        /* TODO: should raise EXCP0D_GPF */
-        lsassert(0);
-    }
-
-    if (option_opt_sysret) {
-        latxs_translate_opt_sysret(pir1);
+    latxs_tr_gen_save_curr_eip();
+    int data_size = latxs_ir1_data_size(pir1);
+#ifdef CONFIG_SOFTMMU
+    if (!lsenv->tr_data->sys.lma &&
+        ((CPUX86State *)lsenv->cpu_state)->cpuid_vendor1 == CPUID_VENDOR_INTEL_1) {
+        latxs_tr_gen_excp_illegal_op(pir1, 1);
         return true;
     }
-
-    int data_size = latxs_ir1_data_size(pir1);
+    IR2_OPND helper = la_new_label();
+    IR2_OPND done = la_new_label();
+    IR2_OPND cs = latxs_ra_alloc_itemp();
+    IR2_OPND ss = latxs_ra_alloc_itemp();
+    IR2_OPND tmp = latxs_ra_alloc_itemp();
+    IR2_OPND mask = latxs_ra_alloc_itemp();
+    if (!option_opt_sysret || !lsenv->tr_data->sys.lma ||
+        lsenv->tr_data->sys.cpl != 0 || (data_size != 32 && data_size != 64)) {
+        la_out1(LISA_B, &helper);
+    }
+    latxs_transition_guard(&helper, true);
+    la_out2i(LISA_LDPTR_D, &tmp, &la_env, offsetof(CPUX86State, efer) >> 2);
+    la_out2i(LISA_ANDI, &tmp, &tmp, MSR_EFER_SCE);
+    la_out2(LISA_BEQZ, &tmp, &helper);
+    IR2_OPND r11 = latxs_ra_alloc_gpr(r11_index);
+    IR2_OPND rcx = latxs_ra_alloc_gpr(rcx_index);
+    la_out3(LISA_OR, &tmp, &r11, &la_zero);
+    latxs_load_imm64(&mask, TF_MASK);
+    la_out3(LISA_AND, &mask, &tmp, &mask);
+    la_out2(LISA_BNEZ, &mask, &helper);
+    latxs_load_imm64(&tmp, offsetof(CPUX86State, star));
+    la_out3(LISA_LDX_D, &tmp, &la_env, &tmp);
+    la_out2i(LISA_SRLI_D, &tmp, &tmp, 48);
+    latxs_load_imm64(&mask, 0xffef);
+    la_out3(LISA_BLTU, &mask, &tmp, &helper);
+    latxs_transition_selector(&cs, &tmp, data_size == 64 ? 16 : 0, true);
+    latxs_transition_selector(&ss, &tmp, 8, true);
+    la_out3(LISA_OR, &tmp, &r11, &la_zero);
+    latxs_load_imm64(&mask, TF_MASK | AC_MASK | ID_MASK | IF_MASK | IOPL_MASK |
+                            VM_MASK | RF_MASK | NT_MASK);
+    latx_cpu_load_eflags(&tmp, &mask);
+    latxs_transition_segments(&cs, &ss, data_size == 64, true, data_size != 64);
+    if (data_size == 64) {
+        la_out2i(LISA_ST_D, &rcx, &la_env, offsetof(CPUX86State, eip));
+    } else {
+        la_out2ii(LISA_BSTRPICK_D, &tmp, &rcx, 31, 0);
+        la_out2i(LISA_ST_D, &tmp, &la_env, offsetof(CPUX86State, eip));
+    }
+    la_out1(LISA_B, &done);
+    la_out1(LISA_LABEL, &helper);
+#endif
     latxs_tr_gen_call_to_helper2_cfg((ADDR)helper_sysret, data_size / 32,
-                                     default_helper_cfg, HELPER_SYSRET);
+                                    default_helper_cfg, HELPER_SYSRET);
+#ifdef CONFIG_SOFTMMU
+    la_out1(LISA_LABEL, &done);
+    latxs_ra_free_temp(&cs);
+    latxs_ra_free_temp(&ss);
+    latxs_ra_free_temp(&tmp);
+    latxs_ra_free_temp(&mask);
+    latxs_transition_end();
+#else
     lsenv->tr_data->ignore_eip_update = 1;
-
+#endif
     return true;
 }
 

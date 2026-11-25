@@ -351,7 +351,9 @@ static void latxs_tr_gen_exit_tb_update_eip(
     }
 
     /* should correctly set env->eip */
-    if (lsenv->tr_data->sys.tf) {
+    IR1_INST *last = lsenv->tr_data->curr_ir1_inst;
+    bool sysret = last && ir1_opcode(last) == X86_INS_SYSRET;
+    if (lsenv->tr_data->sys.tf && !sysret) {
         latxs_tr_gen_call_to_helper1_cfg((ADDR)helper_single_step,
                 default_helper_cfg, HELPER_SINGLE_STEP);
     }
@@ -404,6 +406,11 @@ typedef struct SysEOBContext {
 static int latxs_sys_eob_check_common(IR1_INST *pir1)
 {
     if (!pir1) { return 1; }
+    /* Returning software-INT delivery has already selected a new PC/CPL. */
+    if (ir1_opcode(pir1) == X86_INS_INT &&
+        lsenv->tr_data->ignore_eip_update) {
+        return 0;
+    }
     /* If pir1 is already a normal TB-end instruction,
      * no need another exit codes. */
     if (ir1_is_tb_ending(pir1)) { return 1; }
@@ -428,8 +435,26 @@ static int latxs_sys_eob_check(SysEOBContext *ctx, IR1_INST *pir1)
 
 static void latxs_sys_eob_prepare(SysEOBContext *ctx, IR1_INST *pir1)
 {
+    switch (ir1_opcode(pir1)) {
+    case X86_INS_INT:
+    case X86_INS_IRET:
+    case X86_INS_IRETD:
+    case X86_INS_IRETQ:
+    case X86_INS_SYSCALL:
+    case X86_INS_SYSRET:
+    case X86_INS_SYSENTER:
+    case X86_INS_SYSEXIT:
+        /* A page-boundary decode can request the source TB's flag-specific
+         * cache. These instructions select a different execution state;
+         * only the normal lookup validates its resulting flags. */
+        ctx->td->sys_eob_use_fsht = 0;
+        break;
+    default:
+        break;
+    }
     if (latxs_check_interrupt_at_block_end() &&
-        (latxs_ir1_is_mov_to_cr(pir1) || latxs_ir1_is_mov_to_dr(pir1))) {
+        (latxs_ir1_is_mov_to_cr(pir1) || latxs_ir1_is_mov_to_dr(pir1) ||
+         ir1_opcode(pir1) == X86_INS_INT)) {
         ctx->irqcheck_mode = SYSEOB_IRQCHECK_NORMAL;
     }
     if ((inhibit_irq_hflags() && ctx->td->inhibit_irq_in_hflags)) {
@@ -493,6 +518,16 @@ static void latxs_sys_eob_update_eip(SysEOBContext *ctx, IR1_INST *pir1)
         return;
     }
     latxs_tr_gen_exit_tb_update_eip(ctx->td->ignore_eip_update, next_eip, 64);
+    if (ir1_opcode(pir1) == X86_INS_SYSRET) {
+        /* SYSRET tests the TF restored from R11 before the target executes. */
+        IR2_OPND no_trap = la_new_label();
+        la_out2i(LISA_LD_WU, &la_a0, &la_env, offsetof(CPUX86State, eflags));
+        la_out2i(LISA_ANDI, &la_a0, &la_a0, TF_MASK);
+        la_out2(LISA_BEQZ, &la_a0, &no_trap);
+        latxs_tr_gen_call_to_helper1_cfg((ADDR)helper_single_step,
+                                        default_helper_cfg, HELPER_SINGLE_STEP);
+        la_label(no_trap);
+    }
 }
 
 static void latxs_sys_eob_emit_intcheck(SysEOBContext *ctx)
@@ -535,6 +570,43 @@ static void latxs_tr_emit_inline_njc_lookup(TranslationBlock *tb, bool call_targ
                                             call_target);
 }
 
+/* This is emitted after the common interrupt/debug exit preparation. Both
+ * syscall cache modes retain the TB, so its PC, flags and lifetime can be
+ * checked before using the cached host entry. */
+static void latxs_sys_eob_emit_syscall_cache(SysEOBContext *ctx)
+{
+    if (!ctx->can_link) {
+        return;
+    }
+    IR2_OPND miss = la_new_label();
+    la_out2i(LISA_LDPTR_D, &la_a0, &la_env,
+             offsetof(CPUX86State, syscall_tb) >> 2);
+    la_out2(LISA_BEQZ, &la_a0, &miss);
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_fix_mem(&la_a0);
+    }
+    la_out2i(LISA_LD_WU, &la_a1, &la_a0, offsetof(TranslationBlock, cflags));
+    latxs_load_imm64(&la_a2, CF_INVALID);
+    la_out3(LISA_AND, &la_a1, &la_a1, &la_a2);
+    la_out2(LISA_BNEZ, &la_a1, &miss);
+    la_out2i(LISA_LD_D, &la_a1, &la_a0, offsetof(TranslationBlock, pc));
+    la_out2i(LISA_LD_D, &la_a2, &la_env, offsetof(CPUX86State, eip));
+    la_out3(LISA_BNE, &la_a1, &la_a2, &miss);
+    la_out2i(LISA_LD_WU, &la_a1, &la_env, offsetof(CPUX86State, eflags));
+    latxs_load_imm64(&la_a2, IOPL_MASK | TF_MASK | RF_MASK | VM_MASK | AC_MASK);
+    la_out3(LISA_AND, &la_a1, &la_a1, &la_a2);
+    la_out2i(LISA_LD_WU, &la_a2, &la_env, offsetof(CPUX86State, hflags));
+    la_out3(LISA_OR, &la_a1, &la_a1, &la_a2);
+    la_out2i(LISA_LD_WU, &la_a2, &la_a0, offsetof(TranslationBlock, flags));
+    la_out3(LISA_BNE, &la_a1, &la_a2, &miss);
+    la_out2i(LISA_LD_D, &la_a0, &la_a0, offsetof(TranslationBlock, tc.ptr));
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_fix_mem(&la_a0);
+    }
+    la_out2i(LISA_JIRL, &la_zero, &la_a0, 0);
+    la_label(miss);
+}
+
 static void latxs_sys_eob_emit_exit(SysEOBContext *ctx)
 {
     IR2_OPND tbptr = latxs_ra_alloc_dbt_arg1(); /* a6($10) */
@@ -542,6 +614,7 @@ static void latxs_sys_eob_emit_exit(SysEOBContext *ctx)
 
     if (check_misc_flags(ctx->tb, MF_END_SYSCALL)) {
         /* syscall link handled in latxs_tb_set_jmp_target() */
+        latxs_sys_eob_emit_syscall_cache(ctx);
         latxs_sys_eob_emit_intcheck_exit(ctx, &tbptr, 1);
         return;
     }

@@ -22,5 +22,6 @@ const void *latx_helper_aot_ordinary_jump(void *env, uintptr_t exit);
 void latx_helper_aot_cpu_query(CPUX86State *env, unsigned descriptor);
 void latx_helper_aot_system(CPUX86State *env, unsigned descriptor, uint64_t operand);
 void latx_helper_aot_x87(CPUX86State *env, unsigned descriptor, uint64_t operand);
+void latx_helper_software_interrupt(CPUX86State *env, int intno, int length);
 
 #endif

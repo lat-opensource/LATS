@@ -93,8 +93,8 @@
     pushq $\cs
     pushq $ROM(\target)
 .endm
-/* Expected faults must leave the original IRET instruction and stack visible. */
-.macro expect_fault vector error=0 cr2=0
+/* Expected faults leave the original IRET/INT instruction and stack visible. */
+.macro expect_fault vector error=0 cr2=0 intno=-1
     movl $\vector,.Lexpect_vector(%rip)
     movq $\error,.Lexpect_error(%rip)
     movabsq $\cr2,%rax
@@ -108,9 +108,21 @@
     popq .Lexpect_flags(%rip)
     movw %ss,%ax
     movw %ax,.Lexpect_ss(%rip)
+    movw %cs,%ax
+    movw %ax,.Lexpect_cs(%rip)
+    movl $0,.Lint_fault_state(%rip)
+.if \intno >= 0
+    movl $1,.Lint_fault_state(%rip)
+    load_state
+.endif
     movq $0x123456,%rbx
     movq $0x654321,%r12
-1:  iretq
+1:
+.if \intno < 0
+    iretq
+.else
+    int $\intno
+.endif
     jmp .Lfail
 2:
 .endm
@@ -276,6 +288,18 @@
     movb $0xff,%al
     outb %al,$0x21
     outb %al,$0xa1
+#ifdef IRET_INT_LOOP
+    /* No IRET or ordinary branch in this loop: INT's own exit must poll. */
+    gate 0x80 .Lint_exit_loop
+    movw $24,IDT+16*0x80+2
+    leaq .Lint_exit_text(%rip),%rsi
+    call .Lputs
+.Lint_exit_loop:
+    movabsq $KSTACK,%rsp
+    int $0x80
+    ud2
+.Lint_exit_text: .asciz "IRET INT LOOP\n"
+#endif
 #ifdef IRET_BENCH_ONLY
     leaq .Lbench_only_text(%rip),%rsi
     call .Lputs
@@ -352,6 +376,10 @@
     je .Lmpx_done
     cmpl $3,.Luser_stage(%rip)
     je .Lconforming_done
+    cmpl $4,.Luser_stage(%rip)
+    je .Lint_user_done
+    cmpl $5,.Luser_stage(%rip)
+    je .Lint_tb_done
     movabsq $KSTACK,%rsp
     case 4
     frame .Lunexpected 0 16
@@ -655,6 +683,303 @@
     wrmsr
     incl %ecx
     wrmsr
+.Lint_start:
+    movl $16,%eax
+    movw %ax,%ss
+    /* INT must preserve guest registers and build a five-qword long-mode
+     * frame, including for vectors normally associated with error codes. */
+    case 31
+    gate 0x7f .Lint_entry 3
+    movabsq $(KSTACK-40),%rax
+    movq %rax,.Lint_stack(%rip)
+    movabsq $KSTACK,%rax
+    movq %rax,.Lint_old_rsp(%rip)
+    movq $24,.Lint_old_cs(%rip)
+    movq $16,.Lint_old_ss(%rip)
+    movq $0,.Lint_handler_if(%rip)
+    leaq .Lint_kernel_return(%rip),%rax
+    movq %rax,.Lint_return(%rip)
+    pushq $0x247
+    popfq
+    load_state
+    int $0x7f
+.Lint_kernel_return:
+    pushfq
+    popq .Lreturned_flags(%rip)
+    check_state
+    cmpq $0x247,.Lreturned_flags(%rip)
+    jne .Lfail
+    cli
+    case 32
+    /* Trap gates preserve IF; interrupt gates clear it in the handler. */
+    movb $0xef,IDT+16*0x7f+5
+    movq $0x200,.Lint_handler_if(%rip)
+    leaq .Lint_trap_return(%rip),%rax
+    movq %rax,.Lint_return(%rip)
+    pushq $0x247
+    popfq
+    load_state
+    int $0x7f
+.Lint_trap_return:
+    pushfq
+    popq .Lreturned_flags(%rip)
+    check_state
+    cmpq $0x247,.Lreturned_flags(%rip)
+    jne .Lfail
+    cli
+    case 33
+    gate 0x7f .Lint_entry 3
+    movq $0,.Lint_handler_if(%rip)
+    movq $USTACK,.Lint_old_rsp(%rip)
+    movq $35,.Lint_old_cs(%rip)
+    movq $43,.Lint_old_ss(%rip)
+    leaq .Lint_user_return(%rip),%rax
+    movq %rax,.Lint_return(%rip)
+    movl $4,.Luser_stage(%rip)
+    frame .Lint_user 35 43 0x247 USTACK
+    iretq
+.Lint_user:
+    load_state
+    int $0x7f
+.Lint_user_return:
+    pushfq
+    popq .Lreturned_flags(%rip)
+    check_state .Luser_fail
+    cmpq $0x247,.Lreturned_flags(%rip)
+    jne .Luser_fail
+    cmpq $USTACK,%rsp
+    jne .Luser_fail
+    xorl %eax,%eax
+    int $0x80
+.Lint_user_done:
+    movl $16,%eax
+    movw %ax,%ss
+    movabsq $KSTACK,%rsp
+    movl $0,.Luser_stage(%rip)
+    cli
+    case 34
+    /* An IST switch is required even when no privilege change occurs. */
+    movabsq $(HIGH+0x34000),%rax
+    movq %rax,TSS+52
+    gate 0x7f .Lint_entry 3 3
+    movabsq $(HIGH+0x34000-40),%rax
+    movq %rax,.Lint_stack(%rip)
+    movabsq $KSTACK,%rax
+    movq %rax,.Lint_old_rsp(%rip)
+    movq $24,.Lint_old_cs(%rip)
+    movq $16,.Lint_old_ss(%rip)
+    leaq .Lint_ist_return(%rip),%rax
+    movq %rax,.Lint_return(%rip)
+    pushq $0x247
+    popfq
+    load_state
+    int $0x7f
+.Lint_ist_return:
+    check_state
+    movabsq $KSTACK,%rax
+    cmpq %rax,%rsp
+    jne .Lfail
+    cli
+    case 35
+    gate 8 .Lint_entry
+    movabsq $(KSTACK-40),%rax
+    movq %rax,.Lint_stack(%rip)
+    leaq .Lint_eight_return(%rip),%rax
+    movq %rax,.Lint_return(%rip)
+    pushq $0x247
+    popfq
+    load_state
+    int $8
+.Lint_eight_return:
+    check_state
+    cli
+    case 36
+    gate 14 .Lint_entry
+    leaq .Lint_fourteen_return(%rip),%rax
+    movq %rax,.Lint_return(%rip)
+    pushq $0x247
+    popfq
+    load_state
+    int $14
+.Lint_fourteen_return:
+    check_state
+    cli
+    gate 14 .Lpf 0 1
+    case 37
+    gate 0x7f .Lint_entry 3
+    movb $0xe0,IDT+16*0x7f+5
+    expect_fault 13 0x3fa 0 0x7f
+    case 38
+    movb $0x6e,IDT+16*0x7f+5
+    expect_fault 11 0x3fa 0 0x7f
+    case 39
+    movb $0xee,IDT+16*0x7f+5
+    lidt .Lint_short_idtr(%rip)
+    expect_fault 13 0x3fa 0 0x7f
+    lidt .Lidtr(%rip)
+    case 40
+    movw $0,IDT+16*0x7f+2
+    expect_fault 13 0 0 0x7f
+    case 41
+    movw $16,IDT+16*0x7f+2
+    expect_fault 13 16 0 0x7f
+    case 42
+    movw $24,IDT+16*0x7f+2
+    andb $0x7f,GDT+24+5
+    expect_fault 11 24 0 0x7f
+    orb $0x80,GDT+24+5
+    case 43
+    /* A CPL3 INT through a DPL0 gate faults at the INT, before any stack
+     * write; recovery checks the user CS/SS/RSP and resumes in the kernel. */
+    gate 0x7f .Lint_entry
+    frame .Lint_dpl_user 35 43 2 USTACK
+    iretq
+.Lint_dpl_user:
+    expect_fault 13 0x3fa 0 0x7f
+    case 44
+    gate 0x7f .Lint_entry 3
+    movabsq $(HIGH+0x46000),%rax
+    movq %rax,TSS+4
+    movq $0,0x4000+8*0x45
+    movabsq $(HIGH+0x45000),%rax
+    invlpg (%rax)
+    frame .Lint_stack_user 35 43 2 USTACK
+    iretq
+.Lint_stack_user:
+    expect_fault 14 2 (HIGH+0x45ff8) 0x7f
+    case 45
+    /* Gate validation precedes touching a missing privilege-change stack. */
+    movq $0,0x4000+8*0x45
+    movabsq $(HIGH+0x45000),%rax
+    invlpg (%rax)
+    movb $0xe0,IDT+16*0x7f+5
+    frame .Lint_priority_user 35 43 2 USTACK
+    iretq
+.Lint_priority_user:
+    expect_fault 13 0x3fa 0 0x7f
+    case 46
+    /* DPL failure wins over the not-present bit for a software INT. */
+    gate 0x7f .Lint_entry
+    andb $0x7f,IDT+16*0x7f+5
+    frame .Lint_dpl_np_user 35 43 2 USTACK
+    iretq
+.Lint_dpl_np_user:
+    expect_fault 13 0x3fa 0 0x7f
+    case 47
+    /* A missing IST stack faults without changing the interrupted CPL0
+     * frame. The page-fault handler has its own, independent IST stack. */
+    gate 0x7f .Lint_entry 3 3
+    movabsq $(HIGH+0x46000),%rax
+    movq %rax,TSS+52
+    movq $0,0x4000+8*0x45
+    movabsq $(HIGH+0x45000),%rax
+    invlpg (%rax)
+    expect_fault 14 2 (HIGH+0x45ff8) 0x7f
+    case 48
+    /* INT cannot write TSS.RSP0, and #PF cannot write that same stack.
+     * Delivery must escalate to #DF on a separate, valid IST stack. */
+    gate 8 .Ldf 0 1
+    gate 14 .Lpf
+    gate 0x7f .Lint_entry 3
+    movabsq $(HIGH+0x46000),%rax
+    movq %rax,TSS+4
+    movq $0,0x4000+8*0x45
+    movabsq $(HIGH+0x45000),%rax
+    invlpg (%rax)
+    frame .Lint_double_fault_user 35 43 2 USTACK
+    iretq
+.Lint_double_fault_user:
+    expect_fault 8 0 0 0x7f
+    gate 14 .Lpf 0 1
+    movabsq $KSTACK,%rax
+    movq %rax,TSS+4
+    case 49
+    /* A software INT is not an exception already in progress. If its
+     * own gate is invalid, #GP must not be mistaken for a second fault. */
+    movb $0x80,IDT+16*8+5
+    expect_fault 13 0x42 0 8
+    gate 8 .Ldf 0 1
+    case 50
+    movb $0x80,IDT+16*14+5
+    expect_fault 13 0x72 0 14
+    gate 14 .Lpf 0 1
+.Lint_page_start:
+    case 51
+    /* Prime a CPL3 translation of CLI at the exact low-address handler PC.
+     * Keep the code and CR3 unchanged between this #GP and the real INT. */
+    leaq .Lint_tb_code(%rip),%rsi
+    movl $0x70000,%edi
+    movl $(.Lint_tb_code_end-.Lint_tb_code),%ecx
+    rep movsb
+    movw $0x7fcd,0x71ffe
+    /* On IRET, clear EAX and use the ordinary user-to-kernel continuation. */
+    movl $0x80cdc031,0x72000
+    movl $13,.Lexpect_vector(%rip)
+    movq $0,.Lexpect_error(%rip)
+    movq $0x70000,.Lexpect_rip(%rip)
+    movq $USTACK,.Lexpect_rsp(%rip)
+    movq $2,.Lexpect_flags(%rip)
+    movw $43,.Lexpect_ss(%rip)
+    movw $35,.Lexpect_cs(%rip)
+    movl $1,.Lint_fault_state(%rip)
+    leaq .Lint_tb_seed_done(%rip),%rax
+    movq %rax,.Lresume(%rip)
+    frame .Lint_tb_seed_user 35 43 2 USTACK
+    iretq
+.Lint_tb_seed_user:
+    load_state
+    movq $0x123456,%rbx
+    movq $0x654321,%r12
+    pushq $0x70000
+    ret
+.Lint_tb_seed_done:
+    movl $0,.Lexpect_vector(%rip)
+    movl $0,.Lint_fault_state(%rip)
+    gate 0x7f .Lint_entry 3
+    /* 0x70000 is unchanged: the first instruction is the primed CLI. */
+    movw $0,IDT+16*0x7f
+    movw $24,IDT+16*0x7f+2
+    movw $7,IDT+16*0x7f+6
+    movl $5,.Luser_stage(%rip)
+    frame .Lint_tb_invoke 35 43 0x247 USTACK
+    iretq
+.Lint_tb_invoke:
+    load_state
+    /* The two-byte INT ends exactly at a 4 KiB boundary. */
+    pushq $0x71ffe
+    ret
+.Lint_tb_kernel:
+    popq %rax
+    check_state
+    movw %cs,%ax
+    cmpw $24,%ax
+    jne .Lfail
+    movw %ss,%ax
+    testw %ax,%ax
+    jne .Lfail
+    movabsq $(KSTACK-40),%rax
+    cmpq %rax,%rsp
+    jne .Lfail
+    cmpq $0x72000,(%rsp)
+    jne .Lfail
+    cmpq $35,8(%rsp)
+    jne .Lfail
+    cmpq $0x247,16(%rsp)
+    jne .Lfail
+    cmpq $USTACK,24(%rsp)
+    jne .Lfail
+    cmpq $43,32(%rsp)
+    jne .Lfail
+    load_state
+    iretq
+.Lint_tb_done:
+    movabsq $KSTACK,%rsp
+    movl $16,%eax
+    movw %ax,%ss
+    movl $0,.Luser_stage(%rip)
+    movl $0,.Lexpect_vector(%rip)
+    leaq .Lint_pass_text(%rip),%rsi
+    call .Lputs
 .Lmpx_start:
     /* MPX checks are conditional on CPUID, never silently emulated in the
      * firmware. CPUs without XSAVE+MPX report an explicit skip. */
@@ -815,6 +1140,38 @@
     movl $0x10,%eax
     outl %eax,$0xf4
     jmp .Lhalt
+.Lint_tb_code:
+    cli
+    pushq %rax
+    movabsq $ROM(.Lint_tb_kernel),%rax
+    jmp *%rax
+.Lint_tb_code_end:
+.Lint_entry:
+    pushfq
+    popq .Lint_entry_flags(%rip)
+    check_state
+    cmpq .Lint_stack(%rip),%rsp
+    jne .Lfail
+    movq .Lint_return(%rip),%rax
+    cmpq %rax,(%rsp)
+    jne .Lfail
+    movq .Lint_old_cs(%rip),%rax
+    cmpq %rax,8(%rsp)
+    jne .Lfail
+    cmpq $0x247,16(%rsp)
+    jne .Lfail
+    movq .Lint_old_rsp(%rip),%rax
+    cmpq %rax,24(%rsp)
+    jne .Lfail
+    movq .Lint_old_ss(%rip),%rax
+    cmpq %rax,32(%rsp)
+    jne .Lfail
+    movq .Lint_entry_flags(%rip),%rax
+    andq $0x200,%rax
+    cmpq .Lint_handler_if(%rip),%rax
+    jne .Lfail
+    load_state
+    iretq
 .Lnmi:
     pushq %rax
     pushq %rcx
@@ -845,6 +1202,9 @@
     pushq $0
     pushq $6
     jmp .Ltrap
+.Ldf:
+    pushq $8
+    jmp .Ltrap
 .Lnp:
     pushq $11
     jmp .Ltrap
@@ -857,12 +1217,17 @@
 .Lpf:
     pushq $14
 .Ltrap:
+    movq %rax,.Lfault_rax(%rip)
     movq (%rsp),%rax
     movq %rax,.Lvector(%rip)
     movq 8(%rsp),%rax
     movq %rax,.Lerror(%rip)
     movq 16(%rsp),%rax
     movq %rax,.Lfault_rip(%rip)
+    /* Case 51 has no fixture changes. Preserve the primed user TB by
+     * avoiding page-table/CR3 writes during its expected CLI #GP recovery. */
+    cmpl $51,.Lcase(%rip)
+    je .Ltrap_fixture_ready
     lgdt .Lgdtr(%rip)
     /* Restore fixture mappings before examining the saved state. */
     movq $0x41007,0x4000+8*0x41
@@ -870,6 +1235,7 @@
     movq $0x45007,0x4000+8*0x45
     movq %cr3,%rax
     movq %rax,%cr3
+.Ltrap_fixture_ready:
     movl .Lexpect_vector(%rip),%eax
     testl %eax,%eax
     jz .Lfail
@@ -878,10 +1244,15 @@
     movq .Lexpect_error(%rip),%rax
     cmpq 8(%rsp),%rax
     jne .Lfail
+    /* Double fault is an abort: its saved RIP is architecturally
+     * undefined. All ordinary fault cases still require the exact INT/IRET. */
+    cmpl $8,.Lexpect_vector(%rip)
+    je 3f
     movq .Lexpect_rip(%rip),%rax
     cmpq 16(%rsp),%rax
     jne .Lfail
-    cmpq $24,24(%rsp)
+3:  movzwq .Lexpect_cs(%rip),%rax
+    cmpq %rax,24(%rsp)
     jne .Lfail
     movq .Lexpect_rsp(%rip),%rax
     cmpq 40(%rsp),%rax
@@ -903,7 +1274,16 @@
     movq %cr2,%rax
     cmpq .Lexpect_cr2(%rip),%rax
     jne .Lfail
-1:  movabsq $KSTACK,%rsp
+1:  cmpl $0,.Lint_fault_state(%rip)
+    je 2f
+    /* All software-INT fault paths preserve the full incoming integer and
+     * SIMD state. The common trap machinery saved RAX before using it. */
+    movq .Lfault_rax(%rip),%rax
+    movq $0x2222,%rbx
+    movq $0xcccc,%r12
+    check_state
+2:  movabsq $KSTACK,%rsp
+    orb $0x80,GDT+24+5
     /* Restore the tested CS without invoking the instruction under test. */
     pushq $24
     pushq .Lresume(%rip)
@@ -969,6 +1349,19 @@
 .Lexpect_flags: .quad 0
 .Lexpect_cr2: .quad 0
 .Lexpect_ss: .word 0
+.Lexpect_cs: .word 0
+.Lfault_rax: .quad 0
+.Lint_fault_state: .long 0
+.Lint_short_idtr:
+    .word 16*127-1
+    .quad IDT
+.Lint_stack: .quad 0
+.Lint_return: .quad 0
+.Lint_old_cs: .quad 0
+.Lint_old_ss: .quad 0
+.Lint_old_rsp: .quad 0
+.Lint_handler_if: .quad 0
+.Lint_entry_flags: .quad 0
 .Lresume: .quad 0
 .Lold_cr4: .quad 0
 .Lold_xcr0: .quad 0
@@ -1006,6 +1399,7 @@
     .quad 0x0e2c4a6886a4c2e0,0xf1d3b597795b3d1f
 .Literations_text: .asciz "IRET iterations=0x"
 .Lbench_only_text: .asciz "IRET BENCH ONLY (matrix skipped)\n"
+.Lint_pass_text: .asciz "IRET INT PASS\n"
 .Lmpx_pass_text: .asciz "IRET MPX PASS\n"
 .Lmpx_skip_text: .asciz "IRET SKIP MPX (CPUID XSAVE/MPX absent)\n"
 .Lbench_text: .asciz "IRET kernel_ticks=0x"

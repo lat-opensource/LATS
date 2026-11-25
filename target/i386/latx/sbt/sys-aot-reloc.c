@@ -32,6 +32,9 @@ static uint32_t tu_rel_table_capacity;
 static pthread_mutex_t tu_rel_table_lock;
 
 uintptr_t relkind_to_fixup_addr[] = {
+#ifdef CONFIG_SOFTMMU
+    [LOAD_SOFTWARE_INTERRUPT_HELPER] = (uintptr_t)latx_helper_software_interrupt,
+#endif
     [AOT_NATIVE_ATOMIC] =
         (uintptr_t)offsetof(struct latx_sc_table_t, aot_native_atomic),
     [AOT_NATIVE_CPU_QUERY] =
@@ -825,6 +828,7 @@ void aot_do_tb_reloc(ENV *lsenv, TranslationBlock *tb, aot_rel *aot_rel_table,
                                       relkind_to_fixup_addr[kind]);
             goto relocate_host_address;
         case LOAD_HRAS_CALL_HELPER:
+        case LOAD_SOFTWARE_INTERRUPT_HELPER:
         case LOAD_HELPER_BEGIN ... LOAD_HELPER_END:
             helper_address = (uintptr_t)relkind_to_fixup_addr[aot_rel_table[i].kind];
 relocate_host_address:
