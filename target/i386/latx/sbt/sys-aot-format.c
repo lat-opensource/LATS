@@ -617,6 +617,7 @@ static bool aot_reloc_slots_valid(const aot_rel *rel)
     case LOAD_HELPER_BEGIN ... LOAD_HELPER_END:
     case LOAD_HRAS_CALL_HELPER:
     case LOAD_HRAS_CALL_RET0_ADDR:
+    case LOAD_SOFTWARE_INTERRUPT_HELPER:
         return rel->rel_slots_num == 3;
     case LOAD_HRAS_FSHT_BASE:
         return rel->rel_slots_num == 2;

@@ -26,6 +26,23 @@
 #include "tcg/helper-tcg.h"
 #include "../seg_helper.h"
 #include "latx/include/latx-native-asm.h"
+#include "latx/include/latx-helper.h"
+
+void latx_helper_software_interrupt(CPUX86State *env, int intno, int length)
+{
+    CPUState *cpu = env_cpu(env);
+
+    /* An MMIO IDT/stack needs the ordinary execution-loop retry when I/O
+     * is forbidden. Its software-MMU access cannot recompile from RA=0. */
+    if (!cpu->can_do_io) {
+        helper_raise_interrupt(env, intno, length);
+    }
+    cpu_svm_check_intercept_param(env, SVM_EXIT_SWINT, 0, 0);
+    /* Do not mark the software vector as an already active exception: INT
+     * 8/14 delivery faults are not triple/double faults by themselves. */
+    do_interrupt_all(env_archcpu(env), intno, 1, 0, env->eip + length, 0);
+    env->old_exception = -1;
+}
 
 void helper_syscall(CPUX86State *env, int next_eip_addend)
 {

@@ -1938,9 +1938,7 @@ static void tb_add_jump(TranslationBlock *tb, int n,
     uintptr_t old;
 
     if (check_misc_flags(tb, MF_END_SYSCALL)) {
-        if (option_opt_syscall == 1) {
-            current_cpu->env_ptr->syscall_tb = (void *)tb_next->tc.ptr;
-        } else if (option_opt_syscall == 2) {
+        if (option_opt_syscall) {
             current_cpu->env_ptr->syscall_tb = (void *)tb_next;
         }
         return;
