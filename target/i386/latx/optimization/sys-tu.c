@@ -342,18 +342,34 @@ TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
     uint32_t mtcc_id = curr_mtcc(env);
     tcg_ctx = tcg_ctx_mtcc[mtcc_id];
 
-    phys_pc = get_page_addr_code_hostp(env, pc, &host_pc);
+#ifdef CONFIG_SOFTMMU
+    if (!is_first_tb && !cp_tu_pages() &&
+        get_page(pc) != get_page(tu_data->tb_list[0]->pc)) {
+        return NULL;
+    }
+#endif
+
+    /* tb_explore demand-fetches the entry before acquiring page locks. */
+    phys_pc = get_page_addr_code_hostp_noexit(env, pc, &host_pc);
+    if (phys_pc == -1) {
+        return NULL;
+    }
+#ifdef CONFIG_SOFTMMU
+    if ((is_first_tb || !cp_tu_pages()) &&
+        get_page(phys_pc) != get_page(tcg_ctx->pre_locked_page0)) {
+        /* The entry may have been remapped while we waited for its lock. */
+        return NULL;
+    }
+#endif
 
 #ifdef CONFIG_USER_ONLY
     /* User-mode trylock is a no-op. Protect each member's first page before
      * decoding, including writable code reached beyond the TU entry page.
      * Cross-page decoding protects the second page via tb_lock_page1(). */
-    if (phys_pc != -1) {
-        tb_lock_page0(phys_pc);
-    }
+    tb_lock_page0(phys_pc);
 #endif
 
-    if (phys_pc != -1 && cp_tu_pages()) {
+    if (cp_tu_pages()) {
         lock_result = tu_lock_page(pc, phys_pc, NULL);
 
         if (lock_result == TU_LOCK_RESTART_LOCK_ORDER) {
@@ -368,11 +384,6 @@ TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
             *result = TU_EXPLORE_FALLBACK;
             return NULL;
         }
-    }
-
-    if (phys_pc == -1) {
-        /* Generate a one-shot TB with 1 insn in it */
-        cflags = (cflags & ~CF_COUNT_MASK) | CF_LAST_IO | 1;
     }
 
 #ifdef CONFIG_SOFTMMU
@@ -1379,8 +1390,7 @@ static TranslationBlock *tb_explore(CPUState *cpu,
         /* page is busy, lookup again after get the lock
          * to avoid useless translation */
         if (lookup_after_lock) {
-            //etb = export_tb_lookup(cpu, pc, cs_base, flags, cflags);
-            etb = tb_htable_lookup(cpu, pc, cs_base, flags, cflags);
+            etb = tb_htable_lookup_noexit(cpu, pc, cs_base, flags, cflags);
             if (etb) {
                 *result = TU_EXPLORE_EXISTED;
                 tb_unlock_ctx_pages(1);

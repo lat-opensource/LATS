@@ -25,6 +25,8 @@ TESTS = [
     "latx-aot/test-aot-ras-save.py",
     "latx-aot/test-aottucp-cache-policy.py",
     "latx-aot/test-cross-page-tu-corruption.py",
+    "latx-aot/test-jit-tu-page-boundaries.py",
+    "latx-aot/test-jit-tu-capacity.py",
     "latx-ras/check-aot-ras-link-policy.py",
     "latx-aot/test-host-load-guard.py",
     "latx-aot/ras-tp-bench/spec2000/test-output.py",

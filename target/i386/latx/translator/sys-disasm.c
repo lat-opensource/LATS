@@ -131,6 +131,16 @@ inline ADDRX latxs_ir1_disasm(IR1_INST *ir1,
 
 #include "accel/tcg/internal.h"
 
+static bool tu_allows_split_tb(void)
+{
+#ifdef CONFIG_SOFTMMU
+    if (!in_aot_translate && !cp_tu_pages()) {
+        return false;
+    }
+#endif
+    return cp_tu_cptb();
+}
+
 static void latxs_before_inst_fetch(CPUX86State *env,
         TranslationBlock *tb, ADDRX pc)
 {
@@ -151,7 +161,7 @@ static void latxs_before_inst_fetch(CPUX86State *env,
 
     TRANSLATION_DATA *td = lsenv->tr_data;
     if (td->is_tu_mode) {
-        if (!cp_tu_cptb() ||
+        if (!tu_allows_split_tb() ||
             td->disable_cross_page_tb ||
             tu_data->disable_cross_page_for_run ||
             (cp_tu_pages() && tu_data->pages_num >= cp_tu_page_num()))
@@ -679,7 +689,7 @@ inline IR1_INST *latxs_get_ir1_list(TranslationBlock *tb, ADDRX pc, int *p_ir1_n
          * decoding a first instruction across the page boundary.  A later
          * explore TB must stop at the boundary without discarding the TU.
          */
-        if (td->is_tu_mode && ir1_info_index != 0 && !cp_tu_cptb()) {
+        if (td->is_tu_mode && ir1_info_index != 0 && !tu_allows_split_tb()) {
             decode_cross_page_first = false;
         }
 #endif

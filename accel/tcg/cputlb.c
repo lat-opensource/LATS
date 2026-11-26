@@ -2529,10 +2529,17 @@ tb_page_addr_t get_page_addr_code_hostp_noexit(CPUArchState *env, vaddr addr,
 {
     CPUTLBEntryFull *full;
     void *p;
+#ifdef TARGET_I386
+    /* A failed x86 page walk leaves its error code for nested translation. */
+    int saved_error_code = env->error_code;
+#endif
 
     (void)probe_access_internal(env, addr, 1, MMU_INST_FETCH,
                                 cpu_mmu_index(env, true), true,
                                 &p, &full, 0, false);
+#ifdef TARGET_I386
+    env->error_code = saved_error_code;
+#endif
     if (p == NULL) {
         return -1;
     }
