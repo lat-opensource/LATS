@@ -602,7 +602,7 @@ do_check_protect:
 #endif
 
     ptwerror->error = HAMT_PTW_ERROR_NONE;
-    if (!option_pcid_asid && page_size > TARGET_PAGE_SIZE) {
+    if (page_size > TARGET_PAGE_SIZE) {
         env->hamt_large_page_bits |= page_size == (1U << HAMT_LARGE_PAGE_SHIFT)
                                      ? hamt_large_page_bit(addr) : UINT32_MAX;
     }

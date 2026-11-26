@@ -6744,6 +6744,7 @@ static void x86_cpu_reset_hold(Object *obj)
     env->tu_generation_array = NULL;
     memset(env, 0, offsetof(CPUX86State, end_reset_fields));
 #ifndef CONFIG_USER_ONLY
+    memset(&cpu->pcid_profile, 0, sizeof(cpu->pcid_profile));
     latx_pcid_cache_reset(s);
 #endif
 

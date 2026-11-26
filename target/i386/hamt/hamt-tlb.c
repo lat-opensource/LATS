@@ -121,14 +121,91 @@ static inline uint32_t guest_asid(void)
     return option_pcid_asid ? env->hamt_guest_asid : 0xf;
 }
 
+void hamt_flush_tlb_asid(unsigned asid)
+{
+    /* INVTLB op 4: local non-global entries for this ASID only. */
+    __asm__ __volatile__("invtlb 0x4, %0, $zero" :: "r"((uint64_t)asid)
+                         : "memory");
+}
+
+void hamt_flush_tlb_asid_page(unsigned asid, uint64_t addr)
+{
+    /* Op 5 invalidates the local non-global entry matching ASID and VA. */
+    __asm__ __volatile__("invtlb 0x5, %0, %1" :: "r"((uint64_t)asid),
+                         "r"(addr) : "memory");
+}
+
+void hamt_flush_tlb_pcid_page(CPUX86State *env, uint64_t page, bool large)
+{
+    unsigned active = env->hamt_guest_asid;
+
+    /* The active ASID may have refilled after pcid_valid was cleared. */
+    if (large) {
+        hamt_flush_tlb_asid(active);
+        latx_mem_clear_hpet_vpages();
+    } else {
+        hamt_flush_tlb_asid_page(active, page);
+        latx_mem_clear_hpet_vpage(page);
+    }
+    for (unsigned mask = env->pcid_valid; mask; mask &= mask - 1) {
+        unsigned asid = X86_HAMT_ASID_BASE + ctz32(mask);
+
+        if (asid != active) {
+            hamt_flush_tlb_asid_page(asid, page);
+        }
+    }
+}
+
+/*
+ * Non-PCIDE MOV CR3 invalidates even on a same-root reload. Each vCPU owns
+ * a separate range above the PCID slots. Never reuse a tag in this range
+ * until the local non-global TLB has been flushed.
+ */
+bool hamt_rotate_cr3_asid(CPUX86State *env)
+{
+    const unsigned count = 32;
+    unsigned cpu_index = env_cpu(env)->cpu_index;
+    unsigned first = X86_HAMT_ASID_BASE + X86_PCID_SLOTS;
+    unsigned current = env->hamt_guest_asid;
+
+    /* The ASID field has at most ten usable bits. */
+    if (cpu_index >= (1024 - first) / count) {
+        return false;
+    }
+    first += cpu_index * count;
+    if (current - first >= count) {
+        unsigned bits = extract32(read_csr_asid(), 16, 8);
+
+        if (first + count > (1U << MIN(bits, 10U))) {
+            return false;
+        }
+    }
+    if (current - first >= count - 1) {
+        hamt_flush_tlb_all();
+        env->hamt_guest_asid = first;
+        if (option_pcid_stats) {
+            qatomic_inc(&env_archcpu(env)->pcid_profile.asid_batches);
+        }
+    } else {
+        env->hamt_guest_asid = current + 1;
+        latx_mem_clear_hpet_vpages();
+    }
+    if (option_pcid_stats) {
+        qatomic_inc(&env_archcpu(env)->pcid_profile.asid_rotations);
+    }
+    return true;
+}
+
 bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
 {
     unsigned slot = cr3 & (X86_PCID_SLOTS - 1);
     unsigned asid = X86_HAMT_ASID_BASE + slot;
-    unsigned bits = extract32(read_csr_asid(), 16, 8);
+    unsigned cached_asid = env->hamt_guest_asid;
 
-    /* ASID 0 belongs to the translator and 0xf to the untagged guest. */
-    if (bits < 5) {
+    /* A tagged ASID records a successful width check on this pinned vCPU. */
+    if ((cached_asid < X86_HAMT_ASID_BASE ||
+         cached_asid >= X86_HAMT_ASID_BASE + X86_PCID_SLOTS) &&
+        extract32(read_csr_asid(), 16, 8) < 5) {
         return false;
     }
     bool same_context = noflush && env->pcid_context[slot] == cr3;
@@ -143,9 +220,7 @@ bool hamt_switch_pcid(CPUX86State *env, uint64_t cr3, bool noflush)
             qatomic_inc(&env->pcid_stats.retained);
         }
     } else {
-        /* INVTLB op 4: local non-global entries for this ASID only. */
-        __asm__ __volatile__("invtlb 0x4, %0, $zero" :: "r"((uint64_t)asid)
-                             : "memory");
+        hamt_flush_tlb_asid(asid);
         env->pcid_context[slot] = cr3;
         env->pcid_valid |= 1U << slot;
         if (option_pcid_stats) {

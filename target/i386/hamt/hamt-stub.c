@@ -61,9 +61,30 @@ pid_t hamt_fake_fork(void *dunekvmcpu, void *fn, void *data)
     return -1;
 }
 
+bool hamt_rotate_cr3_asid(struct CPUArchState *env)
+{
+    return false;
+}
+
 bool hamt_switch_pcid(struct CPUArchState *env, uint64_t cr3, bool noflush)
 {
     return false;
+}
+
+void hamt_flush_tlb_asid(unsigned asid)
+{
+    g_assert_not_reached();
+}
+
+void hamt_flush_tlb_pcid_page(struct CPUArchState *env, uint64_t page,
+                              bool large)
+{
+    g_assert_not_reached();
+}
+
+void hamt_flush_tlb_asid_page(unsigned asid, uint64_t addr)
+{
+    g_assert_not_reached();
 }
 
 void hamt_flush_tlb_all(void)

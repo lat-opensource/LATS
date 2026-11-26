@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/main-loop.h"
+#include "qemu/log.h"
 #include "qemu/timer.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
@@ -136,7 +137,16 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         if (option_pcid_asid && (env->cr[4] & CR4_PCIDE_MASK) &&
             hamt_is_running() && hamt_switch_pcid(env, t0, noflush)) {
             env->cr[3] = t0;
-            tlb_flush_after_pcid_switch(env_cpu(env));
+            tlb_flush_unbanked_pcid_caches(env_cpu(env));
+        } else if (option_pcid_asid && !(env->cr[4] & CR4_PCIDE_MASK) &&
+                   (env->cr[0] & CR0_PG_MASK) &&
+                   (env->efer & MSR_EFER_LMA) &&
+                   !(env->hflags & HF_GUEST_MASK) &&
+                   hamt_is_running() && hamt_rotate_cr3_asid(env)) {
+            env->cr[3] = t0;
+            qemu_log_mask(CPU_LOG_MMU, "CR3 update: CR3=" TARGET_FMT_lx "\n",
+                          t0);
+            tlb_flush_after_asid_rotation(env_cpu(env));
         } else {
             cpu_x86_update_cr3(env, t0);
         }
@@ -279,8 +289,11 @@ void helper_invpcid(CPUX86State *env, target_ulong addr, uint32_t reg,
     if (option_pcid_stats) {
         qatomic_inc(&env->pcid_stats.invpcid[type]);
     }
-    /* Over-invalidation is permitted for all four architectural types. */
-    tlb_flush(env_cpu(env));
+    if (type <= 1) {
+        tlb_flush_pcid(env_cpu(env), pcid, type == 0 ? &linear : NULL);
+    } else {
+        tlb_flush(env_cpu(env));
+    }
 }
 
 void helper_wrmsr(CPUX86State *env)
@@ -625,7 +638,7 @@ void helper_rdmsr(CPUX86State *env)
 
 void helper_flush_page(CPUX86State *env, target_ulong addr)
 {
-    tlb_flush_page(env_cpu(env), addr);
+    tlb_flush_x86_invlpg(env_cpu(env), addr);
 }
 
 static G_NORETURN

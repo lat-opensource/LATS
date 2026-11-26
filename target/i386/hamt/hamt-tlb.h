@@ -28,7 +28,12 @@ void hamt_set_tlb(void *env,
         uint64_t vaddr, uint64_t paddr,
         int prot, bool mode);
 struct CPUArchState;
+bool hamt_rotate_cr3_asid(struct CPUArchState *env);
 bool hamt_switch_pcid(struct CPUArchState *env, uint64_t cr3, bool noflush);
+void hamt_flush_tlb_asid(unsigned asid);
+void hamt_flush_tlb_pcid_page(struct CPUArchState *env, uint64_t page,
+                              bool large);
+void hamt_flush_tlb_asid_page(unsigned asid, uint64_t addr);
 void hamt_flush_tlb_all(void);
 void hamt_flush_tlb_page(uint64_t vaddr);
 

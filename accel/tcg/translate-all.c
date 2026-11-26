@@ -2395,6 +2395,7 @@ void dump_exec_info(GString *buf, int tbbytime)
         CPUState *cpu;
         CPU_FOREACH(cpu) {
             CPUX86State *env = cpu->env_ptr;
+            X86PcidProfile *profile = &env_archcpu(env)->pcid_profile;
             g_string_append_printf(buf, "PCID cpu=%d cr3=%" PRIu64
                                    " enabled=%" PRIu64 " noflush=%" PRIu64
                                    " retained=%" PRIu64 " bindings=%" PRIu64,
@@ -2416,6 +2417,19 @@ void dump_exec_info(GString *buf, int tbbytime)
                                    qatomic_read(
                                        &env->pcid_stats.cache_retained),
                                    qatomic_read(&env->pcid_stats.cache_cold));
+            g_string_append_printf(buf, " invpcid_page=%" PRIu64
+                                   " invpcid_large=%" PRIu64,
+                                   qatomic_read(&profile->invpcid_page),
+                                   qatomic_read(
+                                       &profile->invpcid_large));
+            g_string_append_printf(buf, " invlpg_page=%" PRIu64
+                                   " invlpg_large=%" PRIu64,
+                                   qatomic_read(&profile->invlpg_page),
+                                   qatomic_read(&profile->invlpg_large));
+            g_string_append_printf(buf, " asid_rotations=%" PRIu64
+                                   " asid_batches=%" PRIu64,
+                                   qatomic_read(&profile->asid_rotations),
+                                   qatomic_read(&profile->asid_batches));
             g_string_append(buf, " invpcid=");
             for (unsigned i = 0; i < 4; i++) {
                 uint64_t n = qatomic_read(&env->pcid_stats.invpcid[i]);

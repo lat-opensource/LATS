@@ -11,6 +11,8 @@
 #define DESC   0xd000
 #define IDT    0xe000
 #define ALIAS  0x400000
+#define PROBE_PTE (PT_B + 8*8)
+#define PROBE_VA (ALIAS + 0x8000)
 /* Executable pages are in normal RAM, above the BIOS tracking region. */
 #define CODE_A 0x109000
 #define CODE_B 0x10a000
@@ -197,6 +199,9 @@
 #ifdef PCID_CACHE_SMC
     movl $1,0x21108
 #endif
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    orl $2,0x21108
+#endif
     gate 6 .Lud
     gate 12 .Lss
     gate 13 .Lgp
@@ -206,6 +211,10 @@
     call .Lptw_contract
     movl $0x55,%eax
     jmp .Ldone
+#endif
+#ifdef PCID_CR3_NON_PCIDE
+    call .Lcr3_non_pcide
+    orl $4,0x21108
 #endif
     movl $1,%eax
     cpuid
@@ -242,6 +251,12 @@
     movl $CR3_A,%eax
     movq %rax,%cr3
     call .Llarge_page
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    /* Discard large translations left by the INVLPG test. */
+    movq $0,DESC
+    movl $2,%eax
+    invpcid DESC,%rax
+#endif
     movl $0x000011b8,CODE_A
     movl $0x0000c300,CODE_A+4
     movl $0x000022b8,CODE_B
@@ -274,15 +289,69 @@
     shlq $32,%rdx
     orq %rdx,%rax
     movq %rax,0x21100
+#ifdef PCID_INVLPG
+    call .Linvlpg_global
+#else
+#ifdef PCID_INVPCID_TYPE
+    /* Initial code-page protection can evict hardware ASIDs. Allow warmup
+     * before requiring 4096 retained switches back to A. */
+#if PCID_INVPCID_TYPE == 0
+    /* Probe a non-adjacent B page for retention in the target ASID. */
+    movq $0x120003,PROBE_PTE
+    movl $0,0x2110c
+#endif
+    movl $4112,%ecx
+#else
     movl $4096,%ecx
+#endif
 .Lswitch_pair:
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    /* Clear Accessed without INVLPG: an existing translation may stay hot. */
+    andq $~0x20,PROBE_PTE
+#endif
+#ifdef PCID_INVPCID_TYPE
+    /* B is inactive and still maps CODE_B. Remap B while A stays hot. */
+    movq $2,DESC
+    movq $ALIAS,DESC+8
+    movq $CODE_A+3,PT_B
+    movl $PCID_INVPCID_TYPE,%eax
+    invpcid DESC,%rax
+#ifdef PCID_INVPCID_BATCH
+    /* More requests for B before it can fill its jump caches again. */
+    .rept 3
+    invpcid DESC,%rax
+    .endr
+#endif
+#endif
     movabsq $(NOFLUSH | CR3_B),%rax
     movq %rax,%cr3
+#ifdef PCID_INVPCID_TYPE
+    cmpb $0x11,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl $0x11,%eax
+    jne .Lfail
+    /* Remap the active B back. A must survive both invalidations. */
+    movq $CODE_B+3,PT_B
+    movl $PCID_INVPCID_TYPE,%eax
+    invpcid DESC,%rax
+    /* Unbound PCID 17 shares A's slot but cannot invalidate A. */
+    movq $17,DESC
+    invpcid DESC,%rax
+#endif
     cmpb $0x22,64(%rsi)
     jne .Lfail
     call *%rsi
     cmpl $0x22,%eax
     jne .Lfail
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    /* A page walk here would set Accessed on the unrelated B page. */
+    movl PROBE_VA,%edx
+    testb $0x20,PROBE_PTE
+    jnz 1f
+    incl 0x2110c
+1:
+#endif
     movabsq $(NOFLUSH | CR3_A),%rax
     movq %rax,%cr3
     call *%rsi
@@ -292,12 +361,17 @@
     jne .Lfail
     decl %ecx
     jnz .Lswitch_pair
+#endif
     lfence
     rdtsc
     shlq $32,%rdx
     orq %rdx,%rax
     subq 0x21100,%rax
     movq %rax,0x21100
+#endif
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+    call .Linvpcid_cross_page
+    call .Lsplit_large
 #endif
 #ifdef PCID_CACHE_SMC
     /* Modify A through the identity alias while B owns the CPU. */
@@ -341,10 +415,45 @@
     fault 14,3
     movb $1,64(%rsi)
     checkfault
+    movq PT_A,%r8
+    movq PT_B,%r9
+    movq $CODE_A+3,PT_A
+    movq $CODE_B+3,PT_B
     movl $2,%eax
     invpcid DESC,%rax
+
+    .macro check_type3_page expected
+        cmpb $\expected,64(%rsi)
+        jne .Lfail
+        call *%rsi
+        cmpl $\expected,%eax
+        jne .Lfail
+    .endm
+    /* Populate two distinct PCIDs with non-global mappings of the same VA. */
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    check_type3_page 0x22
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    check_type3_page 0x11
+
+    /* Swap both PTEs without an intervening invalidation. */
+    movq $CODE_B+3,PT_A
+    movq $CODE_A+3,PT_B
     movl $3,%eax
     invpcid DESC,%rax
+    check_type3_page 0x22
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    check_type3_page 0x11
+    .purgem check_type3_page
+
+    movq %r8,PT_A
+    movq %r9,PT_B
+    movl $2,%eax
+    invpcid DESC,%rax
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
     movl $4,%eax
     fault 13
     invpcid DESC,%rax
@@ -613,6 +722,83 @@
 .Lwrap_gdtr:
     .word 39
     .quad ROM(.Lwrap_gdt)
+#ifdef PCID_CR3_NON_PCIDE
+#define NON_PCIDE_PAGE_A 0x114000
+#define NON_PCIDE_PAGE_B 0x115000
+#define NON_PCIDE_ITERATIONS 256
+.macro check_non_pcide_page expected
+    cmpb $\expected,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl $\expected,%eax
+    jne .Lfail
+.endm
+.Lcr3_non_pcide:
+    movq %cr4,%rax
+    testl $0x20000,%eax
+    jnz .Lfail
+    movq PT_A,%r8
+    movq PT_B,%r9
+    movl $0x000011b8,NON_PCIDE_PAGE_A
+    movw $0xc300,NON_PCIDE_PAGE_A+4
+    movb $0x11,NON_PCIDE_PAGE_A+64
+    movl $0x000022b8,NON_PCIDE_PAGE_B
+    movw $0xc300,NON_PCIDE_PAGE_B+4
+    movb $0x22,NON_PCIDE_PAGE_B+64
+    movq $NON_PCIDE_PAGE_A+3,PT_A
+    movq $NON_PCIDE_PAGE_A+3,PT_B
+    movl $ALIAS,%esi
+    movl $PML4_B,%edi
+    movq %rdi,%cr3
+    check_non_pcide_page 0x11
+    movl $PML4_A,%edi
+    movq %rdi,%cr3
+    check_non_pcide_page 0x11
+#ifdef PCID_INVLPG
+    /* A rotated ASID is active, but it has no PCID slot in pcid_valid. */
+    movq $NON_PCIDE_PAGE_B+3,PT_A
+    invlpg (%rsi)
+    check_non_pcide_page 0x22
+    movq $NON_PCIDE_PAGE_A+3,PT_A
+    invlpg (%rsi)
+    check_non_pcide_page 0x11
+#endif
+    movl $NON_PCIDE_ITERATIONS,%ecx
+    lfence
+    rdtsc
+    shlq $32,%rdx
+    orq %rax,%rdx
+    movq %rdx,%r10
+.Lcr3_non_pcide_loop:
+    /* Warm A still points to the old page until CR3 is rewritten. */
+    movq $NON_PCIDE_PAGE_B+3,PT_A
+    movq %rdi,%cr3
+    check_non_pcide_page 0x22
+
+    movl $PML4_B,%edx
+    movq %rdx,%cr3
+    check_non_pcide_page 0x11
+    movq %rdi,%cr3
+    check_non_pcide_page 0x22
+
+    movq $NON_PCIDE_PAGE_A+3,PT_A
+    movq %rdi,%cr3
+    check_non_pcide_page 0x11
+    decl %ecx
+    jnz .Lcr3_non_pcide_loop
+    lfence
+    rdtsc
+    shlq $32,%rdx
+    orq %rdx,%rax
+    subq %r10,%rax
+    movq %rax,0x21110
+    movl $NON_PCIDE_ITERATIONS*4,0x21118
+
+    movq %r8,PT_A
+    movq %r9,PT_B
+    movq %rdi,%cr3
+    ret
+#endif
 .Llarge_page:
     /* Cache code in one 4K subpage, invalidate a different one of the same PDE. */
     movq $0x200083,0x3008
@@ -650,6 +836,154 @@
     movq $0,0x3008
     invlpg (CODE_A+0x200000)
     ret
+#if defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0
+/* The cached entry PC is on the preceding page. Only the immediate of the
+ * MOV and its RET move to a different physical page. */
+.Linvpcid_cross_page:
+    movb $0xb8,CODE_B+0xfff
+    movl $0x33,0x112000
+    movb $0xc3,0x112004
+    movl $0x44,0x113000
+    movb $0xc3,0x113004
+    movq $0x112003,PT_B+8
+    movl $CR3_B,%eax
+    movq %rax,%cr3
+    movl $(ALIAS+0xfff),%edi
+    call *%rdi
+    cmpl $0x33,%eax
+    jne .Lfail
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    movq $0x113003,PT_B+8
+    movq $2,DESC
+    movq $ALIAS+0x1007,DESC+8
+    xorl %eax,%eax
+    invpcid DESC,%rax
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    call *%rdi
+    cmpl $0x44,%eax
+    jne .Lfail
+    movq $0,PT_B+8
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    ret
+
+#endif
+#if defined(PCID_INVLPG) || \
+    (defined(PCID_INVPCID_TYPE) && PCID_INVPCID_TYPE == 0)
+/* Split a cached 2M leaf in B. Invalidate a different 4K subpage and
+ * check the old instruction and data aliases, first in active B, then in
+ * inactive B. Walking the new page tables alone would miss the old 2M leaf. */
+.Lsplit_large:
+    xorl %ebp,%ebp
+1:
+#ifdef PCID_INVLPG
+    movq $0x183,0x6010
+#else
+    movq $0x83,0x6010
+#endif
+    movl $CR3_B,%eax
+    movq %rax,%cr3
+    movl $(ALIAS+CODE_A),%edi
+    cmpb $0x11,64(%rdi)
+    jne .Lfail
+    call *%rdi
+    cmpl $0x11,%eax
+    jne .Lfail
+    testl %ebp,%ebp
+    jz 2f
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+2:
+    movq $CODE_B+3,PT_B+8*(CODE_A>>12)
+    movq $PT_B+3,0x6010
+#ifdef PCID_INVLPG
+    invlpg (ALIAS+0x2000)
+#else
+    movq $2,DESC
+    movq $ALIAS+0x2000,DESC+8
+    xorl %eax,%eax
+    invpcid DESC,%rax
+#endif
+    testl %ebp,%ebp
+    jz 3f
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+3:
+    cmpb $0x22,64(%rdi)
+    jne .Lfail
+    call *%rdi
+    cmpl $0x22,%eax
+    jne .Lfail
+    incl %ebp
+    cmpl $2,%ebp
+    jne 1b
+    movq $0,PT_B+8*(CODE_A>>12)
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    ret
+#endif
+#ifdef PCID_INVLPG
+.Linvlpg_global:
+    /* Both PCIDs cache the same global mapping. Only B uses the probe VA. */
+    movq %cr4,%r11
+    movq %r11,%rax
+    orl $0x80,%eax
+    movq %rax,%cr4
+    movq $CODE_A+0x103,PT_A
+    movq $CODE_A+0x103,PT_B
+    movq $0x120003,PROBE_PTE
+    movl $CR3_B,%eax
+    movq %rax,%cr3
+    movl PROBE_VA,%eax
+    movl $ALIAS,%esi
+    call *%rsi
+    movl $CODE_B+0x103,%r8d
+    movl $CODE_A+0x103,%r9d
+    movl $0x22,%r10d
+    movl $0,0x2110c
+    movl $4112,%ecx
+1:
+    andq $~0x20,PROBE_PTE
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    call *%rsi
+    movq %r8,PT_A
+    movq %r8,PT_B
+    invlpg 64(%rsi)
+    cmpb %r10b,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl %r10d,%eax
+    jne .Lfail
+    movabsq $(NOFLUSH | CR3_B),%rax
+    movq %rax,%cr3
+    cmpb %r10b,64(%rsi)
+    jne .Lfail
+    call *%rsi
+    cmpl %r10d,%eax
+    jne .Lfail
+    movl PROBE_VA,%eax
+    testb $0x20,PROBE_PTE
+    jnz 2f
+    incl 0x2110c
+2:
+    xchgq %r8,%r9
+    xorl $0x33,%r10d
+    decl %ecx
+    jnz 1b
+    movq $CODE_A+3,PT_A
+    movq $CODE_B+3,PT_B
+    movq $0,PROBE_PTE
+    movabsq $(NOFLUSH | CR3_A),%rax
+    movq %rax,%cr3
+    invlpg (%rsi)
+    call .Lsplit_large
+    movq %r11,%cr4
+    orl $8,0x21108
+    ret
+#endif
 .Luser_test:
     /* RAM GDT: LTR writes the TSS busy bit. */
     leaq .Lgdt(%rip),%rsi

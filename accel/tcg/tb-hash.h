@@ -193,16 +193,6 @@ static inline void latx_njc_invalidate(CPUState *cpu, unsigned int hash,
     }
 }
 
-static inline void latx_njc_flush_all(CPUState *cpu)
-{
-    if (likely(cpu->latx_njc_cache == NULL)) {
-        return;
-    }
-    memset(cpu->latx_njc_cache->array, 0,
-           latx_jmp_cache_size() *
-           sizeof(cpu->latx_njc_cache->array[0]));
-}
-
 static inline TranslationBlock *
 tb_jmp_cache_load(CPUJumpCacheEntry *entry, bool pcrel)
 {
@@ -265,33 +255,39 @@ static inline void tb_jmp_cache_invalidate_current(CPUState *cpu, vaddr pc,
     latx_njc_invalidate(cpu, hash, pc, tb);
 }
 
+static inline void tb_jmp_cache_flush_bank(CPUJumpCache *jc, LatxNJC *njc)
+{
+    memset(jc->array, 0, latx_jmp_cache_size() * sizeof(jc->array[0]));
+    if (njc) {
+        memset(njc->array, 0, latx_jmp_cache_size() * sizeof(njc->array[0]));
+    }
+}
+
 static inline void tb_jmp_cache_flush_current(CPUState *cpu)
 {
-    CPUJumpCache *jc = cpu->tb_jmp_cache;
-
-    memset(jc->array, 0,
-           latx_jmp_cache_size() * sizeof(jc->array[0]));
-    latx_njc_flush_all(cpu);
+    tb_jmp_cache_flush_bank(cpu->tb_jmp_cache, cpu->latx_njc_cache);
 }
 
 #ifdef CONFIG_SOFTMMU
-static inline void tb_jmp_cache_flush_page_current(CPUState *cpu,
-                                                   vaddr page_addr)
+static inline void tb_jmp_cache_flush_page_bank(CPUState *cpu, CPUJumpCache *jc,
+                                                LatxNJC *njc, vaddr page_addr)
 {
-    CPUJumpCache *jc = cpu->tb_jmp_cache;
     unsigned int i0;
 
     assert(latx_jmp_cache_hash_mode() == LATX_JMP_CACHE_HASH_PAGE);
     i0 = tb_jmp_cache_hash_page(page_addr);
     memset(&jc->array[i0], 0,
            TB_JMP_PAGE_SIZE * sizeof(jc->array[0]));
-    if (cpu->latx_njc_cache) {
-        LatxNJC *latx_jc = cpu->latx_njc_cache;
-
+    if (njc) {
         i0 = latx_njc_hash_page(cpu, page_addr);
-        memset(&latx_jc->array[i0], 0,
-               TB_JMP_PAGE_SIZE * sizeof(latx_jc->array[0]));
+        memset(&njc->array[i0], 0, TB_JMP_PAGE_SIZE * sizeof(njc->array[0]));
     }
+}
+
+static inline void tb_jmp_cache_flush_page_current(CPUState *cpu, vaddr page)
+{
+    tb_jmp_cache_flush_page_bank(cpu, cpu->tb_jmp_cache,
+                                 cpu->latx_njc_cache, page);
 }
 #endif
 

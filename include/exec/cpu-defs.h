@@ -184,6 +184,8 @@ typedef struct CPUTLBCommon {
      * Protected by tlb_c.lock.
      */
     uint16_t dirty;
+    /* Save the active fast descriptors on the next bank switch. */
+    bool fast_changed;
     /*
      * Statistics.  These are not lock protected, but are read and
      * written atomically.  This allows the monitor to print a snapshot

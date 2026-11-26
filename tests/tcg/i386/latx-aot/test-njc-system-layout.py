@@ -75,6 +75,8 @@ for prefix in ['static inline unsigned int tb_jmp_cache_hash_page_legacy(',
                'static inline LatxNJCEntry *latx_njc_entry(']:
     c += block(hash_source, prefix) + '\n'
 c += 'static unsigned tb_jmp_cache_hash_page(vaddr pc) {return tb_jmp_cache_hash_page_legacy(pc);}\n'
+c += block(hash_source,
+           'static inline void tb_jmp_cache_flush_page_bank(') + '\n'
 c += block(hash_source, 'static inline void tb_jmp_cache_flush_page_current(') + '\n'
 c += block(alloc_source, 'static LatxNJC *latx_njc_aligned_alloc(') + '\n'
 c += block(alloc_source, 'static void latx_njc_aligned_free(') + '\n'

@@ -316,9 +316,6 @@ static void record_hamt_large_page(bool page_1g)
     int offset = offsetof(CPUX86State, hamt_large_page_bits);
 
     QEMU_BUILD_BUG_ON(offsetof(CPUX86State, hamt_large_page_bits) > 2047);
-    if (option_pcid_asid) {
-        return; /* The tagged path already invalidates all hardware ASIDs. */
-    }
     if (page_1g) {
         la_out2i(LISA_ADDI_D, &la_t4, &la_zero, -1);
     } else {

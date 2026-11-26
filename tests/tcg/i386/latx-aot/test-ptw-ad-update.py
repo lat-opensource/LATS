@@ -103,7 +103,6 @@ enum { HAMT_PTW_ERROR_NONE, HAMT_PTW_ERROR_PF, HAMT_PTW_ERROR_MMIO,
 static _Alignas(4096) unsigned char ram[6 * 4096];
 static uint8_t page_flags[0x240000];
 #define HACK_RAMBASE ((uintptr_t)ram)
-static bool option_pcid_asid;
 static uint32_t hamt_large_page_bit(uint64_t a) { return 1u << ((a >> 21) & 31); }
 static bool latx_hack_gpa_in_ram(uint64_t a) { return a < UINT64_C(0x240000000); }
 static uint8_t *hamt_get_ptwdata(void) { return page_flags; }

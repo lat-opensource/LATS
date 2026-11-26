@@ -1,24 +1,27 @@
 # PCID and HAMT ASID system test
 
-This is an opt-in x86-64 system-emulation feature. Use the same LATS binary
-and CPU model for all three configurations:
+Use the same LATS binary and CPU model for all configurations. The runner
+sets these switches explicitly:
 
 | Mode | Additional LATS options (after `-latx select`) | Extra `-cpu` features |
 | --- | --- | --- |
-| A | none | none |
-| B | `pcid=on` | `+pcid,+invpcid` |
-| C | `pcid=on,pcidasid=on` | `+pcid,+invpcid` |
+| A | `pcid=off,pcidasid=off,pcidcache=off` | none (qemu64) |
+| B | `pcid=on,pcidasid=off,pcidcache=off` | `+pcid,+invpcid` |
+| C | `pcid=on,pcidasid=on,pcidcache=off` | `+pcid,+invpcid` |
 | C with software banks | `pcid=on,pcidasid=on,pcidcache=on,aotsys=off` | `+pcid,+invpcid` |
 
-Omit the additional options and features to return to A. A and B use
+A and B use
 conservative invalidation. C requires pinned HAMT vCPUs in DMW mode and
 hardware ASIDs enabled. It reserves tags 16–31 in each vCPU, retaining a
 translation only on an explicitly no-flush CR3 write that hits the full
 guest CR3 identity. Slot replacement invalidates the hardware tag before
 publishing the new owner. Tag 0 remains for the translator and 15 for the
 untagged guest. Existing software TLBs, fast instruction caches and jump
-caches are invalidated on address-space switches. INVPCID handles all four
-types conservatively, including global mappings. Hardware cache contents
+caches are invalidated on address-space switches without software banks.
+With a tagged ASID active, INVPCID type 0 invalidates the target address
+unless a large mapping may cover it. Type 1 invalidates the target context.
+Types 2 and 3 use a full local flush, as do types 0 and 1 while running
+without a known tagged context. Hardware cache contents
 are transient across reset and VM state load.
 
 `pcidcache=on` additionally retains the software TLB, fast instruction
@@ -28,7 +31,7 @@ without clearing entry arrays. Explicit mapping changes expire inactive banks
 before reuse. Physical write-protection notifications update matching write
 flags in every live bank. Physical TB invalidation reaches every
 allocated jump-cache bank. See `docs/devel/lats-pcid-caches.md` for the
-lifetime and invalidation rules. This remains an opt-in experimental mode.
+lifetime and invalidation rules.
 
 For diagnostics, add `pcidstats=on` in **all** compared modes. HMP `info jit`
 then shows per-vCPU CR3 writes, PCIDE enables, PCIDs observed, no-flush
@@ -72,6 +75,52 @@ successful C run must actually reuse tags; a successful B/C HAMT run must
 exercise guest hardware refill. Treat the result as mechanism evidence.
 Windows adoption requires observing CR4.PCIDE and no-flush writes in the
 target Windows workload itself.
+
+Add `-DPCID_CR3_NON_PCIDE` to run a separate CR3 regression before the
+ordinary ROM checks. It runs in long mode with CR4.PCIDE clear and writes
+aligned page-table roots without the PCID no-flush hint. Each of 256
+iterations remaps an active 4 KiB page, rewrites the current root, switches
+from A to B and back, and remaps and rewrites A once more. Every write is
+followed by a data read and execution at the same virtual address, with
+distinct expected values for the two physical pages. The 1024 timed writes
+are sufficient for repeated wraparound of a 32-tag rotation. The probe
+then restores the initial mappings and root.
+
+The elapsed guest TSC covers the loop, including mapping updates, data
+reads and calls. Setup and restoration are outside the interval. With
+this build macro, guest result flags at `0x21108` have bit 2 set after the
+probe completes. Read the elapsed TSC as a 64-bit value at `0x21110` and
+the timed CR3 write count as a 32-bit value at `0x21118`.
+
+To check targeted INVPCID, build the SMP/BENCH/WAIT ROM twice, adding
+`-DPCID_INVPCID_TYPE=0` and `-DPCID_INVPCID_TYPE=1` respectively. Run
+each ROM in mode C with `--cache`. Each of the 4112 switch pairs remaps the
+same address in B while inactive and again while active, checks instruction
+and data accesses, and invalidates an unbound PCID colliding with A. The
+runner requires at least 4096 hardware and software retentions on the BSP.
+The 16 extra pairs allow for hardware ASID eviction during initial code-page
+protection. A global flush returns the right data but fails the retention check.
+Type 0 must also retain B and its unrelated 4K data translation. The ROM
+samples that translation through the Accessed bit, remaps the second page
+of a crossing instruction, and splits a 2M mapping in active and inactive B.
+With PCID statistics enabled,
+`invpcid_page` counts targeted address invalidations and `invpcid_large`
+counts type 0 requests widened by the large-page bitmap. The loop timings
+include remapping and invalidation.
+
+For a burst of type 0 requests targeting an inactive bank, also define
+`PCID_INVPCID_BATCH` and run mode C with `--cache --full-hash`. The full hash
+requires invalidating the entire jump table. The bank must clear it before
+executing the remapped code when selected again.
+
+To exercise guest INVLPG, build the SMP/BENCH/WAIT ROM with `-DPCID_INVLPG`
+and run mode C with and without `--cache`. Two PCIDs execute and read a
+global page that changes backing after each INVLPG. The inactive PCID's
+unrelated 4K page is probed via its Accessed bit. The ROM also splits a
+cached 2M leaf in the active and inactive contexts. With PCID statistics
+enabled, `invlpg_page` counts requests handled by page in the active
+context and `invlpg_large` counts requests widened there. Inactive banks
+use their own large-page history.
 
 Add `-DPCID_LEGACY` at assembly time to run 32-bit protected-mode checks
 before entering long mode. These include a non-flat FS descriptor, a
