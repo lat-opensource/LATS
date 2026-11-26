@@ -4040,6 +4040,7 @@ void get_last_info(TranslationBlock *tb, IR1_INST* pir1)
 
 int ir1_is_eob_in_tu(IR1_INST *pir1)
 {
+    if (latxs_ir1_is_port_io(pir1)) return 1;
     if (latxs_ir1_is_sti(pir1)) return 1;
     if (latxs_ir1_is_mov_to_seg_ss(pir1)) return 1;
     if (latxs_ir1_is_pop_to_seg_ss(pir1)) return 1;

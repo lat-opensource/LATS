@@ -12,7 +12,7 @@
 #define AOT_TU   0x04
 #define AOT_TU_FLAG_BIT 10
 
-#define AOT_FORMAT_VERSION "-format35"
+#define AOT_FORMAT_VERSION "-format36"
 
 #define AOT_PAGE_MAGIC 0x66666666
 #define AOT_MERGED_MAGIC 0x77777777

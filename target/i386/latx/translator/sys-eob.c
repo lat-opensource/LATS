@@ -298,7 +298,8 @@ int latxs_ir1_is_eob_in_sys(IR1_INST *ir1)
 
     return latxs_is_system_eob(td, ir1) ||
            is_pause_eob ||
-           latxs_ir1_is_hit_breakpoint(td, ir1);
+           latxs_ir1_is_hit_breakpoint(td, ir1) ||
+           latxs_ir1_is_port_io(ir1);
 }
 
 void latxs_tr_gen_eob(void)
@@ -428,6 +429,15 @@ static int latxs_sys_eob_check(SysEOBContext *ctx, IR1_INST *pir1)
 
 static void latxs_sys_eob_prepare(SysEOBContext *ctx, IR1_INST *pir1)
 {
+    if (latxs_ir1_is_port_io(pir1)) {
+        /* A port access is a device boundary.  Reuse the existing EOB
+         * interrupt check so an async exit request (e.g. SeaBIOS writes
+         * 0xCF9 and then falls through to int3) or a pending interrupt is
+         * taken before the next guest instruction; a clean access still
+         * links to the next TB. */
+        ctx->irqcheck_mode = SYSEOB_IRQCHECK_REQ;
+        return;
+    }
     if (latxs_check_interrupt_at_block_end() &&
         (latxs_ir1_is_mov_to_cr(pir1) || latxs_ir1_is_mov_to_dr(pir1))) {
         ctx->irqcheck_mode = SYSEOB_IRQCHECK_NORMAL;
