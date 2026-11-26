@@ -845,7 +845,7 @@ QemuOptsList qemu_latx_opts = {
         }, {
             .name = "sysflag",
             .type = QEMU_OPT_NUMBER,
-            .help = "optimization for eflags",
+            .help = "optimization for eflags (bit 0: CPL3, bit 1: CPL0; default 3)",
         }, {
             .name = "sysflagtu",
             .type = QEMU_OPT_NUMBER,
@@ -853,7 +853,7 @@ QemuOptsList qemu_latx_opts = {
         }, {
             .name = "instptn",
             .type = QEMU_OPT_NUMBER,
-            .help = "instruction pattern",
+            .help = "instruction pattern mask (bits 0..33: patterns, bit 34: CPL0; default 0x7ffffffff)",
         }, {
             .name = "pushpop",
             .type = QEMU_OPT_BOOL,
@@ -2304,9 +2304,9 @@ void latxs_options_init(void)
     /* ====== 2. Optimization of Translation ====== */
     option_lsfpu = 1; // lsfpu
     option_fast_fpr_ldst = 1; // ffldst
-    option_sys_flag_reduction = 1; // sysflag
+    option_sys_flag_reduction = FLAGRDTN_TB_DEFAULT; // sysflag
     option_sys_flag_reduction_tu = FLAGRDTN_TU_DEFAULT; // sysflagtu
-    option_instptn = 0x3ffffffffULL; /* instptn */
+    option_instptn = INSTPTN_OPT_DEFAULT; /* instptn */
     option_pushpop = 1; // pushpop
     option_pushpop_ret = 1;
     option_by_hand_64 = 1; // byhand64

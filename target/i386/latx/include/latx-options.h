@@ -541,6 +541,9 @@ static inline void __disable_dump_all(void)
 #include "hamt-options.h"
 
 extern int option_sys_flag_reduction;
+#define FLAGRDTN_TB_CPL3        (0x1 << 0)
+#define FLAGRDTN_TB_CPL0        (0x1 << 1)
+#define FLAGRDTN_TB_DEFAULT     (FLAGRDTN_TB_CPL3 | FLAGRDTN_TB_CPL0)
 extern int option_sys_flag_reduction_tu;
 #define FLAGRDTN_TU_PARSE_USE   (0x1 << 0)
 #define FLAGRDTN_TU_NEXT        (0x1 << 1)
@@ -653,6 +656,9 @@ static inline int flag_reduction_tu_dec_jcc(void)
     return option_sys_flag_reduction_tu & FLAGRDTN_TU_DEC_JCC;
 }
 extern uint64_t option_instptn;
+#define INSTPTN_OPT_PATTERN_MASK 0x3ffffffffULL
+#define INSTPTN_OPT_CPL0         (1ULL << 34)
+#define INSTPTN_OPT_DEFAULT      (INSTPTN_OPT_PATTERN_MASK | INSTPTN_OPT_CPL0)
 extern int option_risk_mem_offset;
 extern int option_risk_simd_ignore_upper64;
 extern int option_risk_simd_ignore_upper64_stat_track;

@@ -115,7 +115,9 @@ static const IR1_EFLAG_USEDEF latxs_ir1_opcode_eflag_usedef[] = {
     LATXS_FLAG_DEFINE(INSB,    __NONE, __NONE, __NONE), /* change */
     LATXS_FLAG_DEFINE(INSW,    __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(INSD,    __NONE, __NONE, __NONE),
-    LATXS_FLAG_DEFINE(INT,     __NONE, __NONE, __NONE),
+    LATXS_FLAG_DEFINE(INT,     __ALL_EFLAGS, __NONE, __NONE),
+    LATXS_FLAG_DEFINE(INT1,    __ALL_EFLAGS, __NONE, __NONE),
+    LATXS_FLAG_DEFINE(INT3,    __ALL_EFLAGS, __NONE, __NONE),
     LATXS_FLAG_DEFINE(INTO,    __OF, __NONE, __NONE), /* change */
     LATXS_FLAG_DEFINE(INVD,    __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(INVPCID, __NONE, __NONE, __NONE),
@@ -145,8 +147,8 @@ static const IR1_EFLAG_USEDEF latxs_ir1_opcode_eflag_usedef[] = {
     LATXS_FLAG_DEFINE(JCXZ,    __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(JMP,     __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(LAHF,    __SZAPCF, __NONE, __NONE), /* change */
+    LATXS_FLAG_DEFINE(LAR,     __NONE, __ZF, __NONE),
     /* INVALID */
-    LATXS_FLAG_DEFINE(LAR,     __NONE, __INVALID, __NONE),
     LATXS_FLAG_DEFINE(LDS,     __NONE, __INVALID, __NONE),
     LATXS_FLAG_DEFINE(LES,     __NONE, __INVALID, __NONE),
     LATXS_FLAG_DEFINE(LSS,     __NONE, __INVALID, __NONE),
@@ -172,7 +174,7 @@ static const IR1_EFLAG_USEDEF latxs_ir1_opcode_eflag_usedef[] = {
     LATXS_FLAG_DEFINE(LOOPE,   __ZF, __NONE, __NONE),
     LATXS_FLAG_DEFINE(LOOPNE,  __ZF, __NONE, __NONE),
 
-    LATXS_FLAG_DEFINE(LSL,     __NONE, __INVALID, __NONE),
+    LATXS_FLAG_DEFINE(LSL,     __NONE, __ZF, __NONE),
     LATXS_FLAG_DEFINE(LTR,     __NONE, __INVALID, __NONE),
     LATXS_FLAG_DEFINE(LZCNT,   __NONE, __ALL_EFLAGS, __OSAPF),
     LATXS_FLAG_DEFINE(MONITOR, __NONE, __INVALID, __NONE),
@@ -197,6 +199,7 @@ static const IR1_EFLAG_USEDEF latxs_ir1_opcode_eflag_usedef[] = {
     LATXS_FLAG_DEFINE(OUTSW,   __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(OUTSD,   __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(POP,     __NONE, __NONE, __NONE),
+    LATXS_FLAG_DEFINE(POPCNT,  __NONE, __ALL_EFLAGS, __NONE),
     LATXS_FLAG_DEFINE(POPAW,   __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(POPAL,   __NONE, __NONE, __NONE),
     LATXS_FLAG_DEFINE(POPF,    __NONE, __ALL_EFLAGS, __NONE),
@@ -212,6 +215,7 @@ static const IR1_EFLAG_USEDEF latxs_ir1_opcode_eflag_usedef[] = {
     LATXS_FLAG_DEFINE(RCR,     __CF, __CF | __OF, __NONE),
     LATXS_FLAG_DEFINE(RDMSR,   __NONE, __INVALID, __NONE),
     LATXS_FLAG_DEFINE(RDPMC,   __NONE, __INVALID, __NONE),
+    LATXS_FLAG_DEFINE(RDRAND,  __NONE, __ALL_EFLAGS, __NONE),
     LATXS_FLAG_DEFINE(RDTSC,   __NONE, __NONE, __NONE),
     /* LATXS_FLAG_DEFINE(REP,     __NONE, __INVALID, __NONE), */
     /* LATXS_FLAG_DEFINE(REPNE,     __NONE, __INVALID, __NONE), */
@@ -267,6 +271,7 @@ static const IR1_EFLAG_USEDEF latxs_ir1_opcode_eflag_usedef[] = {
 
     LATXS_FLAG_DEFINE(STR,     __NONE, __INVALID, __NONE),
     LATXS_FLAG_DEFINE(SUB,     __NONE, __ALL_EFLAGS, __NONE),
+    LATXS_FLAG_DEFINE(SYSCALL, __ALL_EFLAGS, __NONE, __NONE),
     LATXS_FLAG_DEFINE(TEST,    __NONE, __ALL_EFLAGS, __AF),
     LATXS_FLAG_DEFINE(TZCNT,   __NONE, __ALL_EFLAGS, __OSAPF),
     LATXS_FLAG_DEFINE(UD0,     __NONE, __NONE, __NONE),
@@ -512,10 +517,13 @@ void __latxs_flag_reduction(TranslationBlock *tb)
     /* cross scanning var defination */
     uint8 rdtn_pending_use =  __ALL_EFLAGS;
     IR1_INST *pir1 = &(list[tb_ir1_num(tb)-1]);
-    if (ir1_is_call(pir1) && ir1_is_indirect_call(pir1))
-        rdtn_pending_use =  __NONE;
-    if (td->is_tu_mode && tu_parse_pending_use(tb)) {
-        rdtn_pending_use = __NONE;
+    if ((tb->flags & HF_CPL_MASK) == 3) {
+        if (ir1_is_call(pir1) && ir1_is_indirect_call(pir1)) {
+            rdtn_pending_use = __NONE;
+        }
+        if (td->is_tu_mode && tu_parse_pending_use(tb)) {
+            rdtn_pending_use = __NONE;
+        }
     }
     /* scanning instructions in reverse order */
     for (int i = tb_ir1_num(tb) - 1; i >= 0; --i) {
