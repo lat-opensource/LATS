@@ -405,7 +405,7 @@ bool latxs_translate_out(IR1_INST *pir1)
     latxs_tr_gen_call_to_helper_epilogue_cfg(default_helper_cfg);
 
     /* 4. breakpoint IO */
-    latxs_tr_gen_io_bpt(pir1, opnd1, data_size >> 3);
+    latxs_tr_gen_io_bpt(pir1, opnd0, data_size >> 3);
 
     /* tr_gen_io_end(); */
 
