@@ -2428,7 +2428,10 @@ DirtyBitmapSnapshot *memory_region_snapshot_and_clear_dirty(MemoryRegion *mr,
     return snapshot;
 }
 
-uint8_t *dirty_bitmap_snapshot_get_dirty(DirtyBitmapSnapshot *snap);
+#ifdef CONFIG_LATX_HACK_MEM
+bool dirty_bitmap_snapshot_hamt_vga_is_dirty(DirtyBitmapSnapshot *snap,
+                                             uint64_t addr, uint64_t size);
+#endif
 
 bool memory_region_snapshot_get_dirty(MemoryRegion *mr, DirtyBitmapSnapshot *snap,
                                       hwaddr addr, hwaddr size)
@@ -2437,8 +2440,8 @@ bool memory_region_snapshot_get_dirty(MemoryRegion *mr, DirtyBitmapSnapshot *sna
 #ifdef CONFIG_LATX_HACK_MEM
     if (strncmp(mr->name, "vga.vram", 8) == 0) {
         if (hamt_no_vga_dirty()) return true;
-        return hamt_ptwdata_vga_snapshot_is_dirty(addr, size,
-                dirty_bitmap_snapshot_get_dirty(snap));
+        return dirty_bitmap_snapshot_hamt_vga_is_dirty(snap,
+                                                        mr->addr + addr, size);
     }
 #endif
     return cpu_physical_memory_snapshot_get_dirty(snap,

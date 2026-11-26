@@ -174,13 +174,45 @@ struct CPUAddressSpace {
 struct DirtyBitmapSnapshot {
     ram_addr_t start;
     ram_addr_t end;
+#ifdef CONFIG_LATX_HACK_MEM
+    uint64_t hamt_vga_start;
+    uint64_t hamt_vga_pages;
+#endif
     unsigned long dirty[];
 };
 
-uint8_t *dirty_bitmap_snapshot_get_dirty(DirtyBitmapSnapshot *snap);
-uint8_t *dirty_bitmap_snapshot_get_dirty(DirtyBitmapSnapshot *snap) {
-    return (uint8_t*)(snap->dirty);
+#ifdef CONFIG_LATX_HACK_MEM
+static uint8_t *dirty_bitmap_snapshot_get_hamt(DirtyBitmapSnapshot *snap)
+{
+    return (uint8_t *)snap->dirty +
+           ((snap->end - snap->start) >> (TARGET_PAGE_BITS + 3));
 }
+
+bool dirty_bitmap_snapshot_hamt_vga_is_dirty(DirtyBitmapSnapshot *snap,
+                                             uint64_t addr, uint64_t size);
+bool dirty_bitmap_snapshot_hamt_vga_is_dirty(DirtyBitmapSnapshot *snap,
+                                             uint64_t addr, uint64_t size)
+{
+    uint64_t first = addr >> TARGET_PAGE_BITS;
+    uint64_t last;
+
+    if (!size) {
+        return false;
+    }
+    if (size - 1 > UINT64_MAX - addr) {
+        return true;
+    }
+    last = (addr + size - 1) >> TARGET_PAGE_BITS;
+    if (first < snap->hamt_vga_start ||
+        last - snap->hamt_vga_start >= snap->hamt_vga_pages) {
+        return true;
+    }
+    return hamt_ptwdata_vga_snapshot_is_dirty(
+        (first - snap->hamt_vga_start) << TARGET_PAGE_BITS,
+        (last - first + 1) << TARGET_PAGE_BITS,
+        dirty_bitmap_snapshot_get_hamt(snap));
+}
+#endif
 
 static void phys_map_node_reserve(PhysPageMap *map, unsigned nodes)
 {
@@ -945,7 +977,7 @@ DirtyBitmapSnapshot *cpu_physical_memory_snapshot_and_clear_dirty
     unsigned long page, end, dest;
 
     snap = g_malloc0(sizeof(*snap) +
-                     ((last - first) >> TARGET_PAGE_BITS) +
+                     ((last - first) >> TARGET_PAGE_BITS) + 1 +
                      ((last - first) >> (TARGET_PAGE_BITS + 3)));
     snap->start = first;
     snap->end   = last;
@@ -979,9 +1011,18 @@ DirtyBitmapSnapshot *cpu_physical_memory_snapshot_and_clear_dirty
         tlb_reset_dirty_range_all(start, length);
 #ifdef CONFIG_LATX_HACK_MEM
         if (client == DIRTY_MEMORY_VGA && !hamt_no_vga_dirty()) {
-            hamt_ptwdata_vga_snapshot(mr->addr + offset, length,
-                    dirty_bitmap_snapshot_get_dirty(snap));
-            hamt_ptwdata_vga_protect(mr->addr + offset, length);
+            uint64_t base = mr->addr + offset;
+            uint64_t first_page = base >> TARGET_PAGE_BITS;
+            uint64_t last_page = length ?
+                ((base + length - 1) >> TARGET_PAGE_BITS) + 1 : first_page;
+
+            snap->hamt_vga_start = first_page;
+            snap->hamt_vga_pages = last_page - first_page;
+            hamt_ptwdata_vga_snapshot(first_page << TARGET_PAGE_BITS,
+                    snap->hamt_vga_pages << TARGET_PAGE_BITS,
+                    dirty_bitmap_snapshot_get_hamt(snap));
+            hamt_ptwdata_vga_protect(first_page << TARGET_PAGE_BITS,
+                    snap->hamt_vga_pages << TARGET_PAGE_BITS);
         }
 #endif
     }
