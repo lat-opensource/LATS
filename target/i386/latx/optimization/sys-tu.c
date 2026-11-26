@@ -378,13 +378,20 @@ TranslationBlock* tb_create(CPUState *cpu, target_ulong pc,
 #ifdef CONFIG_SOFTMMU
     bool reuse_protection = false;
 #ifdef CONFIG_LATX_HACK_MEM
-    /* The earlier CALL member completed the TLB protection scan on this
-     * page. Keep its lock and protected state: new aliases also receive
-     * TLB_NOTDIRTY, so the adjacent return needs no second full scan. */
-    reuse_protection = hras_caller && lock_result == TU_LOCK_ALREADY_HELD &&
-        latx_hack_gpa_in_ram(phys_pc) &&
-        ((tb_page_addr0(hras_caller) ^ phys_pc) & TARGET_PAGE_MASK) == 0 &&
-        tlb_code_page_is_protected(phys_pc);
+    /*
+     * Reuse the entry or HRAS caller's protection scan while this attempt
+     * still holds the same page. New writable aliases acquire TLB_NOTDIRTY
+     * during TLB fill.
+     */
+    if (!is_first_tb && lock_result == TU_LOCK_ALREADY_HELD &&
+        latx_hack_gpa_in_ram(phys_pc)) {
+        TranslationBlock *entry = tu_data->tb_list[0];
+        reuse_protection =
+            (get_page(tb_page_addr0(entry)) == get_page(phys_pc) ||
+             (hras_caller &&
+              get_page(tb_page_addr0(hras_caller)) == get_page(phys_pc))) &&
+            tlb_code_page_is_protected(phys_pc);
+    }
 #endif
     if (!reuse_protection) {
         tlb_protect_code(phys_pc);
