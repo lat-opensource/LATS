@@ -26,7 +26,7 @@
 #define AOT_TU   0x04
 #define AOT_TU_FLAG_BIT 10
 
-#define AOT_FORMAT_VERSION "-format26"
+#define AOT_FORMAT_VERSION "-format27"
 #ifdef CONFIG_LATX_DEBUG
 #define AOT_VERSION "Version: "LATX_VERSION AOT_FORMAT_VERSION"-debug"
 #else

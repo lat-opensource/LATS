@@ -616,6 +616,23 @@ int latxs_ir1_is_string_op(IR1_INST *ir1)
            (0xa4 <= opc && opc <= 0xa7) || /* movs/cmps      */
            (0xaa <= opc && opc <= 0xaf) ;  /* stos/lods/scas */
 }
+static inline bool latxs_ir1_is_port_io(IR1_INST *ir1)
+{
+    switch (ir1_opcode(ir1)) {
+    case X86_INS_IN:
+    case X86_INS_OUT:
+    case X86_INS_INSB:
+    case X86_INS_INSW:
+    case X86_INS_INSD:
+    case X86_INS_OUTSB:
+    case X86_INS_OUTSW:
+    case X86_INS_OUTSD:
+        return true;
+    default:
+        return false;
+    }
+}
+
 /* EOB instructions in system-mode */
 int latxs_ir1_is_eob_in_sys(IR1_INST *ir1);
 int latxs_ir1_is_cross_page(IR1_INST *ir1);
