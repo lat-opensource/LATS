@@ -37,6 +37,9 @@ int gen_latxs_scs_prologue_cfg(
 
     latxs_tr_init(NULL);
     latxs_ras_tp_enter_c();
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_plv0_break();
+    }
 
 //    int ra_reg_num = latxs_ir2_opnd_reg(&latxs_ra_ir2_opnd);
 //    latxs_append_ir2_opnd2i(LISA_ST_D, &latxs_ra_ir2_opnd,
@@ -79,6 +82,7 @@ int gen_latxs_scs_prologue_cfg(
 //            lsenv_offset_of_save_regs(lsenv, ra_reg_num));
 
     if (hamt_enabled()) {
+        latxs_tr_dmw_in_da(&la_a2, &la_a3);
         latxs_tr_dmw_out_fix_asid(NULL);
     }
 
@@ -101,6 +105,9 @@ int gen_latxs_scs_prologue_cfg_nofp(
 
     latxs_tr_init(NULL);
     latxs_ras_tp_enter_c();
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_plv0_break();
+    }
 
 //    int ra_reg_num = latxs_ir2_opnd_reg(&latxs_ra_ir2_opnd);
 //    latxs_append_ir2_opnd2i(LISA_ST_D, &latxs_ra_ir2_opnd,
@@ -133,6 +140,7 @@ int gen_latxs_scs_prologue_cfg_nofp(
 //            lsenv_offset_of_save_regs(lsenv, ra_reg_num));
 
     if (hamt_enabled()) {
+        latxs_tr_dmw_in_da(&la_a2, &la_a3);
         latxs_tr_dmw_out_fix_asid(NULL);
     }
 
@@ -162,6 +170,8 @@ int gen_latxs_scs_epilogue_cfg(
 
     if (hamt_enabled()) {
         latxs_tr_dmw_in_fix_asid(&latxs_arg2_ir2_opnd);
+        latxs_tr_dmw_in_pg(&la_a2, &la_a3);
+        latxs_tr_dmw_in_plv_env(&la_a2, &la_a3, &la_env);
     }
 
 
@@ -220,6 +230,8 @@ int gen_latxs_scs_epilogue_cfg_nofp(
 
     if (hamt_enabled()) {
         latxs_tr_dmw_in_fix_asid(&latxs_arg2_ir2_opnd);
+        latxs_tr_dmw_in_pg(&la_a2, &la_a3);
+        latxs_tr_dmw_in_plv_env(&la_a2, &la_a3, &la_env);
     }
 
 

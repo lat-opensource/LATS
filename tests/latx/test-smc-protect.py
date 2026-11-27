@@ -60,13 +60,15 @@ support = r'''
 #define MMU_DATA_STORE 2
 #define CPU_VTLB_SIZE 4
 #define DIRTY_MEMORY_CODE 1
+#define HAMT_PTWFLAGS_WRITE_MASK 0x7f
+#define HAMT_PROT_DEL_PLV(prot) ((void)(prot))
 #define tlb_debug(...) ((void)0)
 typedef uint64_t ram_addr_t, vaddr, hwaddr;
 typedef struct { bool byte_swap; } MemTxAttrs;
 typedef struct {
     hwaddr phys_addr, xlat_section;
     MemTxAttrs attrs;
-    int prot, lg_page_size;
+    int prot, prot32, lg_page_size;
 } CPUTLBEntryFull;
 typedef struct { uintptr_t addend; uint64_t addr[3]; } CPUTLBEntry;
 typedef struct {
@@ -89,18 +91,21 @@ typedef struct { bool ram, romd; } MemoryRegion;
 typedef struct { MemoryRegion *mr; bool readonly; } MemoryRegionSection;
 static MemoryRegion mr = { .ram = true };
 static MemoryRegionSection section = { .mr = &mr };
-static uint8_t page_state;
+static uint8_t page_state, vga_state;
+static bool enable_vga;
 static bool parallel, clean, inject_protection, stub;
 static unsigned scans, flushes, clears, large_pages;
+static uint64_t scan_addr, flush_addr;
 static int locked;
 static bool latx_hack_gpa_in_ram(uint64_t p) { return p >= 0x100000 && p < 0x80000000; }
-static bool hamt_ptwdata_smc_page_is_protected(uint64_t p) { (void)p; return page_state==2; }
-static uint8_t hamt_ptwdata_get_page(uint64_t p) { (void)p; return page_state; }
+static bool paddr_in_vram(uint64_t p) { return enable_vga && p >= 0x7000000 && p < 0x7001000; }
+static bool hamt_ptwflags_smc_page_is_protected(uint64_t p) { (void)p; return page_state==1; }
+static uint8_t hamt_ptwflags_get_page(uint64_t p) { return paddr_in_vram(p) ? vga_state : page_state; }
 static bool qemu_tcg_mttcg_enabled(void) { return parallel; }
 static uint64_t qemu_ram_addr_to_gpa(uint64_t p) { return p; }
-static void hamt_protect_code(uint64_t p,int full) { (void)p;(void)full; flushes++; }
-static void hamt_ptwdata_smc_protect_page(uint64_t p) { (void)p; if (!stub) page_state=2; }
-static void tlb_reset_dirty_range_all(uint64_t p,uint64_t n) { assert(!(p&4095)&&n==4096);scans++; }
+static void hamt_protect_code(uint64_t p,int full) { flush_addr=p;(void)full; flushes++; }
+static void hamt_ptwflags_smc_protect_page(uint64_t p) { (void)p; if (!stub) page_state=1; }
+static void tlb_reset_dirty_range_all(uint64_t p,uint64_t n) { assert(!(p&4095)&&n==4096);scan_addr=p;scans++; }
 static bool cpu_physical_memory_test_and_clear_dirty(uint64_t p,uint64_t n,int b) { (void)p;(void)n;(void)b;clears++;return true; }
 static bool cpu_physical_memory_is_clean(uint64_t p) { (void)p;return clean; }
 static CPUTLB *env_tlb(CPUArchState *e) { return &e->tlb; }
@@ -119,7 +124,7 @@ static CPUTLBEntry *tlb_entry(CPUArchState *e,int i,vaddr a) { return &e->tlb.ta
 static void qemu_spin_lock(int *p) {
     (void)p; assert(!locked); locked=1;
     /* Model protection completing after a constructor starts, before lock. */
-    if (inject_protection) page_state=2;
+    if (inject_protection) page_state=1;
 }
 static void qemu_spin_unlock(int *p) { (void)p;assert(locked);locked=0; }
 static void tlb_flush_vtlb_page_locked(CPUArchState *e,int i,vaddr a) { (void)e;(void)i;(void)a;assert(locked); }
@@ -163,7 +168,7 @@ int main(void) {
     for (int inject=0;inject<2;inject++)
     for (int writable=0;writable<2;writable++)
     for (int big=0;big<2;big++) {
-        page_state=protect ? 2 : 0;
+        page_state=protect ? 1 : 0;
         inject_protection=inject;
         int prot=PAGE_READ|PAGE_EXEC|(writable ? PAGE_WRITE : 0);
         CPUTLBEntryFull full={.phys_addr=0x200000,.prot=prot,.lg_page_size=big ? 21 : 12};
@@ -174,7 +179,7 @@ int main(void) {
         else assert(!!(write&TLB_NOTDIRTY)==(protect||inject));
         cases++;
     }
-    inject_protection=false; page_state=2;
+    inject_protection=false; page_state=1;
     section.readonly=true;
     CPUTLBEntryFull full={.phys_addr=0x200000,.prot=PAGE_READ|PAGE_WRITE,.lg_page_size=12};
     tlb_set_page_full(&cpu,0,0x400000,&full);
@@ -183,8 +188,11 @@ int main(void) {
     section.readonly=false; page_state=0; clean=true;
     tlb_set_page_full(&cpu,0,0x400000,&full);
     assert(env.tlb.table[0][0].addr[MMU_DATA_STORE]&TLB_NOTDIRTY);
+    clean=false; page_state=0;
+    tlb_protect_code(0x7000000);
+    assert(flush_addr==0x7000000 && scan_addr==0x7000000);
     assert(large_pages);
-    printf("PASS: protection cycles, parallel/stub fallback, %u TLB construction cases, readonly/dirty bitmap\n",cases);
+    printf("PASS: protection cycles, parallel/stub fallback, %u TLB construction cases and readonly/dirty bitmap\n",cases);
 }
 '''
 

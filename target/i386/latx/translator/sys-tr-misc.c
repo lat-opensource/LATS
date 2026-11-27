@@ -2583,6 +2583,10 @@ static bool latxs_do_fast_iret(IR1_INST *pir1, int size)
     la_out3(LISA_ADD_D, &new_eflags, &new_eflags, &latxs_env_ir2_opnd);
     la_out3(LISA_AMAND_W, &old_cpl, &new_eflags, &old_cpl);
 
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_plv_env_break(&tmp0, &latxs_env_ir2_opnd);
+    }
+
     la_out1(LISA_B, &label_end);
 
     latxs_ra_free_temp(&old_cpl);
@@ -4456,6 +4460,10 @@ static bool latxs_translate_opt_syscall(IR1_INST *pir1)
     latxs_ra_free_temp(&flags);
     latxs_ra_free_temp(&limit);
 
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_plv0_break();
+    }
+
     /* env->eip = env->lstar; */
      la_out2i(LISA_LD_D, &tmp, &latxs_env_ir2_opnd,
         lsenv_offset_of_lstar(lsenv));
@@ -4639,6 +4647,10 @@ static bool latxs_translate_opt_sysret(IR1_INST *pir1)
                          DESC_W_MASK | DESC_A_MASK);
     fast_cpu_x86_load_seg_cache(R_SS, &tmp,
                          &la_zero, &limit, &flags);
+
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_plv3_break();
+    }
 
     latxs_append_ir2_opnd1(LISA_B, &label_end);
 

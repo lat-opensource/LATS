@@ -10,6 +10,7 @@
 #include <errno.h>
 #include "hamt-va.h"
 #include "hamt-tlb.h"
+#include "hamt-ptw.h"
 #include "hamt-init.h"
 #include "target/i386/latx/tb-record.h"
 #include "latx-options.h"
@@ -20,18 +21,6 @@
 
 /* Forward declarations for functions without header prototypes */
 void hamt_init(void);
-void hamt_ptwdata_smc_protect_page(uint64_t page);
-void hamt_ptwdata_smc_unprotect_page(uint64_t page);
-uint64_t *hamt_ptwdata_get_page(uint64_t page);
-void hamt_ptwdata_set_page(uint64_t page, uint64_t *p);
-void hamt_ptwdata_set_mmio(uint64_t start, uint64_t size);
-int hamt_ptwdata_smc_range_is_protected(uint64_t start, uint64_t end);
-void hamt_ptwdata_vga_snapshot(uint64_t start, uint64_t count, void *bitmap);
-void hamt_ptwdata_vga_protect(uint64_t start, uint64_t count);
-int hamt_ptwdata_vga_snapshot_is_dirty(uint64_t start, uint64_t count, void *bitmap);
-void *hamt_get_ptwdata(void);
-void *hamt_get_ptwdata1m(void);
-void hamt_realloc_ptwdata(void *opaque);
 int dune_enter(void *cpu, int mode, int cpuid);
 void latxs_init_rr_thread_sigfpe(void);
 void hamt_ras_tp_mirror(int cpuid, uint64_t native_tp);
@@ -78,61 +67,56 @@ void hamt_protect_code(uint64_t guest_phys_page, int full)
 {
 }
 
-int hamt_ptwdata_smc_page_is_protected(uint64_t page)
+bool hamt_ptwflags_smc_page_is_protected(uint64_t page)
+{
+    return false;
+}
+
+void hamt_ptwflags_smc_protect_page(uint64_t page)
+{
+}
+
+void hamt_ptwflags_smc_unprotect_page(uint64_t page)
+{
+}
+
+uint8_t hamt_ptwflags_get_page(uint64_t page)
 {
     return 0;
 }
 
-void hamt_ptwdata_smc_protect_page(uint64_t page)
+void hamt_ptwflags_set_mmio(uint64_t start, uint64_t size)
 {
 }
 
-void hamt_ptwdata_smc_unprotect_page(uint64_t page)
+void hamt_ptwflags_vga_protect(uint64_t start, uint64_t size)
 {
 }
 
-uint64_t *hamt_ptwdata_get_page(uint64_t page)
-{
-    return NULL;
-}
-
-void hamt_ptwdata_set_page(uint64_t page, uint64_t *p)
+void hamt_ptwflags_vga_snapshot(uint64_t start, uint64_t size, uint8_t *dest)
 {
 }
 
-void hamt_ptwdata_set_mmio(uint64_t start, uint64_t size)
+bool hamt_ptwflags_vga_snapshot_is_dirty(uint64_t start, uint64_t size, uint8_t *snap)
+{
+    return false;
+}
+
+void hamt_ptwflags_vga_write_page(uint64_t page)
 {
 }
 
-int hamt_ptwdata_smc_range_is_protected(uint64_t start, uint64_t end)
+bool hamt_ptwflags_smc_range_is_protected(uint64_t start, uint64_t size)
 {
-    return 0;
+    return false;
 }
 
-void hamt_ptwdata_vga_snapshot(uint64_t start, uint64_t count, void *bitmap)
-{
-}
-
-void hamt_ptwdata_vga_protect(uint64_t start, uint64_t count)
-{
-}
-
-int hamt_ptwdata_vga_snapshot_is_dirty(uint64_t start, uint64_t count, void *bitmap)
-{
-    return 0;
-}
-
-void *hamt_get_ptwdata(void)
+void *hamt_get_ptwflags(void)
 {
     return NULL;
 }
 
-void *hamt_get_ptwdata1m(void)
-{
-    return NULL;
-}
-
-void hamt_realloc_ptwdata(void *opaque)
+void hamt_ptwflags_reserve(uint64_t gpa_end)
 {
 }
 

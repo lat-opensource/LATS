@@ -33,6 +33,9 @@ typedef struct {
     int verbose;
 } hamt_excp_t;
 
+#define HAMT_BREAK_CODE_TOPLV0      0x4
+#define HAMT_BREAK_CODE_TOPLV3      0x5
+
 #define HAMT_EXCP_ENTRY_SYSCALL     1
 #define HAMT_EXCP_ENTRY_TLBREFILL   2
 #define HAMT_EXCP_INTERRUPT_IPI     3

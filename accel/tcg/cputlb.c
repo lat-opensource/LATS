@@ -1403,7 +1403,7 @@ bool tlb_code_page_is_protected(ram_addr_t ram_addr)
 {
 #ifdef CONFIG_LATX_HACK_MEM
     return !latx_hack_gpa_in_ram(ram_addr) ||
-           hamt_ptwdata_smc_page_is_protected(ram_addr);
+           hamt_ptwflags_smc_page_is_protected(ram_addr);
 #else
     return true;
 #endif
@@ -1415,9 +1415,9 @@ void tlb_protect_code(ram_addr_t ram_addr)
 {
 #ifdef CONFIG_LATX_HACK_MEM
     if (latx_hack_gpa_in_ram(ram_addr)) {
-        if (!hamt_ptwdata_smc_page_is_protected(ram_addr)) {
+        if (!hamt_ptwflags_smc_page_is_protected(ram_addr)) {
+            hamt_ptwflags_smc_protect_page(ram_addr);
             hamt_protect_code(qemu_ram_addr_to_gpa(ram_addr), 0);
-            hamt_ptwdata_smc_protect_page(ram_addr);
             tlb_reset_dirty_range_all(ram_addr & TARGET_PAGE_MASK,
                                       TARGET_PAGE_SIZE);
         } else if (qemu_tcg_mttcg_enabled() && CPU_NEXT(first_cpu)) {
@@ -1444,7 +1444,7 @@ void tlb_unprotect_code(ram_addr_t ram_addr)
 {
 #ifdef CONFIG_LATX_HACK_MEM
     if (latx_hack_gpa_in_ram(ram_addr)) {
-        hamt_ptwdata_smc_unprotect_page(ram_addr);
+        hamt_ptwflags_smc_unprotect_page(ram_addr);
     } else {
         cpu_physical_memory_set_dirty_flag(ram_addr, DIRTY_MEMORY_CODE);
     }
@@ -1693,6 +1693,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     paddr_page = full->phys_addr & TARGET_PAGE_MASK;
 
     prot = full->prot;
+    HAMT_PROT_DEL_PLV(prot);
     asidx = cpu_asidx_from_attrs(cpu, full->attrs);
     section = address_space_translate_for_iotlb(cpu, asidx, paddr_page,
                                                 &xlat, &sz, full->attrs, &prot);
@@ -1770,7 +1771,7 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
 #ifdef CONFIG_LATX_HACK_MEM
     if (is_ram && (prot & PAGE_WRITE) && !section->readonly &&
         latx_hack_gpa_in_ram(iotlb) &&
-        hamt_ptwdata_smc_page_is_protected(iotlb)) {
+        hamt_ptwflags_smc_page_is_protected(iotlb)) {
         write_flags |= TLB_NOTDIRTY;
     }
 #endif
@@ -1891,7 +1892,7 @@ static void tlb_set_page_full_fast(CPUState *cpu, int mmu_idx,
     qemu_spin_lock(&tlb->c.lock);
 
     /* Read the page state while holding the same lock as protection scans. */
-    if ((prot & PAGE_WRITE) && hamt_ptwdata_get_page(iotlb) != 0) {
+    if ((prot & PAGE_WRITE) && (hamt_ptwflags_get_page(iotlb) & HAMT_PTWFLAGS_WRITE_MASK)) {
         write_flags |= TLB_NOTDIRTY;
     }
 
@@ -1918,6 +1919,7 @@ static void tlb_set_page_full_fast(CPUState *cpu, int mmu_idx,
     full = &desc->fulltlb[index];
     full->attrs = attrs;
     full->prot = prot;
+    full->prot32 = prot;
     full->lg_page_size = ctz64(size);
     full->xlat_section = iotlb - addr_page;
     full->phys_addr = paddr_page;
@@ -1954,7 +1956,8 @@ void tlb_set_page_with_attrs(CPUState *cpu, vaddr addr,
                              int mmu_idx, uint64_t size)
 {
 #ifdef CONFIG_LATX_HACK_MEM
-    if (latx_hack_gpa_in_ram(paddr) && hamt_ptwdata_get_page(paddr) != 1) {
+    if (latx_hack_gpa_in_ram(paddr) &&
+        !(hamt_ptwflags_get_page(paddr) & HAMT_PTWFLAGS_NOACCESS_MASK)) {
         tlb_set_page_full_fast(cpu, mmu_idx, addr, paddr, attrs, prot, size);
         return;
     }
@@ -1964,6 +1967,7 @@ void tlb_set_page_with_attrs(CPUState *cpu, vaddr addr,
         .phys_addr = paddr,
         .attrs = attrs,
         .prot = prot,
+        .prot32 = prot,
         .lg_page_size = ctz64(size)
     };
 
@@ -2275,13 +2279,11 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
 
 #ifdef CONFIG_LATX_HACK_MEM
     if (latx_hack_gpa_in_ram(ram_addr)) {
-        if (hamt_ptwdata_get_page(ram_addr) == 2) {
+        if (hamt_ptwflags_smc_page_is_protected(ram_addr)) {
             tb_invalidate_phys_range_fast(ram_addr, size, retaddr);
         }
-        if (hamt_ptwdata_get_page(ram_addr) == 4) {
-            hamt_ptwdata_set_page(ram_addr, 0);
-        }
-        if (hamt_ptwdata_get_page(ram_addr) == 0) {
+        hamt_ptwflags_vga_write_page(ram_addr);
+        if (!(hamt_ptwflags_get_page(ram_addr) & HAMT_PTWFLAGS_WRITE_MASK)) {
             tlb_set_dirty(cpu, mem_vaddr);
         }
         return;

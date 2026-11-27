@@ -33,10 +33,12 @@
 
 #define DMW_PABITS 48
 #define CSR_DMW1_PLV0 _CONST64_(1 << 0)
+#define CSR_DMW1_PLV_ALL _CONST64_(0xf << 0)
 #define CSR_DMW1_MAT _CONST64_(1 << 4)
 #define CSR_DMW1_VSEG _CONST64_(0x9000)
 #define CSR_DMW1_BASE (CSR_DMW1_VSEG << DMW_PABITS)
 #define CSR_DMW1_INIT (CSR_DMW1_BASE | CSR_DMW1_MAT | CSR_DMW1_PLV0)
+#define CSR_DMW1_INIT_PLV_ALL (CSR_DMW1_BASE | CSR_DMW1_MAT | CSR_DMW1_PLV_ALL)
 
 /* TLB exception allocated KS0 and KS1 statically */
 #define TLB_EXC_KS0 LOONGARCH_CSR_KS0
@@ -95,9 +97,11 @@
     (CSR_TLBELO_V | CSR_TLBELO_WE | CSR_TLBELO_CCA | CSR_TLBELO_GLOBAL)
 
 // ring 0, disable interrupt, mapping
+#define CRMD_DA 3
 #define CRMD_PG 4
 #define CRMD_IE 2
-#define INIT_VALUE_CRMD ((1<<CRMD_PG) | (1<<CRMD_IE) | (1<<5) | (1<<7))
+#define __INIT_VALUE_CRMD    ((1<<CRMD_PG) | (1<<CRMD_IE) | (1<<5) | (1<<7))
+#define __INIT_VALUE_CRMD_DA ((1<<CRMD_DA) | (1<<CRMD_IE) | (1<<5) | (1<<7))
 
 #define INIT_VALUE_EUEN 0xf
 

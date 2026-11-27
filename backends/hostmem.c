@@ -20,7 +20,7 @@
 #include "qom/object_interfaces.h"
 #include "qemu/mmap-alloc.h"
 #include "qemu/madvise.h"
-#include "hamt-hostmem.h"
+#include "hamt-ptw.h"
 #include "latx-hack.h"
 
 #ifdef CONFIG_NUMA
@@ -349,6 +349,10 @@ host_memory_backend_memory_prepare(HostMemoryBackend *backend, Error **errp)
     uint64_t sz;
 
     if (bc->alloc) {
+        if (backend->latx_role == LATX_BACKEND_GUEST_RAM) {
+            hamt_ptwflags_reserve(host_memory_backend_alloc_size(backend));
+        }
+
         bc->alloc(backend, &local_err);
         if (local_err) {
             goto out;
@@ -360,7 +364,6 @@ host_memory_backend_memory_prepare(HostMemoryBackend *backend, Error **errp)
         if (backend->latx_role == LATX_BACKEND_GUEST_RAM &&
             sz > latx_memory_backend_size) {
             latx_memory_backend_size = sz;
-            hamt_realloc_ptwdata(sz);
         }
 
 #if defined(CONFIG_LATX_PRINT)

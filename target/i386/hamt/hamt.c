@@ -970,7 +970,10 @@ static int hamt_fill_hardware_tlb(CPUX86State *env,
     uint64_t paddr = addr + entry->addend;
     CPUTLBEntryFull *full = &env_tlb(env)->d[mmu_idx].fulltlb[index];
     int prot = 0;
+    int plv = 0;
     int is_tlb_notdirty = 0;
+
+    if (hamt_enable_plv()) HAMT_PROT_GET_PLV(full->prot32, plv);
 
     int flags_w = tlb_addr_w & TLB_FLAGS_MASK;
     int flags_r = tlb_addr_r & TLB_FLAGS_MASK;
@@ -992,6 +995,10 @@ static int hamt_fill_hardware_tlb(CPUX86State *env,
            __func__, (void *)addr, (void *)entry->addend, (void *)paddr,
            flags, !!(prot & PROT_READ), !!(prot & PROT_WRITE));
 #endif
+
+    if (hamt_enable_plv()) {
+        HAMT_PROT_ADD_PLV(prot, plv);
+    }
 
     int do_fill_tlb = 1;
     if (!hamt_do_vga() && paddr_in_vram(paddr)) {
@@ -1889,6 +1896,13 @@ static void hamt_tlb_handler_page_fault(CPUX86State *env,
     }
     intbtblookup = DMW_IN(intbtblookup);
     ((uint64_t *)(hamt_data_area[cpuid]))[28] = env->regs[R_ESP];
+    if (hamt_enable_plv()) {
+        uint64_t *frame = (uint64_t *)hamt_data_area[cpuid];
+
+        /* The delivered guest fault can change CPL before ERTN. */
+        frame[PT_PRMD_INDEX] = (frame[PT_PRMD_INDEX] & ~3ULL) |
+                               (env->hflags & HF_CPL_MASK);
+    }
     ((uint64_t *)(hamt_data_area[cpuid]))[PT_ERA_INDEX] = intbtblookup;
     ((uint64_t *)(hamt_data_area[cpuid]))[5] = env->eip;
     latxs_ras_tp_redirect(env, (uint64_t *)hamt_data_area[cpuid]);
@@ -2286,14 +2300,27 @@ void restore_prmd(int cpuid)
 
 void loongarch_ertn(void)
 {
-   __asm__ volatile (
-        "csrwr %0, 0x6\n\t"
+    uint64_t resume;
+
+    if (hamt_dmw_mode_da()) {
+        uint64_t mode = CSR_CRMD_DA;
+
+        /* cpu_loop_exit() returns to C, not to the faulting instruction. */
+        __asm__ volatile (
+            "csrxchg %[mode], %[mask], %[crmd]\n\t"
+            : [mode] "+r" (mode)
+            : [mask] "r" (CSR_CRMD_DA | CSR_CRMD_PG),
+              [crmd] "i" (LOONGARCH_CSR_CRMD)
+            : "memory");
+    }
+    /* Keep the return address local to each emitted ERTN. */
+    __asm__ volatile (
+        "la.local %[resume], 1f\n\t"
+        "csrwr %[resume], 0x6\n\t"
         "ertn\n"
-        : : "r"(&&end)
-        : "memory"
-    );
-end:
-    return;
+        "1:"
+        : [resume] "=r" (resume)
+        : : "memory");
 }
 
 /* Called only after the exception entry has saved the host vector state. */

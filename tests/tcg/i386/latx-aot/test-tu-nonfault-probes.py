@@ -108,7 +108,7 @@ static tb_page_addr_t get_page_addr_code_hostp_noexit(CPUArchState *env,
 static bool aot_host_pc_in_main_ram(void *p) { return p != NULL; }
 #ifdef CONFIG_LATX_HACK_MEM
 static bool latx_hack_gpa_in_ram(uint64_t pp) { return pp < sizeof(ram); }
-static bool hamt_ptwdata_smc_page_is_protected(uint64_t pp)
+static bool hamt_ptwflags_smc_page_is_protected(uint64_t pp)
 {
     return protected_page[pp / 4096];
 }

@@ -19,6 +19,7 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "hamt-options.h"
 #include "exec/exec-all.h"
 #include "tcg/helper-tcg.h"
 #include "tcg/fast-itlb.h"
@@ -296,6 +297,9 @@ do_check_protect:
     paddr = (pte & PG_ADDRESS_MASK & ~(page_size - 1))
           | (addr & (page_size - 1));
 
+    if (hamt_enable_plv()) {
+        HAMT_PROT_ADD_PLV(prot, (ptep & PG_USER_MASK) ? 3 : 0);
+    }
     out->paddr = paddr;
     out->prot = prot;
     out->page_size = page_size;
@@ -715,6 +719,9 @@ do_check_protect_pse36:
         }
     }
 
+    if (hamt_enable_plv()) {
+        HAMT_PROT_ADD_PLV(prot, (ptep & PG_USER_MASK) ? 3 : 0);
+    }
     out->paddr = paddr;
     out->prot = prot;
     out->page_size = page_size;

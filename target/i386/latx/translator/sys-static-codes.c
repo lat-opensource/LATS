@@ -399,10 +399,14 @@ static int gen_latxs_sc_prologue(void *code_ptr)
     latxs_tr_begin(code_ptr);
 
     if (hamt_enabled()) { /* hamt swtich into DMW mode */
+        /* The caller can still be at guest PLV3; CSR operations need PLV0. */
+        latxs_tr_dmw_in_plv0_break();
         latxs_tr_dmw_in_fix_mem(&la_sp);
         latxs_tr_dmw_in_fix_mem(&la_a0);
         latxs_tr_dmw_in_fix_mem(&la_a1);
         latxs_tr_dmw_in_fix_asid_tmp(&la_a1);
+        latxs_tr_dmw_in_pg_tmp();
+        latxs_tr_dmw_in_plv_env_tmp(&la_a1);
     }
 
     /* 1. save DBT's context in stack, so allocate space on the stack */
@@ -571,6 +575,7 @@ static int gen_latxs_sc_epilogue(void *code_ptr)
 
     if (hamt_enabled()) {
         latxs_tr_dmw_in_fix_mem(&la_sp);
+        latxs_tr_dmw_in_plv0_break();
     }
 
     /* 4. restore bt's context */
@@ -588,6 +593,7 @@ static int gen_latxs_sc_epilogue(void *code_ptr)
 
     if (hamt_enabled()) {
         latxs_tr_dmw_out_fix_mem(&la_sp);
+        latxs_tr_dmw_in_da_tmp();
         latxs_tr_dmw_out_fix_asid(NULL);
     }
 

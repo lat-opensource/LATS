@@ -1796,7 +1796,7 @@ static uint64_t aot_find_tu_page_record(CPUState *cpu, vaddr page_pc,
 
 #ifdef CONFIG_SOFTMMU
 #ifdef CONFIG_LATX_HACK_MEM
-        if (!hamt_ptwdata_smc_page_is_protected(phys)) {
+        if (!hamt_ptwflags_smc_page_is_protected(phys)) {
             tlb_protect_code(phys);
         }
 #else
@@ -2669,7 +2669,7 @@ TranslationBlock *load_aot_tb(CPUState *cpu, vaddr pc, uint64_t cs_base,
 
 #ifdef CONFIG_SOFTMMU
 #ifdef CONFIG_LATX_HACK_MEM
-    if (!hamt_ptwdata_smc_page_is_protected(phys_pc)) {
+    if (!hamt_ptwflags_smc_page_is_protected(phys_pc)) {
         tlb_protect_code(phys_pc);
     }
 #else

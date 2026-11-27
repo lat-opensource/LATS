@@ -15,6 +15,7 @@ if host_arch == 'loongarch64'
     'hamt.c',
     'hamt-init.c',
     'hamt-ptw.c',
+    'hamt-ptw-flags.c',
     'hamt-tlb.c',
     'hamt-error.c',
     'hamt-interrupt.c',

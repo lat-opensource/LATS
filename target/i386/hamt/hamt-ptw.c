@@ -14,12 +14,12 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#include <pthread.h>
 #include <malloc.h>
 
 #include "qemu/osdep.h"
 #include "qemu/compiler.h"
 #include "qemu/host-utils.h"
+#include "qemu/processor.h"
 #include "qemu/typedefs.h"
 #include "exec/cpu-defs.h"
 #include "cpu.h"
@@ -38,7 +38,6 @@
 
 #include "hamt-ptw.h"
 #include "hamt-ptw-internal.h"
-#include "hamt-hostmem.h"
 
 #include "loongarch-csr.h"
 
@@ -47,212 +46,6 @@
 #include "latx-options.h"
 #include "latx-hack.h"
 #include "latx/include/error.h"
-
-#define _KB_    ((uint64_t)(1) << 10)
-#define _MB_    ((uint64_t)(1) << 20)
-#define _GB_    ((uint64_t)(1) << 30)
-#define _TB_    ((uint64_t)(1) << 40)
-
-#define HAMT_PTWDATA_SIZE   (((9)*(_GB_)) >> 12)
-#define HAMT_PTWDATA1M_SIZE (((9)*(_GB_)) >> 20)
-#define HAMT_PTWRCD_SIZE    (((9)*(_GB_)) >> 12)
-
-uint8_t *ptwdata;
-uint16_t *ptwdata1m;
-uint64_t ptwdata_size;
-uint64_t ptwdata1m_size;
-
-static void *hamt_new_ptwdata(uint64_t size)
-{
-    uint8_t *data = (void *)mmap(0, size,
-                                 PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANONYMOUS,
-                                 -1, 0);
-    lsassert(HAMT_HOLE_ASSERT(data));
-    memset(data, 0, size);
-    if (data == MAP_FAILED) {
-        printf("%s fail\n", __func__);
-        exit(-1);
-    }
-
-    ptwdata_size = size;
-    return data;
-}
-
-static void *hamt_new_ptwdata1m(uint64_t size)
-{
-    size *= sizeof(*ptwdata1m);
-    uint16_t *data = (void *)mmap(0, size,
-                                 PROT_READ | PROT_WRITE,
-                                 MAP_PRIVATE | MAP_ANONYMOUS,
-                                 -1, 0);
-    lsassert(HAMT_HOLE_ASSERT(data));
-    memset(data, 0, size);
-    if (data == MAP_FAILED) {
-        printf("%s fail\n", __func__);
-        exit(-1);
-    }
-
-    ptwdata1m_size = size;
-    return data;
-}
-
-static void __attribute__((__constructor__)) hamt_ptwdata_init(void)
-{
-    ptwdata = hamt_new_ptwdata(HAMT_PTWDATA_SIZE);
-    ptwdata1m = hamt_new_ptwdata1m(HAMT_PTWDATA1M_SIZE);
-}
-
-void hamt_realloc_ptwdata(uint64_t size)
-{
-    if ((size >> 12) < ptwdata_size) {
-#ifdef CONFIG_LATX_PRINT
-        printf("%s:%d required size 0x%lx < curr size 0x%lx\n",
-                __func__, __LINE__,
-                size, ptwdata_size << 12);
-#endif
-        return;
-    }
-
-#ifdef CONFIG_LATX_PRINT
-    printf("%s:%d size 0x%lx\n", __func__, __LINE__, size);
-#endif
-
-    if (ptwdata) munmap(ptwdata, ptwdata_size);
-    if (ptwdata1m) munmap(ptwdata1m, ptwdata1m_size);
-
-    ptwdata = hamt_new_ptwdata(size >> 12);
-    ptwdata1m = hamt_new_ptwdata1m(size >> 20);
-}
-
-void *hamt_get_ptwdata(void)
-{
-    return ptwdata;
-}
-void *hamt_get_ptwdata1m(void)
-{
-    return ptwdata1m;
-}
-
-void hamt_ptwdata_set_mmio(uint64_t base, uint64_t size)
-{
-    size += TARGET_PAGE_SIZE - 1;
-    memset(ptwdata + (base >> 12), 1, (size >> 12));
-}
-
-void hamt_ptwdata_smc_protect(uint64_t base, uint64_t size)
-{
-    size += TARGET_PAGE_SIZE - 1;
-    memset(ptwdata + (base >> 12), 1, (size >> 12));
-}
-void hamt_ptwdata_smc_unprotect(uint64_t base, uint64_t size)
-{
-    size += TARGET_PAGE_SIZE - 1;
-    memset(ptwdata + (base >> 12), 0, (size >> 12));
-}
-
-void hamt_ptwdata_vga_protect(uint64_t base, uint64_t size)
-{
-    g_assert(!hamt_no_vga_dirty());
-    size += TARGET_PAGE_SIZE - 1;
-    memset(ptwdata + (base >> 12), 4, (size >> 12));
-}
-void hamt_ptwdata_vga_unprotect(uint64_t base, uint64_t size)
-{
-    g_assert(!hamt_no_vga_dirty());
-    size += TARGET_PAGE_SIZE - 1;
-    memset(ptwdata + (base >> 12), 0, (size >> 12));
-}
-
-void hamt_ptwdata_smc_protect_page(uint64_t page)
-{
-    int old = qatomic_cmpxchg__nocheck(&(ptwdata[(page >> 12)]), 0, 2);
-    if (old == 0) {
-        lsassertm(ptwdata1m[(page >> 20)] < 256,
-                "ERROR ptwdata1m %d page %lx",
-                ptwdata1m[(page >> 20)], page);
-        qatomic_inc(&(ptwdata1m[(page >> 20)]));
-    } else {
-        lsassertm(old == 2, "ERROR ptwdata %d page %lx",
-                ptwdata[(page >> 12)], page);
-    }
-}
-void hamt_ptwdata_smc_unprotect_page(uint64_t page)
-{
-    int old = qatomic_cmpxchg__nocheck(&(ptwdata[(page >> 12)]), 2, 0);
-    if (old == 2) {
-        lsassertm(ptwdata1m[(page >> 20)] > 0,
-                "ERROR ptwdata1m %d page %lx",
-                ptwdata1m[(page >> 20)], page);
-        qatomic_dec(&(ptwdata1m[(page >> 20)]));
-    } else {
-        lsassertm(old == 0, "ERROR ptwdata %d page %lx",
-                ptwdata[(page >> 12)], page);
-    }
-}
-uint8_t hamt_ptwdata_get_page(uint64_t page)
-{
-    return ptwdata[(page >> 12)];
-}
-void hamt_ptwdata_set_page(uint64_t page, uint8_t v)
-{
-    ptwdata[(page >> 12)] = v;
-}
-
-bool hamt_ptwdata_smc_page_is_protected(uint64_t page)
-{
-    return ptwdata[(page >> 12)] == 2;
-}
-
-bool hamt_ptwdata_smc_range_is_protected(uint64_t base, uint64_t size)
-{
-    uint64_t start = base >> TARGET_PAGE_BITS;
-    uint64_t end = TARGET_PAGE_ALIGN(base + size) >> TARGET_PAGE_BITS;
-    bool protected = false;
-    while(start < end) {
-        protected |= (ptwdata[start] == 2);
-        if (protected)
-            return protected;
-        start ++;
-    }
-    return protected;
-}
-
-bool hamt_ptwdata_vga_range_is_protected(uint64_t base, uint64_t size)
-{
-    g_assert(!hamt_no_vga_dirty());
-    uint64_t start = base >> TARGET_PAGE_BITS;
-    uint64_t end = TARGET_PAGE_ALIGN(base + size) >> TARGET_PAGE_BITS;
-    bool protected = false;
-    while(start < end) {
-        protected |= (ptwdata[start] == 4);
-        if (protected)
-            return protected;
-        start ++;
-    }
-    return protected;
-}
-
-void hamt_ptwdata_vga_snapshot(uint64_t base, uint64_t size, uint8_t *dest)
-{
-    g_assert(!hamt_no_vga_dirty());
-    size += TARGET_PAGE_SIZE - 1;
-    memcpy(dest, &ptwdata[base>>12], size>>12);
-}
-
-bool hamt_ptwdata_vga_snapshot_is_dirty(uint64_t base, uint64_t size,
-        uint8_t *snap)
-{
-    g_assert(!hamt_no_vga_dirty());
-    uint64_t start = base >> 12;
-    uint64_t end = TARGET_PAGE_ALIGN(base + size) >> 12;
-    while(start < end) {
-        /* =0 means this page is dirty and should be update */
-        if (snap[start] == 0) return true;
-        start ++;
-    }
-    return false;
-}
 
 #ifdef CONFIG_LATX_PRINT
 static __thread uint64_t ptw_num;
@@ -516,8 +309,15 @@ do_check_protect:
     rsvd_mask |= (page_size - 1) & PG_ADDRESS_MASK & ~PG_PSE_PAT_MASK;
     if (pte & rsvd_mask) goto do_fault_rsvd;
 
-    /* can the page can be put in the TLB?  prot will tell us */
-    if (is_user && !(ptep & PG_USER_MASK)) goto do_fault_protect;
+    /* Guest page permissions are independent of the host PLV encoding. */
+    if (is_user && !(ptep & PG_USER_MASK)) {
+        goto do_fault_protect;
+    }
+
+    int plv = 0;
+    if (hamt_enable_plv()) {
+        plv = (ptep & PG_USER_MASK) ? 3 : 0;
+    }
 
     int prot = PAGE_READ;
     if ((ptep & PG_RW_MASK)) prot |= PAGE_WRITE;
@@ -543,9 +343,10 @@ do_check_protect:
     paddr = (pte & PG_ADDRESS_MASK & ~(page_size - 1)) | (addr & (page_size - 1));
     haddr = paddr + rambase;
 
-    uint8_t *ptwdata = hamt_get_ptwdata();
-    assert(ptwdata == env->ptw4k);
-    if (ptwdata[paddr >> 12] == 1) {
+    uint8_t reasons;
+    uint8_t ptwflags = hamt_ptwflags_get_page_state(paddr, &reasons);
+
+    if (ptwflags & HAMT_PTWFLAGS_NOACCESS_MASK) {
 #ifdef CONFIG_LATX_PRINT
         ptw_xx_mmio_num += 1;
 #endif
@@ -554,34 +355,42 @@ do_check_protect:
         goto returnfalse;
     }
 
-    if (ptwdata[paddr >> 12] == 2) {
+    if (ptwflags & HAMT_PTWFLAGS_NOWRITE) {
+        ptwerror->error = HAMT_PTW_ERROR_NOWRITE;
+        if (reasons & PTW_REASON_VGA) {
+            ptwerror->error = HAMT_PTW_ERROR_VGA;
+        }
+        if (reasons & PTW_REASON_SMC) {
+            ptwerror->error = HAMT_PTW_ERROR_SMC;
+        }
 #ifdef CONFIG_LATX_PRINT
-        ptw_xx_smc_num += 1;
-        TranslationBlock *tb = tcg_tb_lookup((uintptr_t)epc);
-        if (tb) {
-            uint64_t pc_phys_page = tb_page_addr0(tb);
-            if ((pc_phys_page >> 12) == (paddr >> 12)) {
-                if (access_type == MMU_DATA_LOAD)  ptw_xx_smc_r_sp_num += 1;
-                if (access_type == MMU_DATA_STORE) ptw_xx_smc_w_sp_num += 1;
-            } else {
-                if (access_type == MMU_DATA_LOAD)  ptw_xx_smc_r_dp_num += 1;
-                if (access_type == MMU_DATA_STORE) ptw_xx_smc_w_dp_num += 1;
+        if (ptwerror->error == HAMT_PTW_ERROR_VGA) {
+            ptw_xx_vga_ram_num += 1;
+            if (is_big_page) {
+                ptw_xx_vga_ram_big_page_num += 1;
+            }
+        } else if (ptwerror->error == HAMT_PTW_ERROR_SMC) {
+            ptw_xx_smc_num += 1;
+            TranslationBlock *tb = tcg_tb_lookup((uintptr_t)epc);
+            if (tb) {
+                uint64_t pc_phys_page = tb_page_addr0(tb);
+                if ((pc_phys_page >> 12) == (paddr >> 12)) {
+                    if (access_type == MMU_DATA_LOAD)  ptw_xx_smc_r_sp_num += 1;
+                    if (access_type == MMU_DATA_STORE) ptw_xx_smc_w_sp_num += 1;
+                } else {
+                    if (access_type == MMU_DATA_LOAD)  ptw_xx_smc_r_dp_num += 1;
+                    if (access_type == MMU_DATA_STORE) ptw_xx_smc_w_dp_num += 1;
+                }
             }
         }
 #endif
-        ptwerror->error = HAMT_PTW_ERROR_SMC;
         goto returnfalse;
     }
 
-    /* dirty memory vga */
-    if (!hamt_no_vga_dirty() && ptwdata[paddr >> 12] == 4) {
-#ifdef CONFIG_LATX_PRINT
-        ptw_xx_vga_ram_num += 1;
-        if (is_big_page) {
-            ptw_xx_vga_ram_big_page_num += 1;
-        }
-#endif
-        ptwerror->error = HAMT_PTW_ERROR_VGA;
+    if (page_size > TARGET_PAGE_SIZE &&
+        hamt_ptwflags_large_page_blocked(paddr, page_size)) {
+        ptwerror->error = HAMT_PTW_ERROR_MMIO;
+        ptwerror->paddr = paddr;
         goto returnfalse;
     }
 
@@ -602,6 +411,7 @@ do_check_protect:
 #endif
 
     ptwerror->error = HAMT_PTW_ERROR_NONE;
+    if (hamt_enable_plv()) HAMT_PROT_ADD_PLV(prot, plv);
     if (!option_pcid_asid && page_size > TARGET_PAGE_SIZE) {
         env->hamt_large_page_bits |= page_size == (1U << HAMT_LARGE_PAGE_SHIFT)
                                      ? hamt_large_page_bit(addr) : UINT32_MAX;

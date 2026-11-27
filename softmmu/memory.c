@@ -769,8 +769,8 @@ static FlatView *generate_memory_topology(MemoryRegion *mr,
             section_from_flat_range(&view->ranges[i], view);
 #ifdef CONFIG_LATX_HACK_MEM
         if (update && !(mrs.mr->ram)) {
-            hamt_ptwdata_set_mmio((uint64_t)mrs.offset_within_address_space,
-                                  (uint64_t)mrs.size);
+            hamt_ptwflags_set_mmio((uint64_t)mrs.offset_within_address_space,
+                                   (uint64_t)mrs.size);
         }
 #endif
         flatview_add_to_dispatch(view, &mrs);

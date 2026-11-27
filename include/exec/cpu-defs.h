@@ -121,6 +121,9 @@ typedef struct CPUTLBEntryFull {
     /* @prot contains the complete protections for the page. */
     uint8_t prot;
 
+    /* Original target protection bits before address-space translation. */
+    int prot32;
+
     /* @lg_page_size contains the log2 of the page size. */
     uint8_t lg_page_size;
 

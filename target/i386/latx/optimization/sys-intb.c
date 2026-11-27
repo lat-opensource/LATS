@@ -138,6 +138,9 @@ static int gen_latxs_intb_lookup_impl(void *code_ptr, bool compact, bool resume)
         if (!compact && hamt_enabled()) {
             latxs_tr_dmw_in_fix_mem(&tmp);
         }
+        if (hamt_enabled()) {
+            latxs_tr_dmw_in_plv_env_break(&tmp0, env);
+        }
         latxs_append_ir2_opnd2i(LISA_JIRL, zero,
                 compact ? ret0 : &tmp, 0);
 
@@ -190,6 +193,7 @@ static int gen_latxs_intb_lookup_impl(void *code_ptr, bool compact, bool resume)
     /* return tb.tc.ptr or cs_native_to_bt */
     if (hamt_enabled()) {
         latxs_tr_dmw_in_fix_mem(ret0);
+        latxs_tr_dmw_in_plv_env_break(&tmp0, env);
     }
     latxs_append_ir2_opnd2i(LISA_JIRL, zero, ret0, 0);
 #endif

@@ -207,7 +207,7 @@ bool dirty_bitmap_snapshot_hamt_vga_is_dirty(DirtyBitmapSnapshot *snap,
         last - snap->hamt_vga_start >= snap->hamt_vga_pages) {
         return true;
     }
-    return hamt_ptwdata_vga_snapshot_is_dirty(
+    return hamt_ptwflags_vga_snapshot_is_dirty(
         (first - snap->hamt_vga_start) << TARGET_PAGE_BITS,
         (last - first + 1) << TARGET_PAGE_BITS,
         dirty_bitmap_snapshot_get_hamt(snap));
@@ -1018,10 +1018,10 @@ DirtyBitmapSnapshot *cpu_physical_memory_snapshot_and_clear_dirty
 
             snap->hamt_vga_start = first_page;
             snap->hamt_vga_pages = last_page - first_page;
-            hamt_ptwdata_vga_snapshot(first_page << TARGET_PAGE_BITS,
+            hamt_ptwflags_vga_snapshot(first_page << TARGET_PAGE_BITS,
                     snap->hamt_vga_pages << TARGET_PAGE_BITS,
                     dirty_bitmap_snapshot_get_hamt(snap));
-            hamt_ptwdata_vga_protect(first_page << TARGET_PAGE_BITS,
+            hamt_ptwflags_vga_protect(first_page << TARGET_PAGE_BITS,
                     snap->hamt_vga_pages << TARGET_PAGE_BITS);
         }
 #endif
@@ -2837,7 +2837,7 @@ static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
 
 #ifdef CONFIG_LATX_HACK_MEM
     if (latx_hack_gpa_in_ram(addr)) {
-        if (hamt_ptwdata_smc_range_is_protected(addr, length)) {
+        if (hamt_ptwflags_smc_range_is_protected(addr, length)) {
             tb_invalidate_phys_range(addr, addr + length - 1);
         }
         return;

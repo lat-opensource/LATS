@@ -24,6 +24,7 @@
 #include "loongarch-extcontext.h"
 #include "hamt-data.h"
 #include "hamt-internal.h"
+#include "hamt-ptw.h"
 #include "hamt-tlb.h"
 #include "hamt-options.h"
 #include "hamt-entry-func.h"
@@ -200,6 +201,11 @@ hamt_ipi_sync_done:
     la_outa(LISA_DUP, 0x06483800); /* ertn */
 }
 
+static void record_hamt_tlbr_user_masks(IR2_OPND *user0,
+                                        IR2_OPND *user1, IR2_OPND *tmp);
+static void set_hamt_tlbr_plv(IR2_OPND *elo0, IR2_OPND *elo1,
+                              IR2_OPND *tmp0, IR2_OPND *tmp1);
+
 static void __latxs_gen_hamt_excp_tlbrefill_dbt(void)
 {
     la_out2(LISA_CSRRD, &la_t0, &la_csr_tlbr_ehi);
@@ -218,13 +224,14 @@ static void __latxs_gen_hamt_excp_tlbrefill_dbt(void)
     /*csrwr   \tmp,  LOONGARCH_CSR_TLBRELO0*/
     la_out2(LISA_CSRRD, &la_t1, &la_csr_ks6);
     la_out3(LISA_ADD_D, &la_t1, &la_t1, &la_t0);
-    la_out2(LISA_CSRWR, &la_csr_tlbr_elo0, &la_t1);
     /*csrrd   \tmp,  LOONGARCH_CSR_KS7*/
     /*add.d   \tmp,  \tmp, \ehi*/
     /*csrwr   \tmp,  LOONGARCH_CSR_TLBRELO1*/
-    la_out2(LISA_CSRRD, &la_t1, &la_csr_ks7);
-    la_out3(LISA_ADD_D, &la_t1, &la_t1, &la_t0);
-    la_out2(LISA_CSRWR, &la_csr_tlbr_elo1, &la_t1);
+    la_out2(LISA_CSRRD, &la_t2, &la_csr_ks7);
+    la_out3(LISA_ADD_D, &la_t2, &la_t2, &la_t0);
+    /* DBT refill is a LATX address-space path, not a DA/PG guest mapping. */
+    la_out2(LISA_CSRWR, &la_csr_tlbr_elo0, &la_t1);
+    la_out2(LISA_CSRWR, &la_csr_tlbr_elo1, &la_t2);
     /*tlbfill*/
     /*0000 0110 0100 1000 0011 0100 0000 0000*/
     la_outa(LISA_DUP, 0x06483400); /* tlbfill */
@@ -232,6 +239,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_dbt(void)
 
 static void __latxs_gen_hamt_excp_tlbrefill_hamt_zero(void)
 {
+    /* The invalid entry has V=0; its PLV field is not observable. */
     la_out2(LISA_CSRRD, &la_t0, &la_csr_tlbr_ehi);
     /*srli.d  \tmp,  \tmp, 0x6*/
     /*slli.d  \tmp,  \tmp, 0x6*/
@@ -329,6 +337,43 @@ static void record_hamt_large_page(bool page_1g)
         la_out3(LISA_OR, &la_t4, &la_t4, &la_t1);
     }
     la_out2i(LISA_ST_W, &la_t4, &la_env, offset);
+}
+
+static void record_hamt_tlbr_user_masks(IR2_OPND *user0,
+                                        IR2_OPND *user1, IR2_OPND *tmp)
+{
+    if (!hamt_enable_plv()) {
+        return;
+    }
+
+    QEMU_BUILD_BUG_ON(offsetof(CPUX86State, hamt_tlbr_user_mask[1]) > 2047);
+    la_out2i(LISA_ANDI, tmp, user0, PG_USER_MASK);
+    la_out2i(LISA_ST_W, tmp, &la_env,
+             offsetof(CPUX86State, hamt_tlbr_user_mask[0]));
+    la_out2i(LISA_ANDI, tmp, user1, PG_USER_MASK);
+    la_out2i(LISA_ST_W, tmp, &la_env,
+             offsetof(CPUX86State, hamt_tlbr_user_mask[1]));
+}
+
+
+static void set_hamt_tlbr_plv(IR2_OPND *elo0, IR2_OPND *elo1,
+        IR2_OPND *tmp0, IR2_OPND *tmp1)
+{
+    if (!hamt_enable_plv()) {
+        return;
+    }
+
+    la_out2i(LISA_LD_WU, tmp0, &la_env,
+             offsetof(CPUX86State, hamt_tlbr_user_mask[0]));
+    la_out2i(LISA_ORI, tmp1, &la_zero, 0x3 << 2);
+    la_out3(LISA_MASKEQZ, tmp1, tmp1, tmp0);
+    la_out3(LISA_OR, elo0, elo0, tmp1);
+
+    la_out2i(LISA_LD_WU, tmp0, &la_env,
+             offsetof(CPUX86State, hamt_tlbr_user_mask[1]));
+    la_out2i(LISA_ORI, tmp1, &la_zero, 0x3 << 2);
+    la_out3(LISA_MASKEQZ, tmp1, tmp1, tmp0);
+    la_out3(LISA_OR, elo1, elo1, tmp1);
 }
 
 static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
@@ -498,6 +543,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
         la_out3 (LISA_ADD_D,  &la_t4, &la_t4, &la_t1); // CPL3 && USER0
     }
     la_out2 (LISA_BEQZ, &la_t4, &ptw_no);
+    record_hamt_tlbr_user_masks(&la_t6, &la_t6, &la_t4);
     la_out2i(LISA_ANDI, &la_t6, &la_t6, PG_RW_MASK);
 
     gen_hamt_leaf_accessed(&accessed);
@@ -602,18 +648,21 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
      */
 
     IR2_OPND big_page_do_4k = la_new_label();
-    /* check ptwdata1m[paddr>>20] */
-    la_out2i(LISA_SRLI_D, &la_t4, &la_t1, 19); // (paddr0 >> 20) * 2
-    la_out2i(LISA_SRLI_D, &la_t6, &la_t2, 19); // (paddr1 >> 20) * 2
+    /* ptwflags is one byte per 4K GPA. The NO2M bit lives on the
+     * first 4K page of each 1M group, matching the two ELO entries. */
+    la_out2i(LISA_SRLI_D, &la_t4, &la_t1, 12);
+    la_out2i(LISA_SRLI_D, &la_t6, &la_t2, 12);
     la_out3 (LISA_ADD_D,  &la_t1, &la_t1, &la_t7);
     la_out3 (LISA_ADD_D,  &la_t2, &la_t2, &la_t7);
-    la_out2i(LISA_LD_D,   &la_a3, &la_env, offsetof(CPUX86State, ptw1m));
-    la_out3 (LISA_LDX_HU, &la_t4, &la_a3, &la_t4); // ptwdata1m[paddr0>>20]
-    la_out3 (LISA_LDX_HU, &la_t6, &la_a3, &la_t6); // ptwdata1m[paddr1>>20]
-    la_out3 (LISA_OR,   &la_a3, &la_t4, &la_t6);
-    la_out2 (LISA_BNEZ, &la_a3, &big_page_do_4k);
-    la_out3(LISA_MASKNEZ, &la_a0, &la_a0, &la_t4); // if (smc) D=0
-    la_out3(LISA_MASKNEZ, &la_a1, &la_a1, &la_t6); // if (smc) D=0
+    la_out2i(LISA_LD_D,   &la_a3, &la_env, offsetof(CPUX86State, ptwflags));
+    la_out3 (LISA_LDX_B,  &la_t4, &la_a3, &la_t4);
+    la_out3 (LISA_LDX_B,  &la_t6, &la_a3, &la_t6);
+    la_out2i(LISA_ANDI,   &la_t4, &la_t4, HAMT_PTWFLAGS_NO2M);
+    la_out2i(LISA_ANDI,   &la_t6, &la_t6, HAMT_PTWFLAGS_NO2M);
+    la_out3 (LISA_OR,     &la_a3, &la_t4, &la_t6);
+    la_out2 (LISA_BNEZ,   &la_a3, &big_page_do_4k);
+    la_out3(LISA_MASKNEZ, &la_a0, &la_a0, &la_t4);
+    la_out3(LISA_MASKNEZ, &la_a1, &la_a1, &la_t6);
 
     /*
      * la_t0 : vaddr
@@ -627,6 +676,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
     la_out2i(LISA_ORI, &la_t2, &la_t2, 0x11); // MAT(5:4)=1 V(0) = 1 for elo1
     la_out3 (LISA_OR,  &la_t1, &la_t1, &la_a0); // D(1) = 1 for elo0
     la_out3 (LISA_OR,  &la_t2, &la_t2, &la_a1); // D(1) = 1 for elo1
+    set_hamt_tlbr_plv(&la_t1, &la_t2, &la_t4, &la_t6);
 
     la_out2i(LISA_SRLI_D, &la_t0, &la_t0, 21);
     la_out2i(LISA_SLLI_D, &la_t0, &la_t0, 21);
@@ -684,16 +734,22 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
      * la_a0 : D(1) for elo0 after RW
      * la_a1 : D(1) for elo1 after RW
      */
-    /* check ptwdata[paddr>>12] */
+    /* check ptwflags[paddr>>12] */
     la_out2i(LISA_SRLI_D, &la_t4, &la_t1, 12); // paddr0 >> 12
     la_out2i(LISA_SRLI_D, &la_t6, &la_t2, 12); // paddr1 >> 12
     la_out3 (LISA_ADD_D,  &la_t1, &la_t1, &la_t7);
     la_out3 (LISA_ADD_D,  &la_t2, &la_t2, &la_t7);
-    la_out2i(LISA_LD_D,   &la_a3, &la_env, offsetof(CPUX86State, ptw4k));
-    la_out3 (LISA_LDX_B,  &la_t4, &la_a3, &la_t4); // ptwdata[paddr0>>12]
-    la_out3 (LISA_LDX_B,  &la_t6, &la_a3, &la_t6); // ptwdata[paddr1>>12]
-    la_out3(LISA_MASKNEZ, &la_a0, &la_a0, &la_t4); // if (smc) D=0
-    la_out3(LISA_MASKNEZ, &la_a1, &la_a1, &la_t6); // if (smc) D=0
+    la_out2i(LISA_LD_D,   &la_a3, &la_env, offsetof(CPUX86State, ptwflags));
+    la_out3 (LISA_LDX_B,  &la_t4, &la_a3, &la_t4);
+    la_out3 (LISA_LDX_B,  &la_t6, &la_a3, &la_t6);
+    la_out2i(LISA_ANDI,   &la_t3, &la_t4, HAMT_PTWFLAGS_NOACCESS_MASK);
+    la_out2i(LISA_ANDI,   &la_t5, &la_t6, HAMT_PTWFLAGS_NOACCESS_MASK);
+    la_out3 (LISA_OR,     &la_t3, &la_t3, &la_t5);
+    la_out2 (LISA_BNEZ,   &la_t3, &ptw_no);
+    la_out2i(LISA_ANDI,   &la_t4, &la_t4, HAMT_PTWFLAGS_WRITE_MASK);
+    la_out2i(LISA_ANDI,   &la_t6, &la_t6, HAMT_PTWFLAGS_WRITE_MASK);
+    la_out3(LISA_MASKNEZ, &la_a0, &la_a0, &la_t4); // if (NOWRITE) D=0
+    la_out3(LISA_MASKNEZ, &la_a1, &la_a1, &la_t6); // if (NOWRITE) D=0
 
     /*
      * la_t0 : vaddr
@@ -707,6 +763,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
     la_out2i(LISA_ORI, &la_t2, &la_t2, 0x11); // MAT(5:4)=1 V(0) = 1 for elo1
     la_out3 (LISA_OR,  &la_t1, &la_t1, &la_a0); // D(1) = 1 for elo0
     la_out3 (LISA_OR,  &la_t2, &la_t2, &la_a1); // D(1) = 1 for elo1
+    set_hamt_tlbr_plv(&la_t1, &la_t2, &la_t3, &la_t4);
     la_out2i(LISA_SRLI_D, &la_t0, &la_t0, 13);
     la_out2i(LISA_SLLI_D, &la_t0, &la_t0, 13);
     la_out2i(LISA_ORI,    &la_t0, &la_t0, 0xc); // PS 4K
@@ -810,6 +867,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
     la_out3(LISA_MASKEQZ, &la_a3, &la_a3, &la_t5);
     la_out3(LISA_OR,   &la_t4, &la_a2, &la_a3);
     la_out2(LISA_BEQZ, &la_t4, &ptw_no);
+    record_hamt_tlbr_user_masks(&la_a0, &la_a1, &la_t3);
     la_out2i(LISA_ANDI, &la_a0, &la_a0, PG_RW_MASK);
     la_out2i(LISA_ANDI, &la_a1, &la_a1, PG_RW_MASK);
     /*
@@ -941,17 +999,23 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
     la_out2i(LISA_SRLI_D, &la_t5, &la_t2, 12);     // paddr1 >> 12
     la_out3 (LISA_ADD_D,  &la_t1, &la_t1, &la_t7);
     la_out3 (LISA_ADD_D,  &la_t2, &la_t2, &la_t7);
-    la_out2i(LISA_LD_D,   &la_t3, &la_env, offsetof(CPUX86State, ptw4k));
+    la_out2i(LISA_LD_D,   &la_t3, &la_env, offsetof(CPUX86State, ptwflags));
     la_out3 (LISA_MASKEQZ, &la_t4, &la_t4, &la_a2);
     la_out3 (LISA_MASKEQZ, &la_t5, &la_t5, &la_a3);
-    la_out3 (LISA_LDX_B,  &la_t4, &la_t3, &la_t4); // ptwdata[paddr0]
-    la_out3 (LISA_LDX_B,  &la_t5, &la_t3, &la_t5); // ptwdata[paddr1]
+    la_out3 (LISA_LDX_B,  &la_t4, &la_t3, &la_t4);
+    la_out3 (LISA_LDX_B,  &la_t5, &la_t3, &la_t5);
+    la_out2i(LISA_ANDI,   &la_a4, &la_t4, HAMT_PTWFLAGS_NOACCESS_MASK);
+    la_out2i(LISA_ANDI,   &la_a5, &la_t5, HAMT_PTWFLAGS_NOACCESS_MASK);
+    la_out2i(LISA_ANDI,   &la_t4, &la_t4, HAMT_PTWFLAGS_WRITE_MASK);
+    la_out2i(LISA_ANDI,   &la_t5, &la_t5, HAMT_PTWFLAGS_WRITE_MASK);
     /*
      * la_t0 : vaddr
      * la_t1 : haddr 4K page for elo0
      * la_t2 : haddr 4K page for elo1
-     * la_t4 : ptwdata[paddr0>>12] for elo0
-     * la_t5 : ptwdata[paddr1>>12] for elo1
+     * la_t4 : NOWRITE bits for elo0
+     * la_t5 : NOWRITE bits for elo1
+     * la_a4 : NOACCESS bits for elo0
+     * la_a5 : NOACCESS bits for elo1
      * la_a0 : RW for elo0
      * la_a1 : RW for elo1
      * la_a2 : valid for elo0
@@ -961,24 +1025,22 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
     la_out2i(LISA_ORI, &la_t7, &la_zero, 0x2); // D(1) in elo1
     la_out3(LISA_MASKEQZ, &la_t6, &la_t6, &la_a0); // if (!rw) D=0
     la_out3(LISA_MASKEQZ, &la_t7, &la_t7, &la_a1);
-    la_out3(LISA_MASKNEZ, &la_t6, &la_t6, &la_t4); // if (!ptwdata) D=0
+    la_out3(LISA_MASKNEZ, &la_t6, &la_t6, &la_t4); // if (NOWRITE) D=0
     la_out3(LISA_MASKNEZ, &la_t7, &la_t7, &la_t5);
     /*
      * la_t0 : vaddr
      * la_t1 : haddr 4K page for elo0
      * la_t2 : haddr 4K page for elo1
-     * la_t4 : ptwdata[paddr0>>12] for elo0
-     * la_t5 : ptwdata[paddr1>>12] for elo1
+     * la_t4 : NOWRITE bits for elo0
+     * la_t5 : NOWRITE bits for elo1
      * la_t6 : D(1) for elo0
      * la_t7 : D(1) for elo1
      * la_a2 : valid for elo0
      * la_a3 : valid for elo1
      */
     la_out2i(LISA_ORI, &la_t3, &la_zero, 0x1); // v(0) in elo
-    la_out2i(LISA_ANDI, &la_t4, &la_t4, 0x1);
-    la_out2i(LISA_ANDI, &la_t5, &la_t5, 0x1);
-    la_out3(LISA_MASKNEZ, &la_t4, &la_t3, &la_t4); // elo0 valid after mmio
-    la_out3(LISA_MASKNEZ, &la_t5, &la_t3, &la_t5); // elo1 valid after mmio
+    la_out3(LISA_MASKNEZ, &la_t4, &la_t3, &la_a4); // elo0 invalid on noaccess
+    la_out3(LISA_MASKNEZ, &la_t5, &la_t3, &la_a5); // elo1 invalid on noaccess
     la_out3(LISA_MASKEQZ, &la_t4, &la_t4, &la_a2); // elo0 valid after PTW
     la_out3(LISA_MASKEQZ, &la_t5, &la_t5, &la_a3); // elo1 valid after PTW
     la_out3(LISA_OR,   &la_a2, &la_t4, &la_t5);
@@ -999,6 +1061,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2m(hamt_excp_t *d)
     la_out2i(LISA_ORI, &la_t2, &la_t2, 0x10); // MAT(5:4)=1, PLV(3:2)=0, D(1)=0
     la_out3 (LISA_OR,  &la_t1, &la_t1, &la_t6); // D(1) in elo0
     la_out3 (LISA_OR,  &la_t2, &la_t2, &la_t7); // D(1) in elo1
+    set_hamt_tlbr_plv(&la_t1, &la_t2, &la_t4, &la_t5);
 
     /*
      * register status at here
@@ -1274,6 +1337,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2(hamt_excp_t *d)
     la_out3(LISA_MASKEQZ, &la_a3, &la_a3, &la_t5);
     la_out3(LISA_OR,   &la_t4, &la_a2, &la_a3);
     la_out2(LISA_BEQZ, &la_t4, &ptw_no);
+    record_hamt_tlbr_user_masks(&la_a0, &la_a1, &la_t3);
     la_out2i(LISA_ANDI, &la_a0, &la_a0, PG_RW_MASK);
     la_out2i(LISA_ANDI, &la_a1, &la_a1, PG_RW_MASK);
     /*
@@ -1386,6 +1450,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2(hamt_excp_t *d)
         la_out3 (LISA_ADD_D,  &la_t4, &la_t4, &la_t1); // CPL3 && USER0
     }
     la_out2 (LISA_BEQZ, &la_t4, &ptw_no);
+    record_hamt_tlbr_user_masks(&la_t6, &la_t6, &la_t4);
     la_out2i(LISA_ANDI, &la_t6, &la_t6, PG_RW_MASK);
 
     gen_hamt_leaf_accessed(&accessed);
@@ -1476,17 +1541,23 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2(hamt_excp_t *d)
     la_out2i(LISA_SRLI_D, &la_t5, &la_t2, 12);     // paddr1 >> 12
     la_out3 (LISA_ADD_D,  &la_t1, &la_t1, &la_t7);
     la_out3 (LISA_ADD_D,  &la_t2, &la_t2, &la_t7);
-    la_out2i(LISA_LD_D,   &la_t3, &la_env, offsetof(CPUX86State, ptw4k));
+    la_out2i(LISA_LD_D,   &la_t3, &la_env, offsetof(CPUX86State, ptwflags));
     la_out3 (LISA_MASKEQZ, &la_t4, &la_t4, &la_a2);
     la_out3 (LISA_MASKEQZ, &la_t5, &la_t5, &la_a3);
-    la_out3 (LISA_LDX_B,  &la_t4, &la_t3, &la_t4); // ptwdata[paddr0]
-    la_out3 (LISA_LDX_B,  &la_t5, &la_t3, &la_t5); // ptwdata[paddr1]
+    la_out3 (LISA_LDX_B,  &la_t4, &la_t3, &la_t4);
+    la_out3 (LISA_LDX_B,  &la_t5, &la_t3, &la_t5);
+    la_out2i(LISA_ANDI,   &la_a4, &la_t4, HAMT_PTWFLAGS_NOACCESS_MASK);
+    la_out2i(LISA_ANDI,   &la_a5, &la_t5, HAMT_PTWFLAGS_NOACCESS_MASK);
+    la_out2i(LISA_ANDI,   &la_t4, &la_t4, HAMT_PTWFLAGS_WRITE_MASK);
+    la_out2i(LISA_ANDI,   &la_t5, &la_t5, HAMT_PTWFLAGS_WRITE_MASK);
     /*
      * la_t0 : vaddr
      * la_t1 : haddr 4K page for elo0
      * la_t2 : haddr 4K page for elo1
-     * la_t4 : ptwdata[paddr0>>12] for elo0
-     * la_t5 : ptwdata[paddr1>>12] for elo1
+     * la_t4 : NOWRITE bits for elo0
+     * la_t5 : NOWRITE bits for elo1
+     * la_a4 : NOACCESS bits for elo0
+     * la_a5 : NOACCESS bits for elo1
      * la_a0 : RW for elo0
      * la_a1 : RW for elo1
      * la_a2 : valid for elo0
@@ -1496,24 +1567,22 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2(hamt_excp_t *d)
     la_out2i(LISA_ORI, &la_t7, &la_zero, 0x2); // D(1) in elo1
     la_out3(LISA_MASKEQZ, &la_t6, &la_t6, &la_a0); // if (!rw) D=0
     la_out3(LISA_MASKEQZ, &la_t7, &la_t7, &la_a1);
-    la_out3(LISA_MASKNEZ, &la_t6, &la_t6, &la_t4); // if (!ptwdata) D=0
+    la_out3(LISA_MASKNEZ, &la_t6, &la_t6, &la_t4); // if (NOWRITE) D=0
     la_out3(LISA_MASKNEZ, &la_t7, &la_t7, &la_t5);
     /*
      * la_t0 : vaddr
      * la_t1 : haddr 4K page for elo0
      * la_t2 : haddr 4K page for elo1
-     * la_t4 : ptwdata[paddr0>>12] for elo0
-     * la_t5 : ptwdata[paddr1>>12] for elo1
+     * la_t4 : NOWRITE bits for elo0
+     * la_t5 : NOWRITE bits for elo1
      * la_t6 : D(1) for elo0
      * la_t7 : D(1) for elo1
      * la_a2 : valid for elo0
      * la_a3 : valid for elo1
      */
     la_out2i(LISA_ORI, &la_t3, &la_zero, 0x1); // v(0) in elo
-    la_out2i(LISA_ANDI, &la_t4, &la_t4, 0x1);
-    la_out2i(LISA_ANDI, &la_t5, &la_t5, 0x1);
-    la_out3(LISA_MASKNEZ, &la_t4, &la_t3, &la_t4); // elo0 valid after mmio
-    la_out3(LISA_MASKNEZ, &la_t5, &la_t3, &la_t5); // elo1 valid after mmio
+    la_out3(LISA_MASKNEZ, &la_t4, &la_t3, &la_a4); // elo0 invalid on noaccess
+    la_out3(LISA_MASKNEZ, &la_t5, &la_t3, &la_a5); // elo1 invalid on noaccess
     la_out3(LISA_MASKEQZ, &la_t4, &la_t4, &la_a2); // elo0 valid after PTW
     la_out3(LISA_MASKEQZ, &la_t5, &la_t5, &la_a3); // elo1 valid after PTW
     la_out3(LISA_OR,   &la_a2, &la_t4, &la_t5);
@@ -1534,6 +1603,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw2(hamt_excp_t *d)
     la_out2i(LISA_ORI, &la_t2, &la_t2, 0x10); // MAT(5:4)=1, PLV(3:2)=0, D(1)=0
     la_out3 (LISA_OR,  &la_t1, &la_t1, &la_t6); // D(1) in elo0
     la_out3 (LISA_OR,  &la_t2, &la_t2, &la_t7); // D(1) in elo1
+    set_hamt_tlbr_plv(&la_t1, &la_t2, &la_t3, &la_t6);
 
     /*
      * register status at here
@@ -1749,6 +1819,7 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw(void)
         la_out3(LISA_ADD_D, &la_t4, &la_t4, &la_t1); // CPL3 && USER0
     }
     la_out2 (LISA_BEQZ, &la_t4, &ptw_no);
+    record_hamt_tlbr_user_masks(&la_t6, &la_t6, &la_t4);
     la_out2i(LISA_ANDI, &la_t6, &la_t6, PG_RW_MASK);
 
     /* Read-only refill entries defer first-write Dirty updates to C. */
@@ -1784,9 +1855,11 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw(void)
     la_out2i(LISA_SRLI_D, &la_t1, &la_t1, 2);
     la_out2 (LISA_BEQZ,   &la_t1, &ptw_no);
 
-    /* check ptwdata[paddr >> 12] */
-    la_out2i(LISA_LD_D,  &la_t1, &la_env, offsetof(CPUX86State, ptw4k));
+    /* check ptwflags[paddr >> 12] */
+    la_out2i(LISA_LD_D,  &la_t1, &la_env, offsetof(CPUX86State, ptwflags));
     la_out3 (LISA_LDX_B, &la_t7, &la_t1, &la_t4);
+    la_out2i(LISA_ANDI,  &la_t1, &la_t7, HAMT_PTWFLAGS_WRITE_MASK);
+    la_out2i(LISA_ANDI,  &la_t7, &la_t7, HAMT_PTWFLAGS_NOACCESS_MASK);
     la_out2 (LISA_BNEZ,  &la_t7, &ptw_no);
 
     /*
@@ -1809,12 +1882,14 @@ static void __latxs_gen_hamt_excp_tlbrefill_hamt_ptw(void)
     // if (rw==0) D(1)=0; else D(1)=0x1;
     la_out2i(LISA_ORI,     &la_t3, &la_zero, 0x2);
     la_out3 (LISA_MASKEQZ, &la_t3, &la_t3, &la_t6);
+    la_out3 (LISA_MASKNEZ, &la_t3, &la_t3, &la_t1); // if (NOWRITE) D=0
     la_out3 (LISA_OR,      &la_t2, &la_t2, &la_t3);
 
     // elo0 = (bit12 == 0) ? haddr : zero
     // elo1 = (bti12 == 0) ? zero  : haddr
     la_out3(LISA_MASKNEZ, &la_t3, &la_t2, &la_t4); // elo0
     la_out3(LISA_MASKEQZ, &la_t6, &la_t2, &la_t4); // elo1
+    set_hamt_tlbr_plv(&la_t3, &la_t6, &la_t4, &la_t5);
     la_out2(LISA_CSRWR, &la_csr_tlbr_ehi,  &la_t0); // PS 4K
     la_out2i(LISA_ORI, &la_t0, &la_zero, 0xc);
     la_out2i(LISA_SLLI_D, &la_t0, &la_t0, 24);
@@ -1866,9 +1941,11 @@ static void __latxs_gen_hamt_excp_tlbrefill(hamt_excp_t *d, int *need_ptw)
 
     IR2_OPND hamtspace = la_new_label();
     if (hamt_mode_dmw()) {
-        la_out2(LISA_CSRRD, &la_t0, &la_csr_asid);
-        la_out2i(LISA_ANDI, &la_t0, &la_t0, 0x3ff);
-        la_out2(LISA_BNEZ,  &la_t0, &hamtspace);
+        if (!hamt_dmw_mode_da()) {
+            la_out2(LISA_CSRRD, &la_t0, &la_csr_asid);
+            la_out2i(LISA_ANDI, &la_t0, &la_t0, 0x3ff);
+            la_out2(LISA_BNEZ,  &la_t0, &hamtspace);
+        }
     } else if (hamt_mode_hole()) {
         la_out2(LISA_CSRRD, &la_t0, &la_csr_tlbr_badv);
         if (hamt_hole_mode_48_7f()) {
@@ -1889,14 +1966,16 @@ static void __latxs_gen_hamt_excp_tlbrefill(hamt_excp_t *d, int *need_ptw)
         exit(-1);
     }
 
-    /* ====================================== */
-    /* === dbt space, 1G entry and return === */
-    /* ====================================== */
+    if (!hamt_dmw_mode_da()) {
+        /* ====================================== */
+        /* === dbt space, 1G entry and return === */
+        /* ====================================== */
 #ifdef CONFIG_LATX_PRINT
-    __latxs_counter(d->database, 1, &la_t0, &la_t1, HD_CNT_TLBR_DBT_INDEX);
+        __latxs_counter(d->database, 1, &la_t0, &la_t1, HD_CNT_TLBR_DBT_INDEX);
 #endif
-    __latxs_gen_hamt_excp_tlbrefill_dbt();
-    la_out1(LISA_B, &ereturn);
+        __latxs_gen_hamt_excp_tlbrefill_dbt();
+        la_out1(LISA_B, &ereturn);
+    }
 
     /* ================================== */
     /* === hamt space, need GVA - HVA === */
@@ -1961,6 +2040,51 @@ static void __latxs_gen_hamt_excp_tlbrefill(hamt_excp_t *d, int *need_ptw)
     la_outa(LISA_DUP, 0x06483800); /* ertn */
 }
 
+static void __latxs_gen_hamt_excp_break(hamt_excp_t *d)
+{
+    IR2_OPND break_try_plv3 = la_new_label();
+    IR2_OPND break_update_era = la_new_label();
+    IR2_OPND break_invalid = la_new_label();
+
+    la_out2(LISA_CSRWR, &la_csr_ks3, &la_t0);
+    la_out2(LISA_CSRWR, &la_csr_ks4, &la_t1);
+
+    la_out2(LISA_CSRRD, &la_t1, &la_csr_badi);
+    la_out2i(LISA_ANDI, &la_t1, &la_t1, 0xff);
+
+    la_out2i(LISA_ORI, &la_t0, &la_zero, HAMT_BREAK_CODE_TOPLV0);
+    la_out3(LISA_BNE, &la_t1, &la_t0, &break_try_plv3);
+    la_out2(LISA_CSRRD, &la_t0, &la_csr_prmd);
+    la_out2ii(LISA_BSTRINS_D, &la_t0, &la_zero, 1, 0);
+    la_out2(LISA_CSRWR, &la_csr_prmd, &la_t0);
+    la_comment("HAMT break: return at PLV0");
+    la_out1(LISA_B, &break_update_era);
+
+    la_label(break_try_plv3);
+    la_out2i(LISA_ORI, &la_t0, &la_zero, HAMT_BREAK_CODE_TOPLV3);
+    la_out3(LISA_BNE, &la_t1, &la_t0, &break_invalid);
+    la_out2(LISA_CSRRD, &la_t0, &la_csr_prmd);
+    la_out2ii(LISA_BSTRINS_D, &la_t0, &la_zero, 1, 0);
+    la_out2i(LISA_ORI, &la_t0, &la_t0, 0x3);
+    la_out2(LISA_CSRWR, &la_csr_prmd, &la_t0);
+    la_comment("HAMT break: return at PLV3");
+
+    la_label(break_update_era);
+    la_out2(LISA_CSRRD, &la_t0, &la_csr_era);
+    la_out2i(LISA_ADDI_D, &la_t0, &la_t0, 4);
+    la_out2(LISA_CSRWR, &la_csr_era, &la_t0);
+    la_out2(LISA_CSRRD, &la_t0, &la_csr_ks3);
+    la_out2(LISA_CSRRD, &la_t1, &la_csr_ks4);
+    la_outa(LISA_DUP, 0x06483800); /* ertn */
+
+    la_label(break_invalid);
+    la_imm(&la_t0, (uint64_t)d->database2);
+    latxs_tr_dmw_in_fix_mem(&la_t0);
+    la_out2(LISA_CSRRD, &la_t1, &la_csr_estat);
+    la_out2i(LISA_ST_D, &la_t1, &la_t0, HD_ERRCODE_INDEX * 8);
+    la_outa(LISA_DUP, 0x00000000); /* inexcusable invalid break code */
+}
+
 void latxs_gen_hamt_excp(hamt_excp_t *d)
 {
     void *code = d->codebase;
@@ -1982,6 +2106,10 @@ void latxs_gen_hamt_excp(hamt_excp_t *d)
     case HAMT_EXCP_ENTRY_TLBREFILL:
         if (d->verbose) printf("build hamt tlbrefill at %p\n", code);
         __latxs_gen_hamt_excp_tlbrefill(d, &need_ptw);
+        break;
+    case HAMT_EXCP_ENTRY_BREAK:
+        if (d->verbose) printf("build hamt break at %p\n", code);
+        __latxs_gen_hamt_excp_break(d);
         break;
     case HAMT_EXCP_INTERRUPT_IPI:
         if (d->verbose) printf("build hamt interrupt ipi at %p\n", code);
@@ -2076,9 +2204,11 @@ static void latxs_gen_save_some(void)
     la_out2 (LISA_CSRRD, &la_t1, &la_csr_prmd);
     la_out2i(LISA_ST_D,  &la_t1, &la_t0, PT_PRMD);
     if (hamt_mode_dmw()) {
-        la_out2 (LISA_CSRRD, &la_t1, &la_csr_asid);
-        la_out2i(LISA_ST_D,  &la_t1, &la_t0, PT_ASID);
-        la_out2(LISA_CSRWR, &la_csr_asid, &la_zero);
+        if (!hamt_dmw_mode_da()) {
+            la_out2 (LISA_CSRRD, &la_t1, &la_csr_asid);
+            la_out2i(LISA_ST_D,  &la_t1, &la_t0, PT_ASID);
+            la_out2(LISA_CSRWR, &la_csr_asid, &la_zero);
+        }
     } else {
         assert(hamt_mode_hole());
     }
@@ -2135,8 +2265,17 @@ static void latxs_gen_restore_some(void)
     la_out2i(LISA_LD_D,  &la_t1, &la_t0, PT_PRMD);
     la_out2 (LISA_CSRWR, &la_csr_prmd, &la_t1);
     if (hamt_mode_dmw()) {
-        la_out2i(LISA_LD_D,  &la_t1, &la_t0, PT_ASID);
-        la_out2 (LISA_CSRWR, &la_csr_asid, &la_t1);
+        if (!hamt_dmw_mode_da()) {
+            la_out2i(LISA_LD_D,  &la_t1, &la_t0, PT_ASID);
+            la_out2 (LISA_CSRWR, &la_csr_asid, &la_t1);
+        } else {
+            la_out2i(LISA_LD_D, &la_t1, &la_t0, PT_CRMD);
+            la_out2(LISA_CSRWR, &la_csr_ks0, &la_t0);
+            la_out2i(LISA_ORI, &la_t0, &la_zero,
+                     CSR_CRMD_DA | CSR_CRMD_PG);
+            la_out3(LISA_CSRXCHG, &la_csr_crmd, &la_t1, &la_t0);
+            la_out2(LISA_CSRRD, &la_t0, &la_csr_ks0);
+        }
     } else {
         assert(hamt_mode_hole());
     }
@@ -2188,6 +2327,11 @@ void latxs_gen_hamt_int(hamt_excp_t *d)
 
     /* save t0, t1 */
     latxs_gen_save_t0t1(d, &la_csr_ks0);
+    if (hamt_dmw_mode_da()) {
+        la_out2(LISA_CSRRD, &la_t1, &la_csr_crmd);
+        la_out2i(LISA_ST_D, &la_t1, &la_t0, PT_CRMD);
+        latxs_tr_dmw_in_da(&la_t0, &la_t1);
+    }
     /* load database to t0 */
     la_imm(&la_t0, (uint64_t)d->database);
     la_out2i(LISA_LU52I_D, &la_t0, &la_t0, 0x900);
@@ -2266,6 +2410,11 @@ void latxs_gen_hamt_exception(hamt_excp_t *d)
 
     /* save t0, t1 */
     latxs_gen_save_t0t1(d, &la_csr_ks0);
+    if (hamt_dmw_mode_da()) {
+        la_out2(LISA_CSRRD, &la_t1, &la_csr_crmd);
+        la_out2i(LISA_ST_D, &la_t1, &la_t0, PT_CRMD);
+        latxs_tr_dmw_in_da(&la_t0, &la_t1);
+    }
     /* load database to t0 */
     la_imm(&la_t0, (uint64_t)d->database);
     la_out2i(LISA_LU52I_D, &la_t0, &la_t0, 0x900);

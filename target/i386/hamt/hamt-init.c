@@ -302,6 +302,31 @@ static void hamt_prepare_entry_tlb_error(int cpuid)
     assert(hamt_entry_tlb_size < (1<<14));
 }
 
+static void hamt_prepare_entry_break(int cpuid)
+{
+    if (break_entry_size[cpuid]) return;
+    HAMT_PREPARE_TLB_INIT();
+
+    hamt_excp_t d;
+    d.codebase = (void *)hamt_entry_tlb_ptr;
+    d.database = (void *)hamt_data_area[cpuid];
+    d.database2 = (void *)hamt_err_data_area[cpuid];
+    d.subcodebase = NULL;
+    d.type = HAMT_EXCP_ENTRY_BREAK;
+    d.verbose = HAMT_BUILD_VERBOSE;
+    d.begin = &break_entry_begin[cpuid];
+    d.end = &break_entry_end[cpuid];
+    d.size = &break_entry_size[cpuid];
+
+    latxs_gen_hamt_excp(&d);
+    local_flush_icache_range();
+
+    hamt_entry_tlb_size += break_entry_size[cpuid];
+    hamt_entry_tlb_ptr = hamt_entry_tlb + hamt_entry_tlb_size;
+
+    assert(hamt_entry_tlb_size < (1<<14));
+}
+
 #define INST_SIZE           4
 #define INST_PER_EX_BLOCK   128
 #define EX_BLOCK_SIZE       (INST_SIZE * INST_PER_EX_BLOCK)
@@ -633,6 +658,7 @@ static void hamt_prepare_mt(int cpuid)
     hamt_prepare_entry_tlb_ldstmy(cpuid);
     hamt_prepare_entry_tlb_error(cpuid);
     hamt_prepare_entry_error_stop(cpuid);
+    hamt_prepare_entry_break(cpuid);
     hamt_prepare_entry_ine(cpuid);
     hamt_prepare_entry_fpe(cpuid);
     hamt_prepare_entry_ale(cpuid);
