@@ -26,6 +26,8 @@ struct QemuCond {
     unsigned long wait_seq;
     unsigned long release_seq;
     unsigned futex_seq;
+    int futex_waiters;
+    int adapt_spin;
     pthread_cond_t cond;
     bool initialized;
 };

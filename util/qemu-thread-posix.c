@@ -200,6 +200,8 @@ void qemu_cond_init(QemuCond *cond)
     cond->wait_seq = 1;
     cond->release_seq = 0;
     cond->futex_seq = 0;
+    cond->futex_waiters = 0;
+    cond->adapt_spin = 4096;
     cond->initialized = true;
 }
 
@@ -771,25 +773,48 @@ void qemu_mutex_unlock_1(QemuMutex *mutex)
 }
 
 #include "qemu/futex.h"
+
+#define QEMU_COND_ADAPT_MIN_SPIN       512
+#define QEMU_COND_ADAPT_SEED_SPIN      2048
+#define QEMU_COND_ADAPT_SHORT_SLEEP_NS 500000ULL /* 500 us */
+
+static inline uint64_t qemu_cond_mono_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 void qemu_cond_wait_2(QemuCond *cond, QemuMutex *mutex)
 {
     unsigned int futex_seq = qatomic_read(&cond->futex_seq);
 
     pthread_spin_unlock(&mutex->spin);
-    qemu_futex_wait(&cond->futex_seq, futex_seq);
+    qatomic_inc(&cond->futex_waiters);
+    smp_mb();
+    if (qatomic_read(&cond->futex_seq) == futex_seq) {
+        qemu_futex_wait(&cond->futex_seq, futex_seq);
+    }
+    qatomic_dec(&cond->futex_waiters);
     pthread_spin_lock(&mutex->spin);
 }
 
 void qemu_cond_broadcast_2(QemuCond *cond)
 {
     qatomic_inc(&cond->futex_seq);
-    qemu_futex_wake(&cond->futex_seq, INT_MAX);
+    smp_mb();
+    if (qatomic_read(&cond->futex_waiters) > 0) {
+        qemu_futex_wake(&cond->futex_seq, INT_MAX);
+    }
 }
 
 void qemu_cond_signal_2(QemuCond *cond)
 {
     qatomic_inc(&cond->futex_seq);
-    qemu_futex_wake(&cond->futex_seq, 1);
+    smp_mb();
+    if (qatomic_read(&cond->futex_waiters) > 0) {
+        qemu_futex_wake(&cond->futex_seq, 1);
+    }
 }
 
 /* The caller snapshots seq before checking its predicate and deadline. */
@@ -797,8 +822,20 @@ void qemu_cond_wait_2_deadline_unlocked(QemuCond *cond, unsigned seq,
                                       const struct timespec *deadline, int spin_count)
 {
     int ret = 0, err = 0;
+    int limit = spin_count;
+    bool adaptive = (deadline == NULL && spin_count > 0);
 
-    for (int i = 0; i < spin_count &&
+    if (adaptive) {
+        limit = qatomic_read(&cond->adapt_spin);
+        if (limit < 0) {
+            limit = 0;
+        } else if (limit > spin_count) {
+            limit = spin_count;
+        }
+    }
+
+    int i;
+    for (i = 0; i < limit &&
          qatomic_read(&cond->futex_seq) == seq; ++i) {
         if (deadline && !(i & 255)) {
             struct timespec now;
@@ -812,9 +849,50 @@ void qemu_cond_wait_2_deadline_unlocked(QemuCond *cond, unsigned seq,
         smp_mb();
     }
     if (qatomic_read(&cond->futex_seq) == seq) {
-        ret = qemu_futex(&cond->futex_seq, FUTEX_WAIT_BITSET, (int)seq,
-                         deadline, NULL, FUTEX_BITSET_MATCH_ANY);
-        err = errno;
+        uint64_t t0 = adaptive ? qemu_cond_mono_ns() : 0;
+        bool did_futex = false;
+
+        qatomic_inc(&cond->futex_waiters);
+        smp_mb();
+        if (qatomic_read(&cond->futex_seq) == seq) {
+            did_futex = true;
+            ret = qemu_futex(&cond->futex_seq, FUTEX_WAIT_BITSET, (int)seq,
+                             deadline, NULL, FUTEX_BITSET_MATCH_ANY);
+            err = errno;
+        }
+        qatomic_dec(&cond->futex_waiters);
+
+        if (adaptive) {
+            int next = limit;
+            if (!did_futex || (ret && err == EAGAIN)) {
+                /* Woken right at the spin-to-futex boundary: grow poll budget. */
+                next = (limit < QEMU_COND_ADAPT_MIN_SPIN) ?
+                       QEMU_COND_ADAPT_SEED_SPIN : (limit << 1);
+            } else if (ret == 0) {
+                uint64_t sleep_ns = qemu_cond_mono_ns() - t0;
+                if (sleep_ns < QEMU_COND_ADAPT_SHORT_SLEEP_NS) {
+                    next = (limit < QEMU_COND_ADAPT_MIN_SPIN) ?
+                           QEMU_COND_ADAPT_SEED_SPIN : (limit << 1);
+                } else {
+                    next = limit >> 1;
+                    if (next < QEMU_COND_ADAPT_MIN_SPIN) {
+                        next = 0;
+                    }
+                }
+            }
+            if (next > spin_count) {
+                next = spin_count;
+            }
+            if (next != limit) {
+                qatomic_set(&cond->adapt_spin, next);
+            }
+        }
+    } else if (adaptive && i > 0 && i >= (limit >> 1) && limit < spin_count) {
+        int next = limit + (limit >> 1);
+        if (next > spin_count) {
+            next = spin_count;
+        }
+        qatomic_set(&cond->adapt_spin, next);
     }
     if (ret && err != EAGAIN && err != EINTR && err != ETIMEDOUT) {
         error_exit(err, __func__);
@@ -846,7 +924,13 @@ void qemu_cond_wait_3(QemuCond *cond, QemuMutex *mutex, int n)
         if (!(qatomic_read(&cond->release_seq) < ticket)) {
             break;
         }
-        qemu_futex_wait(&cond->futex_seq, futex_seq);
+        qatomic_inc(&cond->futex_waiters);
+        smp_mb();
+        if (qatomic_read(&cond->futex_seq) == futex_seq &&
+            qatomic_read(&cond->release_seq) < ticket) {
+            qemu_futex_wait(&cond->futex_seq, futex_seq);
+        }
+        qatomic_dec(&cond->futex_waiters);
     }
     pthread_spin_lock(&mutex->spin);
 }
