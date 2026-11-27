@@ -24,6 +24,8 @@ DECLARE_OBJ_CHECKERS(PCIDevice, PCIDeviceClass,
 struct PCIDeviceClass {
     DeviceClass parent_class;
 
+    void (*msi_route_change)(PCIDevice *dev, bool before);
+
     void (*realize)(PCIDevice *dev, Error **errp);
     PCIUnregisterFunc *exit;
     PCIConfigReadFunc *config_read;
@@ -36,6 +38,20 @@ struct PCIDeviceClass {
     uint16_t subsystem_vendor_id;       /* only for header type = 0 */
     uint16_t subsystem_id;              /* only for header type = 0 */
 
+    /* Type 0 header reads and INTERRUPT_LINE writes have no side effects. */
+    bool plain_config_header;
+    /* 0x00..0xff config reads have no side effects and all mutations publish the slot. */
+    bool plain_config_space;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /*
+     * Optional BQL-free config write hooks called under memory_topology_mutex
+     * with the config read slot paused.
+     */
+    bool (*try_topo_command_write)(PCIDevice *dev, uint16_t old_cmd,
+                                   uint16_t new_cmd);
+    bool (*try_topo_write_config)(PCIDevice *dev, uint32_t addr,
+                                  uint32_t val, int len);
+#endif
     const char *romfile;                /* rom bar */
 };
 
@@ -57,6 +73,7 @@ struct PCIDevice {
     DeviceState qdev;
     bool partially_hotplugged;
     bool has_power;
+    bool save_irq_separately;
 
     /* PCI config space */
     uint8_t *config;
@@ -111,6 +128,9 @@ struct PCIDevice {
     int msix_entries_nr;
 
     /* Space to store MSIX table & pending bit array */
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    struct PCIConfigReadSlot *msix_config_slot; /* RCU-protected */
+#endif
     uint8_t *msix_table;
     uint8_t *msix_pba;
 
@@ -345,6 +365,15 @@ extern const VMStateDescription vmstate_pci_device;
     .vmsd       = &vmstate_pci_device,                               \
     .flags      = VMS_STRUCT | VMS_POINTER,                          \
     .offset     = vmstate_offset_pointer(_state, _field, PCIDevice), \
+}
+
+static inline void pci_msi_route_change(PCIDevice *dev, bool before)
+{
+    PCIDeviceClass *klass = PCI_DEVICE_GET_CLASS(dev);
+
+    if (klass->msi_route_change) {
+        klass->msi_route_change(dev, before);
+    }
 }
 
 #endif

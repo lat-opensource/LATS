@@ -28,6 +28,7 @@
 
 #include "qemu/osdep.h"
 #include "hw/usb.h"
+#include "hw/usb/hid.h"
 #include "hw/usb/uhci-regs.h"
 #include "migration/vmstate.h"
 #include "hw/pci/pci.h"
@@ -39,9 +40,94 @@
 #include "sysemu/dma.h"
 #include "trace.h"
 #include "qemu/main-loop.h"
+#include "sysemu/runstate.h"
 #include "qemu/module.h"
+#include "qemu/error-report.h"
+#include "qemu/rcu.h"
+#include "migration/misc.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/iothread.h"
+#include "sysemu/qtest.h"
+#include "sysemu/replay.h"
 #include "qom/object.h"
 #include "hcd-uhci.h"
+
+
+enum {
+    TRIAL_QH = 1 << 0,
+    TRIAL_TD = 1 << 1,
+    TRIAL_ACTIVE = 1 << 2,
+    TRIAL_IOC = 1 << 3,
+    TRIAL_NAK = 1 << 4,
+    TRIAL_OTHER_PACKET = 1 << 5,
+    TRIAL_QUEUES = 1 << 6,
+    TRIAL_DMA_UPDATE = 1 << 7,
+    TRIAL_IRQ = 1 << 8,
+    TRIAL_STOP = 1 << 9,
+    TRIAL_NO_FRAME = 1 << 10,
+};
+
+static bool trial_active;
+static unsigned trial_work;
+static uint64_t trial_counts[1 << 11];
+static uint64_t trial_frames;
+static uint64_t trial_locks;
+static uint64_t trial_worker_ticks;
+static uint64_t trial_worker_frames;
+static unsigned trial_gate;
+static uint64_t trial_nak_ticks;
+static uint64_t trial_nak_frames;
+static bool trial_enable_nak;
+
+
+uint64_t uhci_trial_worker_ticks(void);
+uint64_t uhci_trial_worker_ticks(void)
+{
+    return qatomic_read(&trial_worker_ticks);
+}
+
+unsigned uhci_trial_worker_gate(unsigned value);
+unsigned uhci_trial_worker_gate(unsigned value)
+{
+    if (value == 1 || value == 3) {
+        qatomic_set(&trial_gate, value);
+    }
+    return qatomic_read(&trial_gate);
+}
+
+static void trial_uhci_report(const char *phase)
+{
+    fprintf(stderr, "UHCI_PHASE %s locked_callbacks=%" PRIu64
+                    " frames=%" PRIu64 "\n", phase, trial_locks, trial_frames);
+    fprintf(stderr, "UHCI_IDLE %s callbacks=%" PRIu64 " frames=%" PRIu64 "\n",
+            phase, qatomic_read(&trial_worker_ticks), qatomic_read(&trial_worker_frames));
+    fprintf(stderr, "UHCI_NAK %s callbacks=%" PRIu64 " frames=%" PRIu64 "\n",
+            phase, qatomic_read(&trial_nak_ticks), qatomic_read(&trial_nak_frames));
+    for (unsigned i = 0; i < ARRAY_SIZE(trial_counts); i++) {
+        if (trial_counts[i]) {
+            fprintf(stderr, "UHCI_WORK %s %#x %" PRIu64 "\n", phase, i,
+                    trial_counts[i]);
+        }
+    }
+}
+
+static void trial_uhci_exit(void)
+{
+    trial_uhci_report("exit");
+}
+
+static void trial_uhci_vmstate(void *opaque, bool running, RunState state)
+{
+    if (!running && state == RUN_STATE_PAUSED) {
+        trial_uhci_report("menu");
+    }
+}
+
+static void trial_uhci_end(void)
+{
+    trial_counts[trial_work]++;
+    trial_active = false;
+}
 
 #define FRAME_TIMER_FREQ 1000
 
@@ -108,6 +194,8 @@ typedef struct UHCI_QH {
 static void uhci_async_cancel(UHCIAsync *async);
 static void uhci_queue_fill(UHCIQueue *q, UHCI_TD *td);
 static void uhci_resume(void *opaque);
+static void uhci_idle_revoke(UHCIState *s);
+static uint16_t uhci_idle_frnum(UHCIState *s);
 
 static inline int32_t uhci_queue_token(UHCI_TD *td)
 {
@@ -309,6 +397,7 @@ static void uhci_reset(DeviceState *dev)
     int i;
     UHCIPort *port;
 
+    uhci_idle_revoke(s);
     trace_usb_uhci_reset();
 
     pci_conf = s->dev.config;
@@ -345,6 +434,21 @@ static const VMStateDescription vmstate_uhci_port = {
     }
 };
 
+static int uhci_pre_save(void *opaque)
+{
+    uhci_idle_revoke(opaque);
+    return 0;
+}
+
+static int uhci_pre_load(void *opaque)
+{
+    UHCIState *s = opaque;
+
+    uhci_idle_revoke(s);
+    timer_del(s->frame_timer);
+    return 0;
+}
+
 static int uhci_post_load(void *opaque, int version_id)
 {
     UHCIState *s = opaque;
@@ -360,6 +464,8 @@ static const VMStateDescription vmstate_uhci = {
     .name = "uhci",
     .version_id = 3,
     .minimum_version_id = 1,
+    .pre_save = uhci_pre_save,
+    .pre_load = uhci_pre_load,
     .post_load = uhci_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, UHCIState),
@@ -385,6 +491,7 @@ static void uhci_port_write(void *opaque, hwaddr addr,
 {
     UHCIState *s = opaque;
 
+    uhci_idle_revoke(s);
     trace_usb_uhci_mmio_writew(addr, val);
 
     switch(addr) {
@@ -497,7 +604,7 @@ static uint64_t uhci_port_read(void *opaque, hwaddr addr, unsigned size)
         val = s->intr;
         break;
     case 0x06:
-        val = s->frnum;
+        val = uhci_idle_frnum(s);
         break;
     case 0x08:
         val = s->fl_base_addr & 0xffff;
@@ -568,6 +675,7 @@ static void uhci_detach(USBPort *port1)
     UHCIState *s = port1->opaque;
     UHCIPort *port = &s->ports[port1->index];
 
+    uhci_idle_revoke(s);
     uhci_async_cancel_device(s, port1->dev);
 
     /* set connect status */
@@ -588,6 +696,7 @@ static void uhci_child_detach(USBPort *port1, USBDevice *child)
 {
     UHCIState *s = port1->opaque;
 
+    uhci_idle_revoke(s);
     uhci_async_cancel_device(s, child);
 }
 
@@ -597,6 +706,7 @@ static void uhci_wakeup(USBPort *port1)
     UHCIPort *port = &s->ports[port1->index];
 
     if (port->ctrl & UHCI_PORT_SUSPEND && !(port->ctrl & UHCI_PORT_RD)) {
+        uhci_idle_revoke(s);
         port->ctrl |= UHCI_PORT_RD;
         uhci_resume(s);
     }
@@ -747,6 +857,15 @@ static int uhci_handle_td(UHCIState *s, UHCIQueue *q, uint32_t qh_addr,
         q->valid = QH_VALID;
     }
 
+    if (trial_active) {
+        trial_work |= TRIAL_TD;
+        if (td->ctrl & TD_CTRL_ACTIVE) {
+            trial_work |= TRIAL_ACTIVE;
+        } else if (td->ctrl & TD_CTRL_IOC) {
+            trial_work |= TRIAL_IOC;
+        }
+    }
+
     /* Is active ? */
     if (!(td->ctrl & TD_CTRL_ACTIVE)) {
         if (async) {
@@ -857,6 +976,10 @@ static int uhci_handle_td(UHCIState *s, UHCIQueue *q, uint32_t qh_addr,
     }
 
 done:
+    if (trial_active) {
+        trial_work |= async->packet.status == USB_RET_NAK ? TRIAL_NAK :
+                                                            TRIAL_OTHER_PACKET;
+    }
     ret = uhci_complete_td(s, td, async, int_mask);
     uhci_async_free(async);
     return ret;
@@ -974,6 +1097,9 @@ static void uhci_process_frame(UHCIState *s)
             break;
         }
         if (is_qh(link)) {
+            if (trial_active) {
+                trial_work |= TRIAL_QH;
+            }
             /* QH */
             trace_usb_uhci_qh_load(link & ~0xf);
 
@@ -1019,6 +1145,9 @@ static void uhci_process_frame(UHCIState *s)
         old_td_ctrl = td.ctrl;
         ret = uhci_handle_td(s, NULL, curr_qh, &td, link, &int_mask);
         if (old_td_ctrl != td.ctrl) {
+            if (trial_active) {
+                trial_work |= TRIAL_DMA_UPDATE;
+            }
             /* update the status bits of the TD */
             val = cpu_to_le32(td.ctrl);
             pci_dma_write(&s->dev, (link & ~0xf) + 4, &val, sizeof(val));
@@ -1046,6 +1175,9 @@ static void uhci_process_frame(UHCIState *s)
             s->frame_bytes += (td.ctrl & 0x7ff) + 1;
 
             if (curr_qh) {
+                if (trial_active) {
+                    trial_work |= TRIAL_DMA_UPDATE;
+                }
                 /* update QH element link */
                 qh.el_link = link;
                 val = cpu_to_le32(qh.el_link);
@@ -1073,8 +1205,444 @@ out:
 static void uhci_bh(void *opaque)
 {
     UHCIState *s = opaque;
+    uhci_idle_revoke(s);
     uhci_process_frame(s);
 }
+
+#if HOST_LONG_BITS == 64
+
+/*
+ * An armed interval begins under BQL. The worker may advance frames through
+ * ordinary RAM until it encounters work requiring the device model. The
+ * epoch invalidates a scan when guest register writes, reset or unplug
+ * change the input. BQL owners revoke the interval with one exchange and
+ * consume only results that were published before that exchange.
+ *
+ * The lower word contains age (6 bits), slow and deadline slot flags, then
+ * the frame advance (24 bits). The worker writes only the unpublished
+ * deadline slot. FRNUM is derived from the same word as the cache age.
+ */
+#define IDLE_FRAME_NS (NANOSECONDS_PER_SECOND / FRAME_TIMER_FREQ)
+#define IDLE_AGE_MASK UINT64_C(63)
+#define IDLE_SLOW UINT64_C(64)
+#define IDLE_SLOT UINT64_C(128)
+#define IDLE_COUNT_MASK UINT32_C(0xffffff)
+#define IDLE_EPOCH_MASK UINT64_C(0xffffffff00000000)
+
+typedef struct UHCIIdle {
+    MemoryListener dma_listener;
+    UHCIState *owner;
+    IOThread *thread;
+    QEMUTimer *timer;
+    QEMUBH *fallback;
+
+    uint64_t phase;
+    uint32_t epoch;               /* BQL only */
+    USBEndpoint *nak_ep;          /* BQL only, valid for the armed interval */
+    bool tablet_nak;              /* immutable while phase matches */
+    int64_t first_alarm;
+    int64_t alarms[2];            /* worker writes, published by phase */
+    int64_t first_expire;
+    uint32_t base;
+    uint16_t first_frnum;
+    uint32_t queue_addr;
+    uint32_t queue_token;
+    uint8_t device_addr;
+} UHCIIdle;
+
+static void uhci_frame_timer(void *opaque);
+
+static uint32_t uhci_idle_count(uint64_t phase)
+{
+    return (phase >> 8) & IDLE_COUNT_MASK;
+}
+
+static int64_t uhci_idle_alarm(UHCIIdle *idle, uint64_t phase)
+{
+    return uhci_idle_count(phase)
+        ? qatomic_read(&idle->alarms[!!(phase & IDLE_SLOT)])
+        : qatomic_read(&idle->first_alarm);
+}
+
+static uint16_t uhci_idle_frnum(UHCIState *s)
+{
+    uint64_t phase = s->idle ? qatomic_read(&s->idle->phase) : 0;
+
+    return (s->frnum + uhci_idle_count(phase)) & 0x7ff;
+}
+
+static int64_t uhci_idle_take(UHCIState *s)
+{
+    UHCIIdle *idle = s->idle;
+    uint64_t phase = idle ? qatomic_xchg(&idle->phase, 0) : 0;
+    uint32_t advance = uhci_idle_count(phase);
+    UHCIQueue *queue;
+
+    if (!phase) {
+        return -1;
+    }
+    idle->nak_ep = NULL;
+    s->frnum = (s->frnum + advance) & 0x7ff;
+    s->expire_time += advance * IDLE_FRAME_NS;
+    queue = QTAILQ_FIRST(&s->queues);
+    if (queue) {
+        queue->valid = phase & IDLE_AGE_MASK;
+        if (!queue->valid) {
+            uhci_queue_free(queue, "idle-frames");
+        }
+    }
+    return uhci_idle_alarm(idle, phase);
+}
+
+static void uhci_idle_revoke(UHCIState *s)
+{
+    int64_t alarm = uhci_idle_take(s);
+
+    if (alarm >= 0) {
+        timer_mod(s->frame_timer, alarm);
+    }
+}
+
+static void uhci_idle_dma_begin(MemoryListener *listener)
+{
+    UHCIIdle *idle = container_of(listener, UHCIIdle, dma_listener);
+
+    /*
+     * Map transactions call begin under BQL, before publishing any new
+     * FlatView. Invalidate the worker's commit even if it has finished
+     * reading the old mapping.
+     */
+    uhci_idle_revoke(idle->owner);
+}
+
+static void uhci_endpoint_wakeup(USBBus *bus, USBEndpoint *ep, unsigned stream)
+{
+    UHCIState *s = container_of(bus, UHCIState, bus);
+
+    if (s->idle && object_dynamic_cast(OBJECT(ep->dev), TYPE_USB_TABLET)) {
+        /* The tablet publishes HID input under BQL, before notification. */
+        g_assert(qemu_mutex_iothread_locked());
+        if (s->idle->nak_ep == ep) {
+            uhci_idle_revoke(s);
+        }
+    }
+}
+
+static bool uhci_idle_scan(AddressSpace *as, FlatView *view,
+                           uint32_t frame_addr, unsigned *age,
+                           uint32_t queue_addr, uint32_t queue_token,
+                           uint8_t device_addr, bool tablet_nak, bool *nak)
+{
+    uint32_t link, qh_next = 0, curr_qh = 0;
+    QhDb qhdb;
+    const uint32_t *entry;
+
+    dma_barrier(as, DMA_DIRECTION_TO_DEVICE);
+    entry = flatview_ram_read_ptr(view, frame_addr, sizeof(*entry));
+    if (!entry) {
+        return false;
+    }
+    if (*age) {
+        --*age;
+    }
+    link = le32_to_cpu(qatomic_read(entry));
+    qhdb_reset(&qhdb);
+    for (int remaining = FRAME_MAX_LOOPS; remaining && is_valid(link);
+         --remaining) {
+        uint32_t addr = link & ~0xf;
+
+        dma_barrier(as, DMA_DIRECTION_TO_DEVICE);
+        if (is_qh(link)) {
+            uint32_t element;
+
+            if (qhdb_insert(&qhdb, link)) {
+                break;
+            }
+            entry = flatview_ram_read_ptr(view, addr, sizeof(UHCI_QH));
+            if (!entry) {
+                return false;
+            }
+            qh_next = le32_to_cpu(qatomic_read(&entry[0]));
+            element = le32_to_cpu(qatomic_read(&entry[1]));
+            curr_qh = is_valid(element) ? link : 0;
+            link = curr_qh ? element : qh_next;
+        } else {
+            UHCI_TD td;
+            bool found_queue, same_queue;
+
+            entry = flatview_ram_read_ptr(view, addr, sizeof(td));
+            if (!entry) {
+                return false;
+            }
+            td.link = le32_to_cpu(qatomic_read(&entry[0]));
+            td.ctrl = le32_to_cpu(qatomic_read(&entry[1]));
+            td.token = le32_to_cpu(qatomic_read(&entry[2]));
+            found_queue = queue_addr != UINT32_MAX &&
+                          queue_token == uhci_queue_token(&td);
+            same_queue = found_queue && queue_addr == curr_qh &&
+                         ((queue_token >> 8) & 0x7f) == device_addr;
+
+            if (td.ctrl & TD_CTRL_ACTIVE) {
+                /*
+                 * The first NAK writes back the TD. Isochronous NAK also
+                 * clears Active. An ordinary repeated IN NAK has neither
+                 * effect, even when the TD requests IOC.
+                 */
+                if (!tablet_nak || !same_queue || !(td.ctrl & TD_CTRL_NAK) ||
+                    (td.ctrl & TD_CTRL_IOS) ||
+                    (td.token & 0xff) != USB_TOKEN_IN) {
+                    return false;
+                }
+                *nak = true;
+            } else if (td.ctrl & TD_CTRL_IOC) {
+                return false;
+            }
+            /*
+             * An inactive TD can still refresh or invalidate a cached
+             * queue. Age zero is also possible while walking the final
+             * live frame, so distinguish expiry from an absent queue.
+             */
+            if (found_queue) {
+                if (same_queue) {
+                    *age = QH_VALID;
+                } else {
+                    *age = 0;
+                    queue_addr = UINT32_MAX;
+                }
+            }
+            link = curr_qh ? qh_next : td.link;
+        }
+    }
+    return true;
+}
+
+static void uhci_idle_fallback(void *opaque)
+{
+    UHCIState *s = opaque;
+
+    if (qatomic_read(&s->idle->phase) & IDLE_SLOW) {
+        uhci_idle_revoke(s);
+    }
+}
+
+static void uhci_idle_tick(void *opaque)
+{
+    UHCIState *s = opaque;
+    UHCIIdle *idle = s->idle;
+    uint64_t phase = qatomic_load_acquire(&idle->phase);
+    int64_t now, alarm, last, frames, skip;
+    uint32_t advance, base, queue_addr, queue_token;
+    uint16_t frnum;
+    uint8_t device_addr;
+    unsigned age;
+    unsigned nak_frames = 0;
+    bool slot, tablet_nak;
+    AddressSpace *as;
+    FlatView *view;
+
+    if (!phase || (phase & IDLE_SLOW)) {
+        return;
+    }
+    g_assert(!qemu_mutex_iothread_locked());
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    alarm = uhci_idle_alarm(idle, phase);
+    if (now < alarm) {
+        timer_mod_anticipate_ns(idle->timer, alarm);
+        return;
+    }
+    advance = uhci_idle_count(phase);
+    last = qatomic_read(&idle->first_expire) +
+           advance * IDLE_FRAME_NS - IDLE_FRAME_NS;
+    if (migration_incoming_postcopy_advised() ||
+        now < last || now - last < IDLE_FRAME_NS) {
+        goto slow;
+    }
+    frames = (now - last) / IDLE_FRAME_NS;
+    skip = MAX(0, frames - s->maxframes);
+    frames = MIN(frames - skip, MAX_FRAMES_PER_TICK);
+    if (!frames || skip + advance + frames > IDLE_COUNT_MASK) {
+        goto slow;
+    }
+
+    base = qatomic_read(&idle->base);
+    frnum = qatomic_read(&idle->first_frnum) + advance + skip;
+    queue_addr = qatomic_read(&idle->queue_addr);
+    queue_token = qatomic_read(&idle->queue_token);
+    device_addr = qatomic_read(&idle->device_addr);
+    tablet_nak = qatomic_read(&idle->tablet_nak) &&
+        !trace_event_get_state_backends(TRACE_USB_PACKET_STATE_CHANGE) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_PACKET_ADD) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_PACKET_DEL) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_TD_LOAD) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_TD_NEXTQH) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_FRAME_START) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_QH_LOAD) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_QUEUE_DEL) &&
+        !trace_event_get_state_backends(TRACE_USB_UHCI_FRAME_LOOP_STOP_IDLE);
+    age = phase & IDLE_AGE_MASK;
+    as = pci_get_address_space(&s->dev);
+    {
+        RCU_READ_LOCK_GUARD();
+        view = address_space_to_flatview(as);
+        for (int64_t i = 0; i < frames; ++i) {
+            uint32_t addr = base + (((frnum + i) & 0x3ff) << 2);
+            bool nak = false;
+
+            if (!uhci_idle_scan(as, view, addr, &age,
+                                age ? queue_addr : UINT32_MAX,
+                                queue_token, device_addr, tablet_nak, &nak)) {
+                goto slow;
+            }
+            nak_frames += nak;
+        }
+        if (view != address_space_to_flatview(as)) {
+            goto slow;
+        }
+    }
+    advance += skip + frames;
+    slot = !(phase & IDLE_SLOT);
+    alarm = now + IDLE_FRAME_NS;
+    qatomic_set(&idle->alarms[slot], alarm);
+    uint64_t result = (phase & IDLE_EPOCH_MASK) | ((uint64_t)advance << 8) |
+                      (slot ? IDLE_SLOT : 0) | age;
+    bool gated = qatomic_cmpxchg(&trial_gate, 1, 2) == 1;
+    if (gated) {
+        for (unsigned i = 0; i < 10000 && qatomic_read(&trial_gate) == 2; ++i) {
+            g_usleep(100);
+        }
+    }
+    bool committed = qatomic_cmpxchg(&idle->phase, phase, result) == phase;
+    if (gated) {
+        qatomic_set(&trial_gate, committed ? 5 : 4);
+    }
+    if (committed) {
+        qatomic_add(&trial_worker_frames, frames);
+        qatomic_inc(&trial_worker_ticks);
+        if (nak_frames) {
+            qatomic_add(&trial_nak_frames, nak_frames);
+            qatomic_inc(&trial_nak_ticks);
+        }
+        timer_mod_anticipate_ns(idle->timer, alarm);
+    }
+    return;
+
+slow:
+    if (qatomic_cmpxchg(&idle->phase, phase, phase | IDLE_SLOW) == phase) {
+        /* The virtual-clock stop operation waits for this timer under BQL. */
+        qemu_bh_schedule(idle->fallback);
+    }
+}
+
+static bool uhci_idle_arm(UHCIState *s, int64_t alarm)
+{
+    UHCIIdle *idle = s->idle;
+    UHCIQueue *queue = QTAILQ_FIRST(&s->queues);
+    uint64_t age = 0;
+
+    if (!idle || !(s->cmd & UHCI_CMD_RS) || !s->frame_bandwidth ||
+        migration_incoming_postcopy_advised() || idle->epoch == UINT32_MAX) {
+        return false;
+    }
+    if (queue) {
+        if (QTAILQ_NEXT(queue, next) || !QTAILQ_EMPTY(&queue->asyncs) ||
+            USB_DEVICE_GET_CLASS(queue->ep->dev)->ep_stopped) {
+            return false;
+        }
+        age = queue->valid;
+        qatomic_set(&idle->queue_addr, queue->qh_addr);
+        qatomic_set(&idle->queue_token, queue->token);
+        qatomic_set(&idle->device_addr, queue->ep->dev->addr);
+    }
+    idle->nak_ep = trial_enable_nak && queue && usb_tablet_can_nak(queue->ep)
+        ? queue->ep : NULL;
+    qatomic_set(&idle->tablet_nak, idle->nak_ep != NULL);
+    qatomic_set(&idle->first_alarm, alarm);
+    qatomic_set(&idle->first_expire, s->expire_time);
+    qatomic_set(&idle->first_frnum, s->frnum);
+    qatomic_set(&idle->base, s->fl_base_addr);
+    idle->epoch++;
+    qatomic_store_release(&idle->phase, ((uint64_t)idle->epoch << 32) | age);
+    timer_mod_anticipate_ns(idle->timer, alarm);
+    return true;
+}
+
+static void uhci_idle_realize(UHCIState *s)
+{
+    const char *enable = getenv("LATS_UHCI_IDLE_WORKER");
+    g_autofree char *name = NULL;
+    Error *err = NULL;
+    IOThread *thread;
+    UHCIIdle *idle;
+
+    if (!enable || strcmp(enable, qtest_enabled() ? "qtest" : "1") ||
+        icount_enabled() || replay_mode != REPLAY_MODE_NONE || s->masterbus ||
+        !object_dynamic_cast(OBJECT(s), TYPE_PIIX3_USB_UHCI)) {
+        return;
+    }
+    name = g_strdup_printf("uhci-%p", s);
+    thread = iothread_create(name, &err);
+    if (!thread) {
+        error_report_err(err);
+        return;
+    }
+    idle = s->idle = g_new0(UHCIIdle, 1);
+    idle->owner = s;
+    idle->thread = thread;
+    idle->fallback = qemu_bh_new_guarded(uhci_idle_fallback, s,
+                                        &DEVICE(s)->mem_reentrancy_guard);
+    idle->timer = aio_timer_new(iothread_get_aio_context(thread),
+                               QEMU_CLOCK_VIRTUAL, SCALE_NS, uhci_idle_tick, s);
+    idle->dma_listener.begin = uhci_idle_dma_begin;
+    idle->dma_listener.name = "uhci-idle-dma";
+    memory_listener_register(&idle->dma_listener,
+                             pci_get_address_space(&s->dev));
+}
+
+static void uhci_idle_exit(UHCIState *s)
+{
+    UHCIIdle *idle = s->idle;
+
+    if (idle) {
+        uhci_idle_take(s);
+        memory_listener_unregister(&idle->dma_listener);
+        iothread_stop(idle->thread);
+        timer_free(idle->timer);
+        qemu_bh_delete(idle->fallback);
+        iothread_destroy(idle->thread);
+        g_free(idle);
+        s->idle = NULL;
+    }
+}
+
+#else
+
+static void uhci_endpoint_wakeup(USBBus *bus, USBEndpoint *ep, unsigned stream)
+{
+}
+
+static void uhci_idle_revoke(UHCIState *s)
+{
+}
+
+static uint16_t uhci_idle_frnum(UHCIState *s)
+{
+    return s->frnum;
+}
+
+static bool uhci_idle_arm(UHCIState *s, int64_t alarm)
+{
+    return false;
+}
+
+static void uhci_idle_realize(UHCIState *s)
+{
+}
+
+static void uhci_idle_exit(UHCIState *s)
+{
+}
+
+#endif
 
 static void uhci_frame_timer(void *opaque)
 {
@@ -1083,6 +1651,10 @@ static void uhci_frame_timer(void *opaque)
     int i, frames;
     const uint64_t frame_t = NANOSECONDS_PER_SECOND / FRAME_TIMER_FREQ;
 
+    g_assert(qemu_mutex_iothread_locked());
+    trial_locks++;
+    trial_active = true;
+    trial_work = QTAILQ_EMPTY(&s->queues) ? 0 : TRIAL_QUEUES;
     s->completions_only = false;
     qemu_bh_cancel(s->bh);
 
@@ -1093,6 +1665,8 @@ static void uhci_frame_timer(void *opaque)
         uhci_async_cancel_all(s);
         /* set hchalted bit in status - UHCI11D 2.1.2 */
         s->status |= UHCI_STS_HCHALTED;
+        trial_work |= TRIAL_STOP;
+        trial_uhci_end();
         return;
     }
 
@@ -1112,6 +1686,10 @@ static void uhci_frame_timer(void *opaque)
         frames = MAX_FRAMES_PER_TICK;
     }
 
+    trial_frames += frames;
+    if (!frames) {
+        trial_work |= TRIAL_NO_FRAME;
+    }
     for (i = 0; i < frames; i++) {
         s->frame_bytes = 0;
         trace_usb_uhci_frame_start(s->frnum);
@@ -1126,13 +1704,17 @@ static void uhci_frame_timer(void *opaque)
 
     /* Complete the previous frame(s) */
     if (s->pending_int_mask) {
+        trial_work |= TRIAL_IRQ;
         s->status2 |= s->pending_int_mask;
         s->status  |= UHCI_STS_USBINT;
         uhci_update_irq(s);
     }
     s->pending_int_mask = 0;
 
-    timer_mod(s->frame_timer, t_now + frame_t);
+    if (!uhci_idle_arm(s, t_now + frame_t)) {
+        timer_mod(s->frame_timer, t_now + frame_t);
+    }
+    trial_uhci_end();
 }
 
 static const MemoryRegionOps uhci_ioport_ops = {
@@ -1154,6 +1736,7 @@ static USBPortOps uhci_port_ops = {
 };
 
 static USBBusOps uhci_bus_ops = {
+    .wakeup_endpoint = uhci_endpoint_wakeup,
 };
 
 void usb_uhci_common_realize(PCIDevice *dev, Error **errp)
@@ -1192,8 +1775,16 @@ void usb_uhci_common_realize(PCIDevice *dev, Error **errp)
     }
     s->bh = qemu_bh_new_guarded(uhci_bh, s, &DEVICE(dev)->mem_reentrancy_guard);
     s->frame_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, uhci_frame_timer, s);
+    static bool trial_installed;
+    if (!trial_installed) {
+        trial_enable_nak = lats_nobql_enabled();
+        trial_installed = true;
+        qemu_add_vm_change_state_handler(trial_uhci_vmstate, NULL);
+        atexit(trial_uhci_exit);
+    }
     s->num_ports_vmstate = NB_PORTS;
     QTAILQ_INIT(&s->queues);
+    uhci_idle_realize(s);
 
     memory_region_init_io(&s->io_bar, OBJECT(s), &uhci_ioport_ops, s,
                           "uhci", 0x20);
@@ -1207,6 +1798,7 @@ static void usb_uhci_exit(PCIDevice *dev)
 {
     UHCIState *s = UHCI(dev);
 
+    uhci_idle_exit(s);
     trace_usb_uhci_exit();
 
     if (s->frame_timer) {

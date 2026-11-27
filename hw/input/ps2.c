@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "hw/irq.h"
 #include "hw/sysbus.h"
 #include "hw/input/ps2.h"
@@ -309,10 +310,27 @@ static void ps2_put_keycode(void *opaque, int keycode)
     }
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+typedef QemuRecMutex PS2LockGuard;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(PS2LockGuard, qemu_rec_mutex_unlock)
+
+static inline PS2LockGuard *ps2_lock_begin(PS2State *s)
+{
+    if (s && s->lock) {
+        qemu_rec_mutex_lock(s->lock);
+        return s->lock;
+    }
+    return NULL;
+}
+#endif
+
 static void ps2_keyboard_event(DeviceState *dev, QemuConsole *src,
                                InputEvent *evt)
 {
     PS2KbdState *s = (PS2KbdState *)dev;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(PS2_DEVICE(s));
+#endif
     InputKeyEvent *key = evt->u.key.data;
     int qcode;
     uint16_t keycode = 0;
@@ -577,8 +595,24 @@ uint32_t ps2_read_data(PS2State *s)
 
 static void ps2_set_ledstate(PS2KbdState *s, int ledstate)
 {
+    int old_ledstate = s->ledstate;
+
     trace_ps2_set_ledstate(s, ledstate);
     s->ledstate = ledstate;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    PS2State *ps2 = PS2_DEVICE(s);
+    if (ps2->lock && !qemu_mutex_iothread_locked()) {
+        if (ledstate == old_ledstate) {
+            return;
+        }
+        qemu_rec_mutex_unlock(ps2->lock);
+        qemu_mutex_lock_iothread();
+        kbd_put_ledstate(ledstate);
+        qemu_mutex_unlock_iothread();
+        qemu_rec_mutex_lock(ps2->lock);
+        return;
+    }
+#endif
     kbd_put_ledstate(ledstate);
 }
 
@@ -797,6 +831,9 @@ static void ps2_mouse_event(DeviceState *dev, QemuConsole *src,
         [INPUT_BUTTON_EXTRA]  = PS2_MOUSE_BUTTON_EXTRA,
     };
     PS2MouseState *s = (PS2MouseState *)dev;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(PS2_DEVICE(s));
+#endif
     InputMoveEvent *move;
     InputBtnEvent *btn;
 
@@ -844,6 +881,9 @@ static void ps2_mouse_event(DeviceState *dev, QemuConsole *src,
 static void ps2_mouse_sync(DeviceState *dev)
 {
     PS2MouseState *s = (PS2MouseState *)dev;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(PS2_DEVICE(s));
+#endif
 
     /* do not sync while disabled to prevent stream corruption */
     if (!(s->mouse_status & MOUSE_STATUS_ENABLED)) {
@@ -869,6 +909,9 @@ static void ps2_mouse_sync(DeviceState *dev)
 
 void ps2_mouse_fake_event(PS2MouseState *s)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(PS2_DEVICE(s));
+#endif
     trace_ps2_mouse_fake_event(s);
     s->mouse_dx++;
     ps2_mouse_sync(DEVICE(s));
@@ -1010,6 +1053,9 @@ void ps2_write_mouse(PS2MouseState *s, int val)
 static void ps2_reset_hold(Object *obj)
 {
     PS2State *s = PS2_DEVICE(obj);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(s);
+#endif
 
     s->write_cmd = -1;
     ps2_reset_queue(s);
@@ -1018,6 +1064,9 @@ static void ps2_reset_hold(Object *obj)
 static void ps2_reset_exit(Object *obj)
 {
     PS2State *s = PS2_DEVICE(obj);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(s);
+#endif
 
     ps2_lower_irq(s);
 }
@@ -1168,6 +1217,9 @@ static int ps2_kbd_post_load(void *opaque, int version_id)
 {
     PS2KbdState *s = (PS2KbdState *)opaque;
     PS2State *ps2 = PS2_DEVICE(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(ps2);
+#endif
 
     if (version_id == 2) {
         s->scancode_set = 2;
@@ -1203,6 +1255,9 @@ static int ps2_mouse_post_load(void *opaque, int version_id)
 {
     PS2MouseState *s = (PS2MouseState *)opaque;
     PS2State *ps2 = PS2_DEVICE(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PS2LockGuard) guard = ps2_lock_begin(ps2);
+#endif
 
     ps2_common_post_load(ps2);
 

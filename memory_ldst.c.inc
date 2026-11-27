@@ -35,11 +35,10 @@ static inline uint32_t glue(address_space_ldl_internal, SUFFIX)(ARG1_DECL,
     RCU_READ_LOCK();
     mr = TRANSLATE(addr, &addr1, &l, false, attrs);
     if (l < 4 || !memory_access_is_direct(mr, false)) {
-        release_lock |= prepare_mmio_access(mr, addr1, 4, false, attrs);
-
         /* I/O case */
-        r = memory_region_dispatch_read(mr, addr1, &val,
-                                        MO_32 | devend_memop(endian), attrs);
+        r = address_space_read_io(mr, addr1, &val,
+                                  MO_32 | devend_memop(endian),
+                                  attrs, &release_lock);
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 4, mr);
@@ -104,11 +103,10 @@ static inline uint64_t glue(address_space_ldq_internal, SUFFIX)(ARG1_DECL,
     RCU_READ_LOCK();
     mr = TRANSLATE(addr, &addr1, &l, false, attrs);
     if (l < 8 || !memory_access_is_direct(mr, false)) {
-        release_lock |= prepare_mmio_access(mr, addr1, 8, false, attrs);
-
         /* I/O case */
-        r = memory_region_dispatch_read(mr, addr1, &val,
-                                        MO_64 | devend_memop(endian), attrs);
+        r = address_space_read_io(mr, addr1, &val,
+                                  MO_64 | devend_memop(endian),
+                                  attrs, &release_lock);
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 8, mr);
@@ -171,10 +169,8 @@ uint8_t glue(address_space_ldub, SUFFIX)(ARG1_DECL,
     RCU_READ_LOCK();
     mr = TRANSLATE(addr, &addr1, &l, false, attrs);
     if (!memory_access_is_direct(mr, false)) {
-        release_lock |= prepare_mmio_access(mr, addr1, 1, false, attrs);
-
         /* I/O case */
-        r = memory_region_dispatch_read(mr, addr1, &val, MO_8, attrs);
+        r = address_space_read_io(mr, addr1, &val, MO_8, attrs, &release_lock);
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 1, mr);
@@ -208,11 +204,10 @@ static inline uint16_t glue(address_space_lduw_internal, SUFFIX)(ARG1_DECL,
     RCU_READ_LOCK();
     mr = TRANSLATE(addr, &addr1, &l, false, attrs);
     if (l < 2 || !memory_access_is_direct(mr, false)) {
-        release_lock |= prepare_mmio_access(mr, addr1, 2, false, attrs);
-
         /* I/O case */
-        r = memory_region_dispatch_read(mr, addr1, &val,
-                                        MO_16 | devend_memop(endian), attrs);
+        r = address_space_read_io(mr, addr1, &val,
+                                  MO_16 | devend_memop(endian),
+                                  attrs, &release_lock);
     } else {
         /* RAM case */
         fuzz_dma_read_cb(addr, 2, mr);
@@ -315,9 +310,8 @@ static inline void glue(address_space_stl_internal, SUFFIX)(ARG1_DECL,
     RCU_READ_LOCK();
     mr = TRANSLATE(addr, &addr1, &l, true, attrs);
     if (l < 4 || !memory_access_is_direct(mr, true)) {
-        release_lock |= prepare_mmio_access(mr, addr1, 4, true, attrs);
-        r = memory_region_dispatch_write(mr, addr1, val,
-                                         MO_32 | devend_memop(endian), attrs);
+        r = address_space_write_io(mr, addr1, l, val, MO_32 | devend_memop(endian),
+                                   attrs, &release_lock);
     } else {
         /* RAM case */
         ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
@@ -378,8 +372,8 @@ void glue(address_space_stb, SUFFIX)(ARG1_DECL,
     RCU_READ_LOCK();
     mr = TRANSLATE(addr, &addr1, &l, true, attrs);
     if (!memory_access_is_direct(mr, true)) {
-        release_lock |= prepare_mmio_access(mr, addr1, 1, true, attrs);
-        r = memory_region_dispatch_write(mr, addr1, val, MO_8, attrs);
+        r = address_space_write_io(mr, addr1, l, val, MO_8, attrs,
+                                   &release_lock);
     } else {
         /* RAM case */
         ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
@@ -411,9 +405,8 @@ static inline void glue(address_space_stw_internal, SUFFIX)(ARG1_DECL,
     RCU_READ_LOCK();
     mr = TRANSLATE(addr, &addr1, &l, true, attrs);
     if (l < 2 || !memory_access_is_direct(mr, true)) {
-        release_lock |= prepare_mmio_access(mr, addr1, 2, true, attrs);
-        r = memory_region_dispatch_write(mr, addr1, val,
-                                         MO_16 | devend_memop(endian), attrs);
+        r = address_space_write_io(mr, addr1, l, val, MO_16 | devend_memop(endian),
+                                   attrs, &release_lock);
     } else {
         /* RAM case */
         ptr = qemu_map_ram_ptr(mr->ram_block, addr1);

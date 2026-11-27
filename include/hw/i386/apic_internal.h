@@ -141,6 +141,7 @@ struct APICCommonClass {
     void (*enable_tpr_reporting)(APICCommonState *s, bool enable);
     void (*vapic_base_update)(APICCommonState *s);
     void (*external_nmi)(APICCommonState *s);
+    void (*read_pending)(APICCommonState *s, uint32_t *irr, uint32_t *tmr);
     void (*pre_save)(APICCommonState *s);
     void (*post_load)(APICCommonState *s);
     void (*reset)(APICCommonState *s);
@@ -188,6 +189,14 @@ struct APICCommonState {
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
     bool legacy_instance_id;
     uint64_t la_ecfg;
+    /* Software LAPIC. Low half is IRR, high half is the inverse of TMR. */
+    uint64_t pending[8];
+    unsigned ipi_sending;
+    bool ipi_unplugged;
+    struct APICPendingExtension *pending_ext;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex timer_lock;
+#endif
 };
 
 typedef struct VAPICState {

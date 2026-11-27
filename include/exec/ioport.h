@@ -36,6 +36,13 @@ typedef struct MemoryRegionPortio {
     uint32_t (*read)(void *opaque, uint32_t address);
     void (*write)(void *opaque, uint32_t address, uint32_t data);
     uint32_t base; /* private field */
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* Complete a direct read/write or leave it to normal dispatch. */
+    bool (*try_read)(void *opaque, uint32_t address, unsigned size,
+                     uint64_t *value);
+    bool (*try_write)(void *opaque, uint32_t address, unsigned size,
+                      uint32_t value);
+#endif
 } MemoryRegionPortio;
 
 #define PORTIO_END_OF_LIST() { }
@@ -60,12 +67,30 @@ typedef struct PortioList {
     void *opaque;
     const char *name;
     bool flush_coalesced_mmio;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool local_registers;
+    QemuRecMutex *device_lock;
+#endif
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex *local_byte_lock;
+    uint32_t local_byte_first;
+    uint32_t local_byte_end;
+#endif
 } PortioList;
 
 void portio_list_init(PortioList *piolist, Object *owner,
                       const struct MemoryRegionPortio *callbacks,
                       void *opaque, const char *name);
 void portio_list_set_flush_coalesced(PortioList *piolist);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+void portio_list_set_device_lock(PortioList *piolist, QemuRecMutex *lock);
+/*
+ * Guard accesses overlapping [first, end) with lock before dispatch.
+ * The absolute I/O ports in that range may skip the BQL for byte accesses.
+ */
+void portio_list_set_local_bytes(PortioList *piolist, QemuRecMutex *lock,
+                                 uint32_t first, uint32_t end);
+#endif
 void portio_list_destroy(PortioList *piolist);
 void portio_list_add(PortioList *piolist,
                      struct MemoryRegion *address_space,

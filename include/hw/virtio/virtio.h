@@ -107,7 +107,6 @@ struct VirtIODevice
     DeviceState parent_obj;
     const char *name;
     uint8_t status;
-    uint8_t isr;
     uint16_t queue_sel;
     /**
      * These fields represent a set of VirtIO features at various
@@ -166,7 +165,29 @@ struct VirtIODevice
      */
     EventNotifier config_notifier;
     bool device_iotlb_enabled;
+    /* Direct RX uses the same mutex as the Slirp backend. */
+    QemuRecMutex *network_mutex;
+    bool software_net_notifier[3];
+    bool (*try_output)(VirtIODevice *vdev, VirtQueue *vq);
+    void (*flush_output_irqs)(VirtIODevice *vdev);
+    /* Protected by network_mutex; cleared after flushing all output IRQs. */
+    bool output_irqs_may_be_pending;
+    bool queue_mapping_changing;
+    bool network_queue_retry;
 };
+
+typedef QemuRecMutex VirtioNetworkLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(VirtioNetworkLock, qemu_rec_mutex_unlock)
+
+static inline VirtioNetworkLock *virtio_lock_network(VirtIODevice *vdev)
+{
+    QemuRecMutex *mutex = vdev ? vdev->network_mutex : NULL;
+
+    if (mutex) {
+        qemu_rec_mutex_lock(mutex);
+    }
+    return mutex;
+}
 
 struct VirtioDeviceClass {
     /*< private >*/
@@ -251,6 +272,10 @@ typedef void (*VirtIOHandleOutput)(VirtIODevice *, VirtQueue *);
 VirtQueue *virtio_add_queue(VirtIODevice *vdev, int queue_size,
                             VirtIOHandleOutput handle_output);
 
+/* Set a queue handler for ioeventfd dispatch by the main loop. */
+void virtio_queue_set_ioeventfd_handler(VirtQueue *vq,
+                                        VirtIOHandleOutput handle_output);
+
 void virtio_del_queue(VirtIODevice *vdev, int n);
 
 void virtio_delete_queue(VirtQueue *vq);
@@ -280,6 +305,12 @@ void virtqueue_get_avail_bytes(VirtQueue *vq, unsigned int *in_bytes,
 
 void virtio_notify_irqfd(VirtIODevice *vdev, VirtQueue *vq);
 void virtio_notify(VirtIODevice *vdev, VirtQueue *vq);
+bool virtio_split_next_irq_suppressed(VirtIODevice *vdev, VirtQueue *vq);
+bool virtio_queue_irq_ready(VirtIODevice *vdev, VirtQueue *vq);
+bool virtio_queue_try_notify(VirtIODevice *vdev, VirtQueue *vq);
+void virtio_queue_deliver_irq(VirtQueue *vq);
+uint8_t virtio_get_isr(VirtIODevice *vdev);
+uint8_t virtio_clear_isr(VirtIODevice *vdev, uint8_t mask);
 
 int virtio_save(VirtIODevice *vdev, QEMUFile *f);
 
@@ -307,6 +338,7 @@ bool virtio_queue_get_notification(VirtQueue *vq);
 void virtio_queue_set_notification(VirtQueue *vq, int enable);
 
 int virtio_queue_ready(VirtQueue *vq);
+bool virtio_queue_has_ram_rings(VirtQueue *vq);
 
 int virtio_queue_empty(VirtQueue *vq);
 
@@ -335,6 +367,8 @@ int virtio_queue_get_max_num(VirtIODevice *vdev, int n);
 int virtio_get_num_queues(VirtIODevice *vdev);
 void virtio_queue_set_rings(VirtIODevice *vdev, int n, hwaddr desc,
                             hwaddr avail, hwaddr used);
+bool virtio_queue_try_set_rings(VirtIODevice *vdev, int n, hwaddr desc,
+                                hwaddr avail, hwaddr used);
 void virtio_queue_update_rings(VirtIODevice *vdev, int n);
 void virtio_init_region_cache(VirtIODevice *vdev, int n);
 void virtio_queue_set_align(VirtIODevice *vdev, int n, int align);
@@ -406,6 +440,11 @@ void virtio_queue_aio_detach_host_notifier(VirtQueue *vq, AioContext *ctx);
 VirtQueue *virtio_vector_first_queue(VirtIODevice *vdev, uint16_t vector);
 VirtQueue *virtio_vector_next_queue(VirtQueue *vq);
 EventNotifier *virtio_config_get_guest_notifier(VirtIODevice *vdev);
+bool virtio_set_software_net_notifier(VirtIODevice *vdev, unsigned int index,
+                                      bool assign);
+int virtio_device_start_ioeventfd_impl(VirtIODevice *vdev);
+void virtio_device_stop_ioeventfd_impl(VirtIODevice *vdev);
+void virtio_queue_set_ioeventfd_fd_handler(VirtQueue *vq, bool assign);
 void virtio_config_set_guest_notifier_fd_handler(VirtIODevice *vdev,
                                                  bool assign, bool with_irqfd);
 

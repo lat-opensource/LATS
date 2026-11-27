@@ -355,9 +355,33 @@ static void i8257_dma_run(void *opaque)
     if (d->running) {
         rearm = 1;
         goto out;
-    } else {
-        d->running = 1;
     }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (!qemu_mutex_iothread_locked()) {
+        bool any_active = false;
+        for (ichan = 0; ichan < 4; ichan++) {
+            int mask = 1 << ichan;
+            if ((0 == (d->mask & mask)) && (0 != (d->status & (mask << 4)))) {
+                any_active = true;
+                break;
+            }
+        }
+        if (!any_active) {
+            return;
+        }
+        qemu_rec_mutex_unlock(&d->local_lock);
+        qemu_mutex_lock_iothread();
+        qemu_rec_mutex_lock(&d->local_lock);
+        i8257_dma_run(d);
+        qemu_rec_mutex_unlock(&d->local_lock);
+        qemu_mutex_unlock_iothread();
+        qemu_rec_mutex_lock(&d->local_lock);
+        return;
+    }
+#endif
+
+    d->running = 1;
 
     for (ichan = 0; ichan < 4; ichan++) {
         int mask;
@@ -573,8 +597,12 @@ static void i8257_realize(DeviceState *dev, Error **errp)
                                  "dma-pageh");
     }
 
+    qemu_rec_mutex_init(&d->local_lock);
     memory_region_init_io(&d->cont_io, OBJECT(isa), &cont_io_ops, d,
                           "dma-cont", 8 << d->dshift);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&d->cont_io, &d->local_lock);
+#endif
     memory_region_add_subregion(isa_address_space_io(isa),
                                 d->base + (8 << d->dshift), &d->cont_io);
 

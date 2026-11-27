@@ -78,6 +78,7 @@ struct RAMBlock {
 
     int alloc_from_base;
     void *base;
+    struct VGACommonState *vga;
 };
 #endif
 #endif

@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "hw/intc/i8259.h"
 #include "hw/isa/i8259_internal.h"
+#include "hw/i386/hpet-irq0.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "monitor/monitor.h"
@@ -34,8 +35,36 @@
 static int irq_level[16];
 static uint64_t irq_count[16];
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+QemuRecMutex *pic_shared_lock(void)
+{
+    static QemuRecMutex shared_lock;
+    static gsize initialized;
+
+    if (g_once_init_enter(&initialized)) {
+        qemu_rec_mutex_init(&shared_lock);
+        g_once_init_leave(&initialized, 1);
+    }
+    return &shared_lock;
+}
+#endif
+
+bool pic_hpet_irq0_stats_idle(void)
+{
+    return irq_level[0] == 0;
+}
+
+void pic_hpet_irq0_add_edges(uint64_t count)
+{
+    irq_count[0] += count;
+}
+
 void pic_reset_common(PICCommonState *s)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
+    hpet_irq0_revoke_route();
     s->last_irr = 0;
     s->irr &= s->elcr;
     s->imr = 0;
@@ -58,6 +87,9 @@ static int pic_dispatch_pre_save(void *opaque)
 {
     PICCommonState *s = opaque;
     PICCommonClass *info = PIC_COMMON_GET_CLASS(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
 
     if (info->pre_save) {
         info->pre_save(s);
@@ -70,7 +102,15 @@ static int pic_dispatch_post_load(void *opaque, int version_id)
 {
     PICCommonState *s = opaque;
     PICCommonClass *info = PIC_COMMON_GET_CLASS(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
 
+    hpet_irq0_revoke_route();
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* Conservative: force the first post-load write to sync int_out under BQL. */
+    s->int_out_level = true;
+#endif
     if (info->post_load) {
         info->post_load(s);
     }
@@ -82,6 +122,9 @@ static void pic_common_realize(DeviceState *dev, Error **errp)
     PICCommonState *s = PIC_COMMON(dev);
     ISADevice *isa = ISA_DEVICE(dev);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_init(&s->local_lock);
+#endif
     isa_register_ioport(isa, &s->base_io, s->iobase);
     if (s->elcr_addr != -1) {
         isa_register_ioport(isa, &s->elcr_io, s->elcr_addr);
@@ -135,6 +178,9 @@ static bool pic_get_statistics(InterruptStatsProvider *obj,
 static void pic_print_info(InterruptStatsProvider *obj, Monitor *mon)
 {
     PICCommonState *s = PIC_COMMON(obj);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
 
     pic_dispatch_pre_save(s);
     monitor_printf(mon, "pic%d: irr=%02x imr=%02x isr=%02x hprio=%d "

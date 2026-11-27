@@ -28,6 +28,7 @@
 #include "hw/hw.h"
 #include "hw/pci/msi.h"
 #include "qemu/timer.h"
+#include "qemu/rcu.h"
 #include "qom/object.h"
 #include "qemu/main-loop.h" /* iothread mutex */
 #include "qemu/module.h"
@@ -60,6 +61,7 @@ struct EduState {
     uint32_t status;
 
     uint32_t irq_status;
+    unsigned int trial_sent;
 
 #define EDU_DMA_RUN             0x1
 #define EDU_DMA_DIR(cmd)        (((cmd) & 0x2) >> 1)
@@ -96,7 +98,7 @@ static void edu_raise_irq(EduState *edu, uint32_t val)
 
 static void edu_lower_irq(EduState *edu, uint32_t val)
 {
-    edu->irq_status &= ~val;
+    qatomic_and(&edu->irq_status, ~val);
 
     if (!edu->irq_status && !edu_msi_enabled(edu)) {
         pci_set_irq(&edu->pdev, 0);
@@ -215,7 +217,7 @@ static uint64_t edu_mmio_read(void *opaque, hwaddr addr, unsigned size)
         val = qatomic_read(&edu->status);
         break;
     case 0x24:
-        val = edu->irq_status;
+        val = qatomic_read(&edu->irq_status);
         break;
     case 0x80:
         dma_rw(edu, false, &val, &edu->dma.src, false);
@@ -258,11 +260,20 @@ static void edu_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         /* EDU_STATUS_COMPUTING cannot go 0->1 concurrently, because it is only
          * set in this function and it is under the iothread mutex.
          */
+        unsigned int sent = qatomic_read(&edu->trial_sent);
+
         qemu_mutex_lock(&edu->thr_mutex);
         edu->fact = val;
         qatomic_or(&edu->status, EDU_STATUS_COMPUTING);
         qemu_cond_signal(&edu->thr_cond);
         qemu_mutex_unlock(&edu->thr_mutex);
+        if (getenv("MSI_TEST_HOLD_BQL") && edu_msi_enabled(edu) &&
+            msi_get_message(&edu->pdev, 0).data == 0x51) {
+            assert(qemu_mutex_iothread_locked());
+            while (qatomic_read(&edu->trial_sent) == sent) {
+                g_usleep(20);
+            }
+        }
         break;
     case 0x20:
         if (val & EDU_STATUS_IRQFACT) {
@@ -344,6 +355,7 @@ static void *edu_fact_thread(void *opaque)
 {
     EduState *edu = opaque;
 
+    rcu_register_thread();
     while (1) {
         uint32_t val, ret = 1;
 
@@ -379,12 +391,20 @@ static void *edu_fact_thread(void *opaque)
         smp_mb__after_rmw();
 
         if (qatomic_read(&edu->status) & EDU_STATUS_IRQFACT) {
-            qemu_mutex_lock_iothread();
-            edu_raise_irq(edu, FACT_IRQ);
-            qemu_mutex_unlock_iothread();
+            if (getenv("MSI_TEST_HOST_UNLOCKED")) {
+                assert(edu_msi_enabled(edu));
+                qatomic_or(&edu->irq_status, FACT_IRQ);
+                msi_notify(&edu->pdev, 0);
+                qatomic_inc(&edu->trial_sent);
+            } else {
+                qemu_mutex_lock_iothread();
+                edu_raise_irq(edu, FACT_IRQ);
+                qemu_mutex_unlock_iothread();
+            }
         }
     }
 
+    rcu_unregister_thread();
     return NULL;
 }
 

@@ -151,6 +151,9 @@ typedef struct VirtIONetQueue {
     QEMUTimer *tx_timer;
     QEMUBH *tx_bh;
     uint32_t tx_waiting;
+    bool rx_slirp;
+    bool tx_slirp;
+    bool tx_bql_retry;
     struct {
         VirtQueueElement *elem;
     } async_tx;
@@ -163,6 +166,8 @@ struct VirtIONet {
     uint16_t status;
     VirtIONetQueue *vqs;
     VirtQueue *ctrl_vq;
+    QEMUBH *ctrl_bh;
+    bool ctrl_bql_retry;
     NICState *nic;
     /* RSC Chains - temporary storage of coalesced data,
        all these data are lost in case of migration */

@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qemu/datadir.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/dma.h"
@@ -282,7 +283,29 @@ static int fw_cfg_select(FWCfgState *s, uint16_t key)
         arch = !!(key & FW_CFG_ARCH_LOCAL);
         e = &s->entries[arch][key & FW_CFG_ENTRY_MASK];
         if (e->select_cb) {
-            e->select_cb(e->callback_opaque);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            if (!qemu_mutex_iothread_locked() &&
+                memory_region_device_lock_enabled()) {
+                qemu_rec_mutex_unlock(&s->device_lock);
+                if (lats_nobql_enabled()) {
+                    qemu_memory_topology_lock();
+                } else {
+                    qemu_mutex_lock_iothread();
+                }
+                qemu_rec_mutex_lock(&s->device_lock);
+                e->select_cb(e->callback_opaque);
+                qemu_rec_mutex_unlock(&s->device_lock);
+                if (lats_nobql_enabled()) {
+                    qemu_memory_topology_unlock();
+                } else {
+                    qemu_mutex_unlock_iothread();
+                }
+                qemu_rec_mutex_lock(&s->device_lock);
+            } else
+#endif
+            {
+                e->select_cb(e->callback_opaque);
+            }
         }
     }
 
@@ -420,7 +443,23 @@ static void fw_cfg_dma_transfer(FWCfgState *s)
                                     MEMTXATTRS_UNSPECIFIED)) {
                     dma.control |= FW_CFG_DMA_CTL_ERROR;
                 } else if (e->write_cb) {
-                    e->write_cb(e->callback_opaque, s->cur_offset, len);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+                    if (!qemu_mutex_iothread_locked() &&
+                        memory_region_device_lock_enabled()) {
+                        uint32_t cb_offset = s->cur_offset;
+
+                        qemu_rec_mutex_unlock(&s->device_lock);
+                        qemu_mutex_lock_iothread();
+                        qemu_rec_mutex_lock(&s->device_lock);
+                        e->write_cb(e->callback_opaque, cb_offset, len);
+                        qemu_rec_mutex_unlock(&s->device_lock);
+                        qemu_mutex_unlock_iothread();
+                        qemu_rec_mutex_lock(&s->device_lock);
+                    } else
+#endif
+                    {
+                        e->write_cb(e->callback_opaque, s->cur_offset, len);
+                    }
                 }
             }
 
@@ -556,8 +595,14 @@ static void fw_cfg_reset(DeviceState *d)
 {
     FWCfgState *s = FW_CFG(d);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_lock(&s->device_lock);
+#endif
     /* we never register a read callback for FW_CFG_SIGNATURE */
     fw_cfg_select(s, FW_CFG_SIGNATURE);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_unlock(&s->device_lock);
+#endif
 }
 
 /* Save restore 32 bit int as uint16_t
@@ -1264,11 +1309,29 @@ static void fw_cfg_class_init(ObjectClass *klass, void *data)
     device_class_set_props(dc, fw_cfg_properties);
 }
 
+static void fw_cfg_init(Object *obj)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    FWCfgState *s = FW_CFG(obj);
+    qemu_rec_mutex_init(&s->device_lock);
+#endif
+}
+
+static void fw_cfg_finalize(Object *obj)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    FWCfgState *s = FW_CFG(obj);
+    qemu_rec_mutex_destroy(&s->device_lock);
+#endif
+}
+
 static const TypeInfo fw_cfg_info = {
     .name          = TYPE_FW_CFG,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .abstract      = true,
     .instance_size = sizeof(FWCfgState),
+    .instance_init = fw_cfg_init,
+    .instance_finalize = fw_cfg_finalize,
     .class_init    = fw_cfg_class_init,
 };
 
@@ -1320,11 +1383,18 @@ static void fw_cfg_io_realize(DeviceState *dev, Error **errp)
      * of the i/o region used is FW_CFG_CTL_SIZE */
     memory_region_init_io(&s->comb_iomem, OBJECT(s), &fw_cfg_comb_mem_ops,
                           FW_CFG(s), "fwcfg", FW_CFG_CTL_SIZE);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&s->comb_iomem, &FW_CFG(s)->device_lock);
+#endif
 
     if (FW_CFG(s)->dma_enabled) {
         memory_region_init_io(&FW_CFG(s)->dma_iomem, OBJECT(s),
                               &fw_cfg_dma_mem_ops, FW_CFG(s), "fwcfg.dma",
                               sizeof(dma_addr_t));
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        memory_region_set_device_lock(&FW_CFG(s)->dma_iomem,
+                                      &FW_CFG(s)->device_lock);
+#endif
     }
 
     fw_cfg_common_realize(dev, errp);
@@ -1369,6 +1439,9 @@ static void fw_cfg_mem_realize(DeviceState *dev, Error **errp)
 
     memory_region_init_io(&s->ctl_iomem, OBJECT(s), &fw_cfg_ctl_mem_ops,
                           FW_CFG(s), "fwcfg.ctl", FW_CFG_CTL_SIZE);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&s->ctl_iomem, &FW_CFG(s)->device_lock);
+#endif
     sysbus_init_mmio(sbd, &s->ctl_iomem);
 
     if (s->data_width > data_ops->valid.max_access_size) {
@@ -1380,12 +1453,19 @@ static void fw_cfg_mem_realize(DeviceState *dev, Error **errp)
     }
     memory_region_init_io(&s->data_iomem, OBJECT(s), data_ops, FW_CFG(s),
                           "fwcfg.data", data_ops->valid.max_access_size);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&s->data_iomem, &FW_CFG(s)->device_lock);
+#endif
     sysbus_init_mmio(sbd, &s->data_iomem);
 
     if (FW_CFG(s)->dma_enabled) {
         memory_region_init_io(&FW_CFG(s)->dma_iomem, OBJECT(s),
                               &fw_cfg_dma_mem_ops, FW_CFG(s), "fwcfg.dma",
                               sizeof(dma_addr_t));
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        memory_region_set_device_lock(&FW_CFG(s)->dma_iomem,
+                                      &FW_CFG(s)->device_lock);
+#endif
         sysbus_init_mmio(sbd, &FW_CFG(s)->dma_iomem);
     }
 

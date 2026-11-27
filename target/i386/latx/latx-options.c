@@ -113,6 +113,7 @@ int option_hamt_dump;
 int option_hamt_print;
 int option_htimer;
 int option_irq_gate_nobql;
+int option_irq_kick_fast;
 
 int option_ir1_cache_ways;
 int option_ir1_cache_replace;

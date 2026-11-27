@@ -14,6 +14,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
 #include "qemu/log.h"
 #include "qapi/error.h"
 #include "exec/memory.h"
@@ -28,8 +29,10 @@
 #include "exec/memory-internal.h"
 #include "exec/ram_addr.h"
 #include "sysemu/kvm.h"
+#include "sysemu/replay.h"
 #include "sysemu/runstate.h"
 #include "sysemu/tcg.h"
+#include "sysemu/cpu-timers.h"
 #include "qemu/accel.h"
 #include "hw/boards.h"
 #include "migration/vmstate.h"
@@ -46,6 +49,54 @@ static unsigned memory_region_transaction_depth;
 static bool memory_region_update_pending;
 static bool ioeventfd_update_pending;
 unsigned int global_dirty_tracking;
+
+static QemuRecMutex memory_topology_mutex;
+static gsize memory_topology_mutex_init_once;
+static __thread unsigned memory_topology_lock_depth;
+static int memory_listeners_requiring_bql;
+
+static void memory_topology_mutex_ensure_init(void)
+{
+    if (g_once_init_enter(&memory_topology_mutex_init_once)) {
+        qemu_rec_mutex_init(&memory_topology_mutex);
+        g_once_init_leave(&memory_topology_mutex_init_once, 1);
+    }
+}
+
+void qemu_memory_topology_lock(void)
+{
+    memory_topology_mutex_ensure_init();
+    lats_lockdep_acquire(&memory_topology_mutex, LOCK_RANK_MEM_TOPO,
+                         "memory_topology");
+    qemu_rec_mutex_lock(&memory_topology_mutex);
+    ++memory_topology_lock_depth;
+}
+
+void qemu_memory_topology_unlock(void)
+{
+    assert(memory_topology_lock_depth > 0);
+    --memory_topology_lock_depth;
+    qemu_rec_mutex_unlock(&memory_topology_mutex);
+}
+
+bool qemu_memory_topology_locked(void)
+{
+    return memory_topology_lock_depth > 0;
+}
+
+bool qemu_memory_topology_nobql_enabled(void)
+{
+    static int enabled = -1;
+    int val = qatomic_read(&enabled);
+
+    if (unlikely(val < 0)) {
+        val = lats_nobql_enabled();
+        qatomic_set(&enabled, val);
+    }
+    return val != 0 && tcg_enabled() && !kvm_enabled() &&
+           !icount_enabled() && replay_mode == REPLAY_MODE_NONE &&
+           qatomic_read(&memory_listeners_requiring_bql) == 0;
+}
 
 static QTAILQ_HEAD(, MemoryListener) memory_listeners
     = QTAILQ_HEAD_INITIALIZER(memory_listeners);
@@ -297,10 +348,10 @@ static void flatview_destroy(FlatView *view)
         address_space_dispatch_free(view->dispatch);
     }
     for (i = 0; i < view->nr; i++) {
-        memory_region_unref(view->ranges[i].mr);
+        memory_region_unref_nobql(view->ranges[i].mr);
     }
     g_free(view->ranges);
-    memory_region_unref(view->root);
+    memory_region_unref_nobql(view->root);
     g_free(view);
 }
 
@@ -314,7 +365,7 @@ void flatview_unref(FlatView *view)
     if (qatomic_fetch_dec(&view->ref) == 1) {
         trace_flatview_destroy_rcu(view, view->root);
         assert(view->root);
-        call_rcu(view, flatview_destroy, rcu);
+        call_rcu_nobql(view, flatview_destroy, rcu);
     }
 }
 
@@ -433,6 +484,23 @@ static int get_cpu_index(void)
     return -1;
 }
 
+static void memory_region_trace_read(MemoryRegion *mr, hwaddr addr,
+                                     uint64_t value, unsigned size)
+{
+    if (mr->subpage) {
+        trace_memory_region_subpage_read(get_cpu_index(), mr, addr, value, size);
+    } else if (trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        /* A lockless read may race with moving or removing the region. */
+        QEMU_IOTHREAD_LOCK_GUARD();
+#endif
+        hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
+
+        trace_memory_region_ops_read(get_cpu_index(), mr, abs_addr, value, size,
+                                     memory_region_name(mr));
+    }
+}
+
 static MemTxResult  memory_region_read_accessor(MemoryRegion *mr,
                                                 hwaddr addr,
                                                 uint64_t *value,
@@ -444,13 +512,7 @@ static MemTxResult  memory_region_read_accessor(MemoryRegion *mr,
     uint64_t tmp;
 
     tmp = mr->ops->read(mr->opaque, addr, size);
-    if (mr->subpage) {
-        trace_memory_region_subpage_read(get_cpu_index(), mr, addr, tmp, size);
-    } else if (trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
-        hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
-        trace_memory_region_ops_read(get_cpu_index(), mr, abs_addr, tmp, size,
-                                     memory_region_name(mr));
-    }
+    memory_region_trace_read(mr, addr, tmp, size);
     memory_region_shift_read_access(value, shift, mask, tmp);
     return MEMTX_OK;
 }
@@ -467,13 +529,7 @@ static MemTxResult memory_region_read_with_attrs_accessor(MemoryRegion *mr,
     MemTxResult r;
 
     r = mr->ops->read_with_attrs(mr->opaque, addr, &tmp, size, attrs);
-    if (mr->subpage) {
-        trace_memory_region_subpage_read(get_cpu_index(), mr, addr, tmp, size);
-    } else if (trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
-        hwaddr abs_addr = memory_region_to_absolute_addr(mr, addr);
-        trace_memory_region_ops_read(get_cpu_index(), mr, abs_addr, tmp, size,
-                                     memory_region_name(mr));
-    }
+    memory_region_trace_read(mr, addr, tmp, size);
     memory_region_shift_read_access(value, shift, mask, tmp);
     return r;
 }
@@ -519,6 +575,11 @@ static MemTxResult memory_region_write_with_attrs_accessor(MemoryRegion *mr,
     return mr->ops->write_with_attrs(mr->opaque, addr, tmp, size, attrs);
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+typedef QemuRecMutex AdjustedAccessLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(AdjustedAccessLock, qemu_rec_mutex_unlock)
+#endif
+
 static MemTxResult access_with_adjusted_size(hwaddr addr,
                                       uint64_t *value,
                                       unsigned size,
@@ -533,13 +594,14 @@ static MemTxResult access_with_adjusted_size(hwaddr addr,
                                                    uint64_t mask,
                                                    MemTxAttrs attrs),
                                       MemoryRegion *mr,
-                                      MemTxAttrs attrs)
+                                      MemTxAttrs attrs, bool is_write)
 {
     uint64_t access_mask;
     unsigned access_size;
     unsigned i;
     MemTxResult r = MEMTX_OK;
     bool reentrancy_guard_applied = false;
+    bool bypass_reentrancy_guard = mr->disable_reentrancy_guard;
 
     if (!access_size_min) {
         access_size_min = 1;
@@ -548,8 +610,30 @@ static MemTxResult access_with_adjusted_size(hwaddr addr,
         access_size_max = 4;
     }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(AdjustedAccessLock) split_lock = NULL;
+    g_autoptr(MemoryRegionSplitPause) pause = NULL;
+
+    if (size > access_size_max && mr->ops->mmio_split_pause &&
+        qemu_mutex_iothread_locked()) {
+        /* One logical access can also split inside this dispatcher. */
+        if (mr->ops->mmio_split_lock) {
+            split_lock = mr->ops->mmio_split_lock(mr->opaque, addr, size);
+            if (split_lock) {
+                qemu_rec_mutex_lock(split_lock);
+            }
+        }
+        pause = memory_region_pause_split(mr, addr, size);
+    }
+
+    if (mr->dev && !bypass_reentrancy_guard && mr->ops->access_lockless) {
+        bypass_reentrancy_guard = mr->ops->access_lockless(mr->opaque, addr,
+                                                         size, is_write, attrs);
+    }
+#endif
+
     /* Do not allow more than one simultaneous access to a device's IO Regions */
-    if (mr->dev && !mr->disable_reentrancy_guard &&
+    if (mr->dev && !bypass_reentrancy_guard &&
         !mr->ram_device && !mr->ram && !mr->rom_device && !mr->readonly) {
         if (mr->dev->mem_reentrancy_guard.engaged_in_io) {
             warn_report_once("Blocked re-entrant IO on MemoryRegion: "
@@ -1122,7 +1206,10 @@ static void address_space_update_topology(AddressSpace *as)
 
 void memory_region_transaction_begin(void)
 {
-    qemu_flush_coalesced_mmio_buffer();
+    if (qemu_mutex_iothread_locked()) {
+        qemu_flush_coalesced_mmio_buffer();
+    }
+    qemu_memory_topology_lock();
     ++memory_region_transaction_depth;
 }
 
@@ -1131,7 +1218,8 @@ void memory_region_transaction_commit(void)
     AddressSpace *as;
 
     assert(memory_region_transaction_depth);
-    assert(qemu_mutex_iothread_locked());
+    assert(qemu_memory_topology_locked());
+    assert(qemu_mutex_iothread_locked() || qemu_memory_topology_nobql_enabled());
 
     --memory_region_transaction_depth;
     if (!memory_region_transaction_depth) {
@@ -1153,7 +1241,8 @@ void memory_region_transaction_commit(void)
             }
             ioeventfd_update_pending = false;
         }
-   }
+    }
+    qemu_memory_topology_unlock();
 }
 
 static void memory_region_destructor_none(MemoryRegion *mr)
@@ -1439,13 +1528,13 @@ static MemTxResult memory_region_dispatch_read1(MemoryRegion *mr,
                                          mr->ops->impl.min_access_size,
                                          mr->ops->impl.max_access_size,
                                          memory_region_read_accessor,
-                                         mr, attrs);
+                                         mr, attrs, false);
     } else {
         return access_with_adjusted_size(addr, pval, size,
                                          mr->ops->impl.min_access_size,
                                          mr->ops->impl.max_access_size,
                                          memory_region_read_with_attrs_accessor,
-                                         mr, attrs);
+                                         mr, attrs, false);
     }
 }
 
@@ -1457,21 +1546,84 @@ MemTxResult memory_region_dispatch_read(MemoryRegion *mr,
 {
     unsigned size = memop_size(op);
     MemTxResult r;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex *dev_lock;
+#endif
 
     if (mr->alias) {
         return memory_region_dispatch_read(mr->alias,
                                            mr->alias_offset + addr,
                                            pval, op, attrs);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    dev_lock = qatomic_read(&mr->device_lock);
+    if (dev_lock) {
+        lats_lockdep_acquire(dev_lock, LOCK_RANK_DEVICE,
+                             memory_region_name(mr));
+        qemu_rec_mutex_lock(dev_lock);
+    }
+#endif
     if (!memory_region_access_valid(mr, addr, size, false, attrs)) {
         *pval = unassigned_mem_read(mr, addr, size);
-        return MEMTX_DECODE_ERROR;
+        r = MEMTX_DECODE_ERROR;
+        goto out;
     }
 
     r = memory_region_dispatch_read1(mr, addr, pval, size, attrs);
     adjust_endianness(mr, pval, op);
+out:
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (dev_lock) {
+        qemu_rec_mutex_unlock(dev_lock);
+    }
+#endif
     return r;
 }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+bool memory_region_try_read_lockless(MemoryRegion *mr, hwaddr addr,
+                                     uint64_t *value, MemOp op,
+                                     MemTxAttrs attrs)
+{
+    unsigned size = memop_size(op);
+    uint64_t tmp;
+
+    if (!mr->ops->try_read_lockless(mr->opaque, addr, op, attrs, &tmp)) {
+        return false;
+    }
+    if (mr->subpage) {
+        trace_memory_region_subpage_read(get_cpu_index(), mr, addr, tmp, size);
+    } else if (!qatomic_read(&mr->subpage_dispatch_lockless) &&
+               trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+        /* Keep the original access width while walking the region tree. */
+        qemu_mutex_lock_iothread_mmio_profile_impl(mr, memory_region_name(mr),
+                                                  addr, false, __FILE__, __LINE__);
+        memory_region_trace_read(mr, addr, tmp, size);
+        qemu_mutex_unlock_iothread();
+    }
+    *value = tmp & MAKE_64BIT_MASK(0, size * 8);
+    adjust_endianness(mr, value, op);
+    return true;
+}
+
+bool memory_region_try_write_lockless(MemoryRegion *mr, hwaddr addr,
+                                      uint64_t value, MemOp op,
+                                      MemTxAttrs attrs)
+{
+    unsigned size = memop_size(op);
+
+    /* Write tracing walks the BQL-protected region tree. */
+    if (mr->subpage ||
+        trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE) ||
+        !memory_region_access_valid(mr, addr, size, true, attrs)) {
+        return false;
+    }
+
+    adjust_endianness(mr, &value, op);
+    value &= MAKE_64BIT_MASK(0, size * 8);
+    return mr->ops->try_write_lockless(mr->opaque, addr, size, value);
+}
+#endif
 
 /* Return true if an eventfd was signalled */
 static bool memory_region_dispatch_write_eventfds(MemoryRegion *mr,
@@ -1506,38 +1658,58 @@ MemTxResult memory_region_dispatch_write(MemoryRegion *mr,
                                          MemTxAttrs attrs)
 {
     unsigned size = memop_size(op);
+    MemTxResult r;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex *dev_lock;
+#endif
 
     if (mr->alias) {
         return memory_region_dispatch_write(mr->alias,
                                             mr->alias_offset + addr,
                                             data, op, attrs);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    dev_lock = qatomic_read(&mr->device_lock);
+    if (dev_lock) {
+        lats_lockdep_acquire(dev_lock, LOCK_RANK_DEVICE,
+                             memory_region_name(mr));
+        qemu_rec_mutex_lock(dev_lock);
+    }
+#endif
     if (!memory_region_access_valid(mr, addr, size, true, attrs)) {
         unassigned_mem_write(mr, addr, data, size);
-        return MEMTX_DECODE_ERROR;
+        r = MEMTX_DECODE_ERROR;
+        goto out;
     }
 
     adjust_endianness(mr, &data, op);
 
     if ((!kvm_eventfds_enabled()) &&
         memory_region_dispatch_write_eventfds(mr, addr, data, size, attrs)) {
-        return MEMTX_OK;
+        r = MEMTX_OK;
+        goto out;
     }
 
     if (mr->ops->write) {
-        return access_with_adjusted_size(addr, &data, size,
-                                         mr->ops->impl.min_access_size,
-                                         mr->ops->impl.max_access_size,
-                                         memory_region_write_accessor, mr,
-                                         attrs);
+        r = access_with_adjusted_size(addr, &data, size,
+                                      mr->ops->impl.min_access_size,
+                                      mr->ops->impl.max_access_size,
+                                      memory_region_write_accessor, mr,
+                                      attrs, true);
     } else {
-        return
-            access_with_adjusted_size(addr, &data, size,
+        r = access_with_adjusted_size(addr, &data, size,
                                       mr->ops->impl.min_access_size,
                                       mr->ops->impl.max_access_size,
                                       memory_region_write_with_attrs_accessor,
-                                      mr, attrs);
+                                      mr, attrs, true);
     }
+out:
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (dev_lock) {
+        qemu_rec_mutex_unlock(dev_lock);
+    }
+#endif
+    return r;
 }
 
 void memory_region_init_io(MemoryRegion *mr,
@@ -1891,6 +2063,31 @@ void memory_region_unref(MemoryRegion *mr)
     }
 }
 
+void memory_region_unref_nobql(MemoryRegion *mr)
+{
+    Object *obj;
+    uint32_t ref;
+
+    if (!mr || !mr->owner) {
+        return;
+    }
+    obj = mr->owner;
+    ref = qatomic_read(&obj->ref);
+    while (ref > 1) {
+        if (qatomic_cmpxchg(&obj->ref, ref, ref - 1) == ref) {
+            return;
+        }
+        ref = qatomic_read(&obj->ref);
+    }
+    if (qemu_mutex_iothread_locked()) {
+        object_unref(obj);
+    } else {
+        qemu_mutex_lock_iothread();
+        object_unref(obj);
+        qemu_mutex_unlock_iothread();
+    }
+}
+
 uint64_t memory_region_size(MemoryRegion *mr)
 {
     if (int128_eq(mr->size, int128_2_64())) {
@@ -1923,8 +2120,8 @@ uint8_t memory_region_get_dirty_log_mask(MemoryRegion *mr)
     uint8_t mask = mr->dirty_log_mask;
     RAMBlock *rb = mr->ram_block;
 
-    if (global_dirty_tracking && ((rb && qemu_ram_is_migratable(rb)) ||
-                             memory_region_is_iommu(mr))) {
+    if (qatomic_read(&global_dirty_tracking) &&
+        ((rb && qemu_ram_is_migratable(rb)) || memory_region_is_iommu(mr))) {
         mask |= (1 << DIRTY_MEMORY_MIGRATION);
     }
 
@@ -2430,13 +2627,24 @@ DirtyBitmapSnapshot *memory_region_snapshot_and_clear_dirty(MemoryRegion *mr,
 
 uint8_t *dirty_bitmap_snapshot_get_dirty(DirtyBitmapSnapshot *snap);
 
+bool memory_region_vga_dirty_tracking_disabled(const MemoryRegion *mr)
+{
+#ifdef CONFIG_LATX_HACK_MEM
+    return hamt_no_vga_dirty() && strncmp(mr->name, "vga.vram", 8) == 0;
+#else
+    return false;
+#endif
+}
+
 bool memory_region_snapshot_get_dirty(MemoryRegion *mr, DirtyBitmapSnapshot *snap,
                                       hwaddr addr, hwaddr size)
 {
     assert(mr->ram_block);
+    if (memory_region_vga_dirty_tracking_disabled(mr)) {
+        return true;
+    }
 #ifdef CONFIG_LATX_HACK_MEM
     if (strncmp(mr->name, "vga.vram", 8) == 0) {
-        if (hamt_no_vga_dirty()) return true;
         return hamt_ptwdata_vga_snapshot_is_dirty(addr, size,
                 dirty_bitmap_snapshot_get_dirty(snap));
     }
@@ -2459,6 +2667,29 @@ void memory_region_disable_locking(MemoryRegion *mr)
 {
     qatomic_set(&mr->disable_locking, true);
 }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+bool memory_region_device_lock_enabled(void)
+{
+    static int enabled = -1;
+    int val = qatomic_read(&enabled);
+
+    if (unlikely(val < 0)) {
+        val = tcg_enabled() && !icount_enabled() &&
+              replay_mode == REPLAY_MODE_NONE &&
+              lats_nobql_enabled();
+        qatomic_set(&enabled, val);
+    }
+    return val != 0;
+}
+
+void memory_region_set_device_lock(MemoryRegion *mr, QemuRecMutex *lock)
+{
+    if (memory_region_device_lock_enabled()) {
+        qatomic_set(&mr->device_lock, lock);
+    }
+}
+#endif
 
 void memory_region_set_nonvolatile(MemoryRegion *mr, bool nonvolatile)
 {
@@ -2727,7 +2958,6 @@ done:
 uint64_t vram_base;
 uint64_t vram_size;
 uint64_t vram_count;
-extern VGACommonState *system_vga;
 extern void cpu_arch_state_set_vram(CPUArchState *env, uint64_t b, uint64_t s);
 static void memory_region_add_subregion_common(MemoryRegion *mr,
                                                hwaddr offset,
@@ -2742,8 +2972,10 @@ static void memory_region_add_subregion_common(MemoryRegion *mr,
     }
     subregion->addr = offset;
 #ifdef CONFIG_LATX_HACK_MEM
-    if (strncmp(subregion->name, "vga.vram", 8) == 0 &&
+    if (subregion->ram_block && subregion->ram_block->vga &&
         (uint64_t)offset < latx_memory_backend_size) {
+        VGACommonState *vga = subregion->ram_block->vga;
+
         vram_base = offset;
         vram_size = subregion->size;
         CPUState *cpu;
@@ -2755,7 +2987,7 @@ static void memory_region_add_subregion_common(MemoryRegion *mr,
                     subregion->ram_block->host, subregion->size);
         }
         subregion->ram_block->host = (void *) HACK_RAMBASE + offset;
-        system_vga->vram_ptr = memory_region_get_ram_ptr(subregion);
+        vga->vram_ptr = memory_region_get_ram_ptr(subregion);
     }
 #endif
     memory_region_update_container_subregions(subregion);
@@ -3020,7 +3252,7 @@ void memory_global_dirty_log_start(unsigned int flags)
     }
 
     old_flags = global_dirty_tracking;
-    global_dirty_tracking |= flags;
+    qatomic_or(&global_dirty_tracking, flags);
     trace_global_dirty_changed(global_dirty_tracking);
 
     if (!old_flags) {
@@ -3035,7 +3267,7 @@ static void memory_global_dirty_log_do_stop(unsigned int flags)
 {
     assert(flags && !(flags & (~GLOBAL_DIRTY_MASK)));
     assert((global_dirty_tracking & flags) == flags);
-    global_dirty_tracking &= ~flags;
+    qatomic_and(&global_dirty_tracking, ~flags);
 
     trace_global_dirty_changed(global_dirty_tracking);
 
@@ -3157,6 +3389,10 @@ void memory_listener_register(MemoryListener *listener, AddressSpace *as)
     /* Only one of them can be defined for a listener */
     assert(!(listener->log_sync && listener->log_sync_global));
 
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
+    if (!listener->nobql_safe) {
+        qatomic_inc(&memory_listeners_requiring_bql);
+    }
     listener->address_space = as;
     if (QTAILQ_EMPTY(&memory_listeners)
         || listener->priority >= QTAILQ_LAST(&memory_listeners)->priority) {
@@ -3187,6 +3423,7 @@ void memory_listener_register(MemoryListener *listener, AddressSpace *as)
 
 void memory_listener_unregister(MemoryListener *listener)
 {
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
     if (!listener->address_space) {
         return;
     }
@@ -3195,6 +3432,9 @@ void memory_listener_unregister(MemoryListener *listener)
     QTAILQ_REMOVE(&memory_listeners, listener, link);
     QTAILQ_REMOVE(&listener->address_space->listeners, listener, link_as);
     listener->address_space = NULL;
+    if (!listener->nobql_safe) {
+        qatomic_dec(&memory_listeners_requiring_bql);
+    }
 }
 
 void address_space_remove_listeners(AddressSpace *as)
@@ -3206,6 +3446,7 @@ void address_space_remove_listeners(AddressSpace *as)
 
 void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
 {
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
     memory_region_ref(root);
     as->root = root;
     as->current_map = NULL;
@@ -3232,6 +3473,7 @@ void address_space_destroy(AddressSpace *as)
 {
     MemoryRegion *root = as->root;
 
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
     /* Flush out anything from MemoryListeners listening in on this */
     memory_region_transaction_begin();
     as->root = NULL;

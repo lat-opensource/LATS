@@ -203,4 +203,6 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(RCUReadAuto, rcu_read_auto_unlock)
 void rcu_add_force_rcu_notifier(Notifier *n);
 void rcu_remove_force_rcu_notifier(Notifier *n);
 
+#define call_rcu_nobql(s, fn, field) call_rcu(s, fn, field)
+
 #endif /* QEMU_RCU_H */

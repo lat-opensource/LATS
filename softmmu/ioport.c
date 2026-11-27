@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/thread.h"
 #include "cpu.h"
 #include "exec/ioport.h"
 #include "exec/memory.h"
@@ -38,6 +39,14 @@ struct MemoryRegionPortioList {
     MemoryRegion mr;
     void *portio_opaque;
     MemoryRegionPortio *ports;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    MemoryRegionOps *direct_ops;
+#endif
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex *local_byte_lock;
+    uint32_t local_byte_first;
+    uint32_t local_byte_end;
+#endif
 };
 
 #define TYPE_MEMORY_REGION_PORTIO_LIST "memory-region-portio-list"
@@ -137,12 +146,34 @@ void portio_list_init(PortioList *piolist,
     piolist->owner = owner;
     piolist->name = name;
     piolist->flush_coalesced_mmio = false;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    piolist->local_registers = false;
+    piolist->device_lock = NULL;
+#endif
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    piolist->local_byte_lock = NULL;
+#endif
 }
 
 void portio_list_set_flush_coalesced(PortioList *piolist)
 {
     piolist->flush_coalesced_mmio = true;
 }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+void portio_list_set_device_lock(PortioList *piolist, QemuRecMutex *lock)
+{
+    piolist->device_lock = lock;
+}
+
+void portio_list_set_local_bytes(PortioList *piolist, QemuRecMutex *lock,
+                                 uint32_t first, uint32_t end)
+{
+    piolist->local_byte_lock = lock;
+    piolist->local_byte_first = first;
+    piolist->local_byte_end = end;
+}
+#endif
 
 void portio_list_destroy(PortioList *piolist)
 {
@@ -223,11 +254,129 @@ static const MemoryRegionOps portio_ops = {
     .impl.unaligned = true,
 };
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool portio_try_read(void *opaque, hwaddr addr, MemOp op,
+                            MemTxAttrs attrs, uint64_t *value)
+{
+    MemoryRegionPortioList *mrpio = opaque;
+    unsigned size = memop_size(op);
+    const MemoryRegionPortio *port;
+
+    if (attrs.memory ||
+        trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+        return false;
+    }
+    port = find_portio(mrpio, addr, size, false);
+    if (port && port->try_read) {
+        return port->try_read(mrpio->portio_opaque, port->base + addr,
+                              size, value);
+    }
+    if (size == 2) {
+        port = find_portio(mrpio, addr, 1, false);
+        if (port && port->try_read && addr + 1 < port->offset + port->len) {
+            return port->try_read(mrpio->portio_opaque, port->base + addr,
+                                  2, value);
+        }
+    }
+    return false;
+}
+
+static bool portio_try_write(void *opaque, hwaddr addr, unsigned size,
+                             uint64_t value)
+{
+    MemoryRegionPortioList *mrpio = opaque;
+    const MemoryRegionPortio *port;
+
+    port = find_portio(mrpio, addr, size, true);
+    if (port && port->try_write) {
+        return port->try_write(mrpio->portio_opaque, port->base + addr,
+                               size, value);
+    }
+    if (size == 2) {
+        port = find_portio(mrpio, addr, 1, true);
+        if (port && port->try_write && addr + 1 < port->offset + port->len) {
+            return port->try_write(mrpio->portio_opaque, port->base + addr,
+                                   2, value);
+        }
+    }
+    return false;
+}
+
+#endif
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool portio_local_access_lockless(void *opaque, hwaddr addr,
+                                        unsigned size, bool is_write,
+                                        MemTxAttrs attrs)
+{
+    MemoryRegionPortioList *mrpio = opaque;
+
+    return size == 1 && addr >= mrpio->local_byte_first &&
+           addr < mrpio->local_byte_end;
+}
+
+typedef QemuRecMutex PortioByteLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(PortioByteLock, qemu_rec_mutex_unlock)
+
+static QemuRecMutex *portio_local_split_lock(void *opaque, hwaddr addr,
+                                             unsigned size)
+{
+    MemoryRegionPortioList *mrpio = opaque;
+
+    if (addr >= mrpio->local_byte_end ||
+        addr + size <= mrpio->local_byte_first) {
+        return NULL;
+    }
+    return mrpio->local_byte_lock;
+}
+
+static PortioByteLock *portio_lock_bytes(void *opaque, hwaddr addr,
+                                        unsigned size)
+{
+    PortioByteLock *lock = portio_local_split_lock(opaque, addr, size);
+
+    if (lock) {
+        qemu_rec_mutex_lock(lock);
+    }
+    return lock;
+}
+
+static uint64_t portio_read_local(void *opaque, hwaddr addr, unsigned size)
+{
+    g_autoptr(PortioByteLock) lock = portio_lock_bytes(opaque, addr, size);
+
+    return portio_read(opaque, addr, size);
+}
+
+static void portio_write_local(void *opaque, hwaddr addr, uint64_t data,
+                               unsigned size)
+{
+    g_autoptr(PortioByteLock) lock = portio_lock_bytes(opaque, addr, size);
+
+    portio_write(opaque, addr, data, size);
+}
+
+static const MemoryRegionOps portio_local_ops = {
+    .read = portio_read_local,
+    .write = portio_write_local,
+    .access_lockless = portio_local_access_lockless,
+    .mmio_split_lock = portio_local_split_lock,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.unaligned = true,
+    .impl.unaligned = true,
+};
+#endif
+
 static void portio_list_add_1(PortioList *piolist,
                               const MemoryRegionPortio *pio_init,
                               unsigned count, unsigned start,
                               unsigned off_low, unsigned off_high)
 {
+    const MemoryRegionOps *ops = &portio_ops;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool direct_read = false;
+    bool direct_write = false;
+#endif
     MemoryRegionPortioList *mrpio;
     Object *owner;
     char *name;
@@ -245,13 +394,41 @@ static void portio_list_add_1(PortioList *piolist,
     for (i = 0; i < count; ++i) {
         mrpio->ports[i].offset -= off_low;
         mrpio->ports[i].base = start + off_low;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        direct_read |= mrpio->ports[i].try_read != NULL;
+        direct_write |= mrpio->ports[i].try_write != NULL;
+#endif
     }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (piolist->local_byte_lock &&
+        piolist->local_byte_first < start + off_high &&
+        piolist->local_byte_end > start + off_low) {
+        unsigned base = start + off_low;
+
+        mrpio->local_byte_lock = piolist->local_byte_lock;
+        mrpio->local_byte_first = MAX(piolist->local_byte_first, base) - base;
+        mrpio->local_byte_end =
+            MIN(piolist->local_byte_end, start + off_high) - base;
+        ops = &portio_local_ops;
+    }
+#endif
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (piolist->local_registers && (direct_read || direct_write)) {
+        mrpio->direct_ops = g_new(MemoryRegionOps, 1);
+        *mrpio->direct_ops = *ops;
+        mrpio->direct_ops->try_read_lockless = direct_read ? portio_try_read : NULL;
+        mrpio->direct_ops->try_write_lockless = direct_write ? portio_try_write : NULL;
+        ops = mrpio->direct_ops;
+    }
+#endif
 
     /*
      * The MemoryRegion owner is the MemoryRegionPortioList since that manages
      * the lifecycle via the refcount
      */
-    memory_region_init_io(&mrpio->mr, OBJECT(mrpio), &portio_ops, mrpio,
+    memory_region_init_io(&mrpio->mr, OBJECT(mrpio), ops, mrpio,
                           piolist->name, off_high - off_low);
 
     /* Reparent the MemoryRegion to the piolist owner */
@@ -269,6 +446,11 @@ static void portio_list_add_1(PortioList *piolist,
     if (piolist->flush_coalesced_mmio) {
         memory_region_set_flush_coalesced(&mrpio->mr);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (piolist->device_lock) {
+        memory_region_set_device_lock(&mrpio->mr, piolist->device_lock);
+    }
+#endif
     memory_region_add_subregion(piolist->address_space,
                                 start + off_low, &mrpio->mr);
     piolist->regions[piolist->nr] = &mrpio->mr;
@@ -328,6 +510,9 @@ static void memory_region_portio_list_finalize(Object *obj)
     MemoryRegionPortioList *mrpio = MEMORY_REGION_PORTIO_LIST(obj);
 
     object_unref(&mrpio->mr);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_free(mrpio->direct_ops);
+#endif
     g_free(mrpio->ports);
 }
 

@@ -84,6 +84,9 @@ struct FWCfgState {
     uint64_t table_mr_size;
     uint64_t linker_mr_size;
     uint64_t rsdp_mr_size;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex device_lock;
+#endif
 };
 
 struct FWCfgIoState {

@@ -23,13 +23,21 @@
  */
 
 #include "qemu/osdep.h"
+#include "hw/i386/hpet-irq0.h"
 #include "hw/intc/i8259.h"
 #include "hw/irq.h"
 #include "hw/isa/isa.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "hw/isa/i8259_internal.h"
 #include "trace.h"
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
+#include "trace/trace-softmmu.h"
+#endif
 #include "qom/object.h"
 
 /* debug PIC */
@@ -106,13 +114,22 @@ static int pic_get_irq(PICCommonState *s)
 /* Update INT output. Must be called every time the output may have changed. */
 static void pic_update_irq(PICCommonState *s)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
     int irq;
 
     irq = pic_get_irq(s);
     if (irq >= 0) {
         trace_pic_update_irq(s->master, s->imr, s->irr, s->priority_add);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        s->int_out_level = true;
+#endif
         qemu_irq_raise(s->int_out[0]);
     } else {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        s->int_out_level = false;
+#endif
         qemu_irq_lower(s->int_out[0]);
     }
 }
@@ -121,9 +138,21 @@ static void pic_update_irq(PICCommonState *s)
 static void pic_set_irq(void *opaque, int irq, int level)
 {
     PICCommonState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+    bool unlocked = !qemu_mutex_iothread_locked();
+#endif
     int mask = 1 << irq;
     int irq_index = s->master ? irq : irq + 8;
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_begin();
+    } else
+#endif
+    {
+        hpet_irq0_revoke_route();
+    }
     trace_pic_set_irq(s->master, irq, level);
     pic_stat_update_irq(irq_index, level);
 
@@ -154,11 +183,27 @@ static void pic_set_irq(void *opaque, int irq, int level)
         }
     }
     pic_update_irq(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_end();
+    }
+#endif
 }
 
 /* acknowledge interrupt 'irq' */
 static void pic_intack(PICCommonState *s, int irq)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+    bool unlocked = !qemu_mutex_iothread_locked();
+
+    if (unlocked) {
+        hpet_irq0_external_begin();
+    } else
+#endif
+    {
+        hpet_irq0_revoke_route();
+    }
     if (s->auto_eoi) {
         if (s->rotate_on_auto_eoi) {
             s->priority_add = (irq + 1) & 7;
@@ -171,10 +216,18 @@ static void pic_intack(PICCommonState *s, int irq)
         s->irr &= ~(1 << irq);
     }
     pic_update_irq(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_end();
+    }
+#endif
 }
 
 int pic_read_irq(PICCommonState *s)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
     int irq, intno;
 
     irq = pic_get_irq(s);
@@ -222,6 +275,9 @@ static void pic_init_reset(PICCommonState *s)
 static void pic_reset(DeviceState *dev)
 {
     PICCommonState *s = PIC_COMMON(dev);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
 
     s->elcr = 0;
     s->ltim = 0;
@@ -232,10 +288,22 @@ static void pic_ioport_write(void *opaque, hwaddr addr64,
                              uint64_t val64, unsigned size)
 {
     PICCommonState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+    bool unlocked = !qemu_mutex_iothread_locked();
+#endif
     uint32_t addr = addr64;
     uint32_t val = val64;
     int priority, cmd, irq;
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_begin();
+    } else
+#endif
+    {
+        hpet_irq0_revoke_route();
+    }
     trace_pic_ioport_write(s->master, addr, val);
 
     if (addr == 0) {
@@ -319,12 +387,20 @@ static void pic_ioport_write(void *opaque, hwaddr addr64,
             break;
         }
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_end();
+    }
+#endif
 }
 
 static uint64_t pic_ioport_read(void *opaque, hwaddr addr,
                                 unsigned size)
 {
     PICCommonState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
     int ret;
 
     if (s->poll) {
@@ -353,6 +429,9 @@ static uint64_t pic_ioport_read(void *opaque, hwaddr addr,
 
 int pic_get_output(PICCommonState *s)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
     return (pic_get_irq(s) >= 0);
 }
 
@@ -360,13 +439,32 @@ static void elcr_ioport_write(void *opaque, hwaddr addr,
                               uint64_t val, unsigned size)
 {
     PICCommonState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+    bool unlocked = !qemu_mutex_iothread_locked();
+
+    if (unlocked) {
+        hpet_irq0_external_begin();
+    } else
+#endif
+    {
+        hpet_irq0_revoke_route();
+    }
     s->elcr = val & s->elcr_mask;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_end();
+    }
+#endif
 }
 
 static uint64_t elcr_ioport_read(void *opaque, hwaddr addr,
                                  unsigned size)
 {
     PICCommonState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(PICLocalLock) lock = pic_local_lock_begin(s);
+#endif
     return s->elcr;
 }
 
@@ -393,10 +491,23 @@ static void pic_realize(DeviceState *dev, Error **errp)
     PICCommonState *s = PIC_COMMON(dev);
     PICClass *pc = PIC_GET_CLASS(dev);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    s->local_pic = tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        (memory_region_device_lock_enabled() ||
+         lats_nobql_enabled());
+    s->int_out_level = false;
+#endif
     memory_region_init_io(&s->base_io, OBJECT(s), &pic_base_ioport_ops, s,
                           "pic", 2);
     memory_region_init_io(&s->elcr_io, OBJECT(s), &pic_elcr_ioport_ops, s,
                           "elcr", 1);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s->local_pic) {
+        memory_region_set_device_lock(&s->base_io, pic_shared_lock());
+        memory_region_set_device_lock(&s->elcr_io, pic_shared_lock());
+    }
+#endif
 
     qdev_init_gpio_out(dev, s->int_out, ARRAY_SIZE(s->int_out));
     qdev_init_gpio_in(dev, pic_set_irq, 8);

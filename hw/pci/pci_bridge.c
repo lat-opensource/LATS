@@ -384,7 +384,7 @@ void pci_bridge_initfn(PCIDevice *dev, const char *typename)
                        4 * GiB);
     pci_bridge_region_init(br);
     QLIST_INIT(&sec_bus->child);
-    QLIST_INSERT_HEAD(&parent->child, sec_bus, sibling);
+    pci_bus_add_child(parent, sec_bus);
 }
 
 /* default qdev clean up function for PCI-to-PCI bridge */
@@ -392,7 +392,7 @@ void pci_bridge_exitfn(PCIDevice *pci_dev)
 {
     PCIBridge *s = PCI_BRIDGE(pci_dev);
     assert(QLIST_EMPTY(&s->sec_bus.child));
-    QLIST_REMOVE(&s->sec_bus, sibling);
+    pci_bus_remove_child(pci_get_bus(pci_dev), &s->sec_bus);
     pci_bridge_region_del(s, &s->windows);
     pci_bridge_region_cleanup(s, &s->windows);
     /* object_unparent() is called automatically during device deletion */

@@ -769,8 +769,8 @@ VirtioStatus *qmp_x_query_virtio_status(const char *path, Error **errp)
 
     status->num_vqs = virtio_get_num_queues(vdev);
     status->status = qmp_decode_status(vdev->status);
-    status->isr = vdev->isr;
-    status->queue_sel = vdev->queue_sel;
+    status->isr = virtio_get_isr(vdev);
+    status->queue_sel = qatomic_read(&vdev->queue_sel);
     status->vm_running = vdev->vm_running;
     status->broken = vdev->broken;
     status->disabled = vdev->disabled;

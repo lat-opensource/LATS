@@ -20,6 +20,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
+#include "qemu/main-loop.h"
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
+#endif
 #include "hw/irq.h"
 #include "hw/acpi/acpi.h"
 #include "hw/nvram/fw_cfg.h"
@@ -32,6 +39,8 @@
 #include "qemu/module.h"
 #include "qemu/option.h"
 #include "sysemu/runstate.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
 
 struct acpi_table_header {
     uint16_t _length;         /* our length, not actual part of the hdr */
@@ -470,6 +479,9 @@ void acpi_pm1_evt_init(ACPIREGS *ar, acpi_update_sci_fn update_sci,
     ar->pm1.evt.update_sci = update_sci;
     memory_region_init_io(&ar->pm1.evt.io, memory_region_owner(parent),
                           &acpi_pm_evt_ops, ar, "acpi-evt", 4);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&ar->pm1.evt.io, acpi_regs_ensure_lock(ar));
+#endif
     memory_region_add_subregion(parent, 0, &ar->pm1.evt.io);
 }
 
@@ -541,6 +553,14 @@ void acpi_pm_tmr_init(ACPIREGS *ar, acpi_update_sci_fn update_sci,
     ar->tmr.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, acpi_pm_tmr_timer, ar);
     memory_region_init_io(&ar->tmr.io, memory_region_owner(parent),
                           &acpi_pm_tmr_ops, ar, "acpi-tmr", 4);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* With instruction counting off, the read uses the virtual clock's
+     * sequence counter. Writes are ignored and neither callback does DMA. */
+    if (!icount_enabled() && replay_mode == REPLAY_MODE_NONE) {
+        ar->tmr.io.disable_reentrancy_guard = true;
+        memory_region_disable_locking(&ar->tmr.io);
+    }
+#endif
     memory_region_add_subregion(parent, 8, &ar->tmr.io);
 }
 
@@ -585,6 +605,21 @@ static void acpi_pm_cnt_write(void *opaque, hwaddr addr, uint64_t val,
     if (val & ACPI_BITMASK_SLEEP_ENABLE) {
         /* change suspend type */
         uint16_t sus_typ = (val >> 10) & 7;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        bool bounced = false;
+        bool use_lifecycle = false;
+        if (!qemu_mutex_iothread_locked()) {
+            qemu_rec_mutex_unlock(&ar->local_lock);
+            if (lats_nobql_enabled()) {
+                qemu_vm_lifecycle_lock();
+                use_lifecycle = true;
+            } else {
+                qemu_mutex_lock_iothread();
+            }
+            qemu_rec_mutex_lock(&ar->local_lock);
+            bounced = true;
+        }
+#endif
         switch (sus_typ) {
         case 0: /* soft power off */
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
@@ -599,6 +634,17 @@ static void acpi_pm_cnt_write(void *opaque, hwaddr addr, uint64_t val,
             }
             break;
         }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (bounced) {
+            qemu_rec_mutex_unlock(&ar->local_lock);
+            if (use_lifecycle) {
+                qemu_vm_lifecycle_unlock();
+            } else {
+                qemu_mutex_unlock_iothread();
+            }
+            qemu_rec_mutex_lock(&ar->local_lock);
+        }
+#endif
     }
 }
 
@@ -629,6 +675,9 @@ void acpi_pm1_cnt_init(ACPIREGS *ar, MemoryRegion *parent,
 
     memory_region_init_io(&ar->pm1.cnt.io, memory_region_owner(parent),
                           &acpi_pm_cnt_ops, ar, "acpi-cnt", 2);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&ar->pm1.cnt.io, acpi_regs_ensure_lock(ar));
+#endif
     memory_region_add_subregion(parent, 4, &ar->pm1.cnt.io);
 
     fw_cfg = fw_cfg_find();
@@ -650,6 +699,28 @@ void acpi_pm1_cnt_reset(ACPIREGS *ar)
 }
 
 /* ACPI GPE */
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+typedef ACPIGPE AcpiGpeLocalLock;
+
+static inline AcpiGpeLocalLock *acpi_gpe_local_lock_begin(ACPIGPE *gpe)
+{
+    if (gpe->local_acpi) {
+        qemu_rec_mutex_lock(&gpe->local_lock);
+        return gpe;
+    }
+    return NULL;
+}
+
+static inline void acpi_gpe_local_lock_end(AcpiGpeLocalLock *gpe)
+{
+    if (gpe) {
+        qemu_rec_mutex_unlock(&gpe->local_lock);
+    }
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(AcpiGpeLocalLock, acpi_gpe_local_lock_end)
+#endif
+
 void acpi_gpe_init(ACPIREGS *ar, uint8_t len)
 {
     ar->gpe.len = len;
@@ -659,10 +730,19 @@ void acpi_gpe_init(ACPIREGS *ar, uint8_t len)
      */
     ar->gpe.sts = g_malloc0(len);
     ar->gpe.en = g_malloc0(len);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_init(&ar->gpe.local_lock);
+    ar->gpe.local_acpi = tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        lats_nobql_enabled();
+#endif
 }
 
 void acpi_gpe_reset(ACPIREGS *ar)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(AcpiGpeLocalLock) lock = acpi_gpe_local_lock_begin(&ar->gpe);
+#endif
     memset(ar->gpe.sts, 0, ar->gpe.len / 2);
     memset(ar->gpe.en, 0, ar->gpe.len / 2);
 }
@@ -684,6 +764,9 @@ static uint8_t *acpi_gpe_ioport_get_ptr(ACPIREGS *ar, uint32_t addr)
 
 void acpi_gpe_ioport_writeb(ACPIREGS *ar, uint32_t addr, uint32_t val)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(AcpiGpeLocalLock) lock = acpi_gpe_local_lock_begin(&ar->gpe);
+#endif
     uint8_t *cur;
 
     cur = acpi_gpe_ioport_get_ptr(ar, addr);
@@ -700,6 +783,9 @@ void acpi_gpe_ioport_writeb(ACPIREGS *ar, uint32_t addr, uint32_t val)
 
 uint32_t acpi_gpe_ioport_readb(ACPIREGS *ar, uint32_t addr)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(AcpiGpeLocalLock) lock = acpi_gpe_local_lock_begin(&ar->gpe);
+#endif
     uint8_t *cur;
     uint32_t val;
 
@@ -715,12 +801,18 @@ uint32_t acpi_gpe_ioport_readb(ACPIREGS *ar, uint32_t addr)
 void acpi_send_gpe_event(ACPIREGS *ar, qemu_irq irq,
                          AcpiEventStatusBits status)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(AcpiGpeLocalLock) lock = acpi_gpe_local_lock_begin(&ar->gpe);
+#endif
     ar->gpe.sts[0] |= status;
     acpi_update_sci(ar, irq);
 }
 
 void acpi_update_sci(ACPIREGS *regs, qemu_irq irq)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(AcpiGpeLocalLock) lock = acpi_gpe_local_lock_begin(&regs->gpe);
+#endif
     int sci_level, pm1a_sts;
 
     pm1a_sts = acpi_pm1_evt_get_sts(regs);

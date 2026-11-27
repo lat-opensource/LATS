@@ -1,9 +1,16 @@
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "migration/vmstate.h"
 #include "hw/acpi/cpu.h"
 #include "qapi/error.h"
 #include "qapi/qapi-events-acpi.h"
 #include "trace.h"
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
+#include "trace/trace-softmmu.h"
+#endif
 #include "sysemu/numa.h"
 
 #define ACPI_CPU_HOTPLUG_REG_LEN 12
@@ -40,8 +47,33 @@ static ACPIOSTInfo *acpi_cpu_device_status(int idx, AcpiCpuStatus *cdev)
     return info;
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+typedef CPUHotplugState CpuHpLocalLock;
+
+static inline CpuHpLocalLock *cpuhp_local_lock_begin(CPUHotplugState *s)
+{
+    if (s->local_acpi) {
+        qemu_rec_mutex_lock(&s->local_lock);
+        return s;
+    }
+    return NULL;
+}
+
+static inline void cpuhp_local_lock_end(CpuHpLocalLock *s)
+{
+    if (s) {
+        qemu_rec_mutex_unlock(&s->local_lock);
+    }
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(CpuHpLocalLock, cpuhp_local_lock_end)
+#endif
+
 void acpi_cpu_ospm_status(CPUHotplugState *cpu_st, ACPIOSTInfoList ***list)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(CpuHpLocalLock) lock = cpuhp_local_lock_begin(cpu_st);
+#endif
     ACPIOSTInfoList ***tail = list;
     int i;
 
@@ -54,6 +86,9 @@ static uint64_t cpu_hotplug_rd(void *opaque, hwaddr addr, unsigned size)
 {
     uint64_t val = 0;
     CPUHotplugState *cpu_st = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(CpuHpLocalLock) lock = cpuhp_local_lock_begin(cpu_st);
+#endif
     AcpiCpuStatus *cdev;
 
     if (cpu_st->selector >= cpu_st->dev_count) {
@@ -105,6 +140,9 @@ static void cpu_hotplug_wr(void *opaque, hwaddr addr, uint64_t data,
                            unsigned int size)
 {
     CPUHotplugState *cpu_st = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(CpuHpLocalLock) lock = cpuhp_local_lock_begin(cpu_st);
+#endif
     AcpiCpuStatus *cdev;
     ACPIOSTInfo *info;
 
@@ -202,9 +240,154 @@ static void cpu_hotplug_wr(void *opaque, hwaddr addr, uint64_t data,
     }
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool cpu_hotplug_try_read_lockless(void *opaque, hwaddr addr, MemOp op,
+                                          MemTxAttrs attrs, uint64_t *value)
+{
+    CPUHotplugState *cpu_st = opaque;
+    unsigned size = memop_size(op);
+    AcpiCpuStatus *cdev;
+    uint64_t val = 0;
+
+    if (!cpu_st->local_acpi || attrs.memory || size < 1 || size > 4 ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_READ_FLAGS) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_READ_CMD_DATA) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_READ_CMD_DATA2) ||
+        trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+        return false;
+    }
+
+    qemu_rec_mutex_lock(&cpu_st->local_lock);
+    if (cpu_st->selector < cpu_st->dev_count) {
+        cdev = &cpu_st->devs[cpu_st->selector];
+        switch (addr) {
+        case ACPI_CPU_FLAGS_OFFSET_RW:
+            val |= cdev->cpu ? 1 : 0;
+            val |= cdev->is_inserting ? 2 : 0;
+            val |= cdev->is_removing ? 4 : 0;
+            val |= cdev->fw_remove ? 16 : 0;
+            break;
+        case ACPI_CPU_CMD_DATA_OFFSET_RW:
+            switch (cpu_st->command) {
+            case CPHP_GET_NEXT_CPU_WITH_EVENT_CMD:
+                val = cpu_st->selector;
+                break;
+            case CPHP_GET_CPU_ID_CMD:
+                val = cdev->arch_id & 0xFFFFFFFF;
+                break;
+            default:
+                break;
+            }
+            break;
+        case ACPI_CPU_CMD_DATA2_OFFSET_R:
+            switch (cpu_st->command) {
+            case CPHP_GET_NEXT_CPU_WITH_EVENT_CMD:
+                val = 0;
+                break;
+            case CPHP_GET_CPU_ID_CMD:
+                val = cdev->arch_id >> 32;
+                break;
+            default:
+                break;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    qemu_rec_mutex_unlock(&cpu_st->local_lock);
+    *value = val;
+    return true;
+}
+
+static bool cpu_hotplug_try_write_lockless(void *opaque, hwaddr addr,
+                                           unsigned size, uint64_t data)
+{
+    CPUHotplugState *cpu_st = opaque;
+    AcpiCpuStatus *cdev;
+    bool handled = true;
+
+    if (!cpu_st->local_acpi || size < 1 || size > 4 ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_INVALID_IDX_SELECTED) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_WRITE_IDX) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_CLEAR_INSERTING_EVT) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_CLEAR_REMOVE_EVT) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_WRITE_CMD) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_CPU_HAS_EVENTS) ||
+        trace_event_get_state_backends(TRACE_CPUHP_ACPI_WRITE_OST_EV)) {
+        return false;
+    }
+
+    qemu_rec_mutex_lock(&cpu_st->local_lock);
+    if (!cpu_st->dev_count) {
+        qemu_rec_mutex_unlock(&cpu_st->local_lock);
+        return false;
+    }
+    if (addr && cpu_st->selector >= cpu_st->dev_count) {
+        qemu_rec_mutex_unlock(&cpu_st->local_lock);
+        return true;
+    }
+
+    switch (addr) {
+    case ACPI_CPU_SELECTOR_OFFSET_WR:
+        cpu_st->selector = data;
+        break;
+    case ACPI_CPU_FLAGS_OFFSET_RW:
+        cdev = &cpu_st->devs[cpu_st->selector];
+        if (data & 2) {
+            cdev->is_inserting = false;
+        } else if (data & 4) {
+            cdev->is_removing = false;
+        } else if (data & (8 | 16)) {
+            handled = false;
+        }
+        break;
+    case ACPI_CPU_CMD_OFFSET_WR:
+        if (data < CPHP_CMD_MAX) {
+            cpu_st->command = data;
+            if (cpu_st->command == CPHP_GET_NEXT_CPU_WITH_EVENT_CMD) {
+                uint32_t iter = cpu_st->selector;
+
+                do {
+                    cdev = &cpu_st->devs[iter];
+                    if (cdev->is_inserting || cdev->is_removing ||
+                        cdev->fw_remove) {
+                        cpu_st->selector = iter;
+                        break;
+                    }
+                    iter = iter + 1 < cpu_st->dev_count ? iter + 1 : 0;
+                } while (iter != cpu_st->selector);
+            }
+        }
+        break;
+    case ACPI_CPU_CMD_DATA_OFFSET_RW:
+        switch (cpu_st->command) {
+        case CPHP_OST_EVENT_CMD:
+            cdev = &cpu_st->devs[cpu_st->selector];
+            cdev->ost_event = data;
+            break;
+        case CPHP_OST_STATUS_CMD:
+            handled = false;
+            break;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    qemu_rec_mutex_unlock(&cpu_st->local_lock);
+    return handled;
+}
+#endif
+
 static const MemoryRegionOps cpu_hotplug_ops = {
     .read = cpu_hotplug_rd,
     .write = cpu_hotplug_wr,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .try_read_lockless = cpu_hotplug_try_read_lockless,
+    .try_write_lockless = cpu_hotplug_try_write_lockless,
+#endif
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,
@@ -220,6 +403,12 @@ void cpu_hotplug_hw_init(MemoryRegion *as, Object *owner,
     const CPUArchIdList *id_list;
     int i;
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_init(&state->local_lock);
+    state->local_acpi = tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        lats_nobql_enabled();
+#endif
     assert(mc->possible_cpu_arch_ids);
     id_list = mc->possible_cpu_arch_ids(machine);
     state->dev_count = id_list->len;
@@ -250,6 +439,9 @@ static AcpiCpuStatus *get_cpu_status(CPUHotplugState *cpu_st, DeviceState *dev)
 void acpi_cpu_plug_cb(HotplugHandler *hotplug_dev,
                       CPUHotplugState *cpu_st, DeviceState *dev, Error **errp)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(CpuHpLocalLock) lock = cpuhp_local_lock_begin(cpu_st);
+#endif
     AcpiCpuStatus *cdev;
 
     cdev = get_cpu_status(cpu_st, dev);
@@ -268,6 +460,9 @@ void acpi_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
                                 CPUHotplugState *cpu_st,
                                 DeviceState *dev, Error **errp)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(CpuHpLocalLock) lock = cpuhp_local_lock_begin(cpu_st);
+#endif
     AcpiCpuStatus *cdev;
 
     cdev = get_cpu_status(cpu_st, dev);
@@ -282,6 +477,9 @@ void acpi_cpu_unplug_request_cb(HotplugHandler *hotplug_dev,
 void acpi_cpu_unplug_cb(CPUHotplugState *cpu_st,
                         DeviceState *dev, Error **errp)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(CpuHpLocalLock) lock = cpuhp_local_lock_begin(cpu_st);
+#endif
     AcpiCpuStatus *cdev;
 
     cdev = get_cpu_status(cpu_st, dev);

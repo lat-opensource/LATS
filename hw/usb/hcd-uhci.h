@@ -55,6 +55,7 @@ typedef struct UHCIState {
     uint8_t status2; /* bit 0 and 1 are used to generate UHCI_STS_USBINT */
     int64_t expire_time;
     QEMUTimer *frame_timer;
+    struct UHCIIdle *idle;
     QEMUBH *bh;
     uint32_t frame_bytes;
     uint32_t frame_bandwidth;

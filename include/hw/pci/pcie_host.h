@@ -47,6 +47,9 @@ struct PCIExpressHost {
 
     /* MMCONFIG mmio area */
     MemoryRegion mmio;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool mmcfg_empty_read;
+#endif
 };
 
 void pcie_host_mmcfg_unmap(PCIExpressHost *e);

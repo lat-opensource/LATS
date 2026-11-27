@@ -21,9 +21,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "hw/isa/apm.h"
 #include "hw/pci/pci.h"
 #include "migration/vmstate.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
 #include "trace.h"
 
 
@@ -38,7 +42,7 @@ static void apm_ioport_writeb(void *opaque, hwaddr addr, uint64_t val,
 
     trace_apm_io_write(addr, val);
     if (addr == 0) {
-        apm->apmc = val;
+        qatomic_set(&apm->apmc, val);
 
         if (apm->callback) {
             (apm->callback)(val, apm->arg);
@@ -55,7 +59,7 @@ static uint64_t apm_ioport_readb(void *opaque, hwaddr addr, unsigned size)
 
     addr &= 1;
     if (addr == 0) {
-        val = apm->apmc;
+        val = qatomic_read(&apm->apmc);
     } else {
         val = apm->apms;
     }
@@ -91,7 +95,11 @@ void apm_init(PCIDevice *dev, APMState *apm, apm_ctrl_changed_t callback,
     apm->arg = arg;
 
     /* ioport 0xb2, 0xb3 */
+    qemu_rec_mutex_init(&apm->local_lock);
     memory_region_init_io(&apm->io, OBJECT(dev), &apm_ops, apm, "apm-io", 2);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&apm->io, &apm->local_lock);
+#endif
     memory_region_add_subregion(pci_address_space_io(dev), APM_CNT_IOPORT,
                                 &apm->io);
 }

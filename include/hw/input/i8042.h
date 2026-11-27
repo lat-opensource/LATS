@@ -11,6 +11,7 @@
 #include "hw/isa/isa.h"
 #include "hw/sysbus.h"
 #include "hw/input/ps2.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 
 #define I8042_KBD_IRQ      0
@@ -19,6 +20,10 @@
 typedef struct KBDState {
     uint8_t write_cmd; /* if non zero, write data to port 60 is expected */
     uint8_t status;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool mr_device_lock;
+    QemuRecMutex status_lock;
+#endif
     uint8_t mode;
     uint8_t outport;
     uint32_t migration_flags;

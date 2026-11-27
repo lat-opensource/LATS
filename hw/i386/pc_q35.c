@@ -29,6 +29,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qemu/units.h"
 #include "hw/char/parallel-isa.h"
 #include "hw/loader.h"
@@ -51,6 +52,7 @@
 #include "hw/southbridge/ich9.h"
 #include "hw/usb.h"
 #include "hw/usb/hcd-uhci.h"
+#include "hw/i386/hpet-irq0.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "sysemu/numa.h"
@@ -140,6 +142,10 @@ static void pc_q35_init(MachineState *machine)
     bool acpi_pcihp;
     bool keep_pci_slot_hpc;
     uint64_t pci_hole64_size = 0;
+
+    if (lats_nobql_enabled()) {
+        x86_hpet_irq0_enable();
+    }
 
     /* Check whether RAM fits below 4G (leaving 1/2 GByte for IO memory
      * and 256 Mbytes for PCI Express Enhanced Configuration Access Mapping

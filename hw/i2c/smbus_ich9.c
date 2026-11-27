@@ -118,6 +118,21 @@ static void build_ich9_smb_aml(AcpiDevAmlIf *adev, Aml *scope)
     qbus_build_aml(bus, scope);
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool ich9_smbus_try_topo_write_config(PCIDevice *d, uint32_t address,
+                                             uint32_t val, int len)
+{
+    if (range_covers_byte(address, len, ICH9_SMB_HOSTC)) {
+        uint8_t byte = (val >> ((ICH9_SMB_HOSTC - address) * 8)) & 0xff;
+        if (byte & ICH9_SMB_HOSTC_SSRESET) {
+            return false;
+        }
+    }
+    ich9_smbus_write_config(d, address, val, len);
+    return true;
+}
+#endif
+
 static void ich9_smb_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -132,6 +147,11 @@ static void ich9_smb_class_init(ObjectClass *klass, void *data)
     dc->desc = "ICH9 SMBUS Bridge";
     k->realize = ich9_smbus_realize;
     k->config_write = ich9_smbus_write_config;
+    k->plain_config_header = true;
+    k->plain_config_space = true;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    k->try_topo_write_config = ich9_smbus_try_topo_write_config;
+#endif
     /*
      * Reason: part of ICH9 southbridge, needs to be wired up by
      * pc_q35_init()

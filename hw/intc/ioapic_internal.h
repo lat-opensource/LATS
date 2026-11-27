@@ -26,6 +26,7 @@
 #include "hw/intc/ioapic.h"
 #include "hw/sysbus.h"
 #include "qemu/notify.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 
 #define MAX_IOAPICS                     2
@@ -109,7 +110,41 @@ struct IOAPICCommonState {
     int irq_level[IOAPIC_NUM_PINS];
     int irq_eoi[IOAPIC_NUM_PINS];
     QEMUTimer *delayed_ioapic_service_timer;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool local_ioapic;
+    QemuRecMutex local_lock;
+#endif
 };
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#include "qemu/lockdep-lite.h"
+#endif
+
+typedef IOAPICCommonState IOAPICLocalLock;
+
+static inline IOAPICLocalLock *ioapic_local_lock_begin(IOAPICCommonState *s)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s && s->local_ioapic) {
+        lats_lockdep_acquire(&s->local_lock, LOCK_RANK_INTC,
+                             "ioapic->local_lock");
+        qemu_rec_mutex_lock(&s->local_lock);
+        return s;
+    }
+#endif
+    return NULL;
+}
+
+static inline void ioapic_local_lock_end(IOAPICLocalLock *s)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s) {
+        qemu_rec_mutex_unlock(&s->local_lock);
+    }
+#endif
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(IOAPICLocalLock, ioapic_local_lock_end)
 
 void ioapic_reset_common(DeviceState *dev);
 

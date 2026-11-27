@@ -20,9 +20,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/memory.h"
 #include "hw/pci/pci_device.h"
+#include "hw/pci/pci_bus.h"
 #include "hw/pci/pcie_host.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "sysemu/tcg.h"
 
 /* a helper function to get a PCIDevice for a given mmconfig address */
 static inline PCIDevice *pcie_dev_find_by_mmcfg_addr(PCIBus *s,
@@ -67,10 +71,93 @@ static uint64_t pcie_mmcfg_data_read(void *opaque,
     return pci_host_config_read_common(pci_dev, addr, limit, len);
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool pcie_mmcfg_try_write(void *opaque, hwaddr addr, unsigned size,
+                                 uint64_t value)
+{
+    PCIExpressHost *e = opaque;
+    PCIBus *bus = e->pci.bus;
+
+    if (!bus || addr >= PCIE_MMCFG_SIZE_MAX || PCIE_MMCFG_BUS(addr)) {
+        return false;
+    }
+    if (size == 1 && PCIE_MMCFG_CONFOFFSET(addr) == PCI_INTERRUPT_LINE) {
+        return pci_config_try_interrupt_line_write(bus, PCIE_MMCFG_DEVFN(addr),
+                                                   value);
+    }
+    if (size == 4 &&
+        pci_config_try_unused_bar_write(bus, PCIE_MMCFG_DEVFN(addr),
+                                        PCIE_MMCFG_CONFOFFSET(addr), NULL, 0)) {
+        return true;
+    }
+    if (pci_config_try_local_write(bus, PCIE_MMCFG_DEVFN(addr),
+                                   PCIE_MMCFG_CONFOFFSET(addr), size, value)) {
+        return true;
+    }
+    if (lats_nobql_enabled()) {
+        qemu_memory_topology_lock();
+        pcie_mmcfg_data_write(opaque, addr, value, size);
+        qemu_memory_topology_unlock();
+        return true;
+    }
+    return false;
+}
+
+static bool pcie_mmcfg_try_read(void *opaque, hwaddr addr, MemOp op,
+                                      MemTxAttrs attrs, uint64_t *value)
+{
+    PCIExpressHost *e = opaque;
+    PCIBus *bus = e->pci.bus;
+    unsigned size = memop_size(op);
+    unsigned seq;
+    bool absent;
+
+    if (!bus || (!e->mmcfg_empty_read && !bus->config_read_slots) ||
+        !tcg_enabled() || size > 4 ||
+        addr >= PCIE_MMCFG_SIZE_MAX || (addr & (size - 1))) {
+        return false;
+    }
+
+    if (PCIE_MMCFG_BUS(addr) == 0 &&
+        pci_config_read_slot_try(bus, PCIE_MMCFG_DEVFN(addr),
+                                 PCIE_MMCFG_CONFOFFSET(addr), size, value,
+                                 NULL, 0)) {
+        return true;
+    }
+    if (!e->mmcfg_empty_read) {
+        return false;
+    }
+
+    /* q35's root is bus 0. Never dereference an unlocked device or bridge. */
+    seq = seqlock_read_begin(&bus->config_topology);
+    if (PCIE_MMCFG_BUS(addr) == 0) {
+        absent = !qatomic_read(&bus->devices[PCIE_MMCFG_DEVFN(addr)]);
+    } else {
+        absent = !qatomic_read(&bus->child.lh_first);
+    }
+    if (!absent || seqlock_read_retry(&bus->config_topology, seq)) {
+        if (lats_nobql_enabled()) {
+            qemu_memory_topology_lock();
+            *value = pcie_mmcfg_data_read(opaque, addr, size);
+            qemu_memory_topology_unlock();
+            return true;
+        }
+        return false;
+    }
+
+    *value = UINT64_MAX;
+    return true;
+}
+#endif
+
 static const MemoryRegionOps pcie_mmcfg_ops = {
     .read = pcie_mmcfg_data_read,
     .write = pcie_mmcfg_data_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .try_read_lockless = pcie_mmcfg_try_read,
+    .try_write_lockless = pcie_mmcfg_try_write,
+#endif
 };
 
 static void pcie_host_init(Object *obj)

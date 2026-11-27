@@ -16,8 +16,16 @@
  */
 
 #include "qemu/osdep.h"
+#include "sysemu/runstate.h"
+#include "sysemu/cpu-timers.h"
+#include "exec/irq-commit.h"
+#include "sysemu/tcg.h"
+#ifdef CONFIG_LINUX
+#include "qemu/futex.h"
+#endif
 
 #include "exec/memop.h"
+#include "exec/address-spaces.h"
 #include "standard-headers/linux/virtio_pci.h"
 #include "standard-headers/linux/virtio_ids.h"
 #include "hw/boards.h"
@@ -42,6 +50,7 @@
 #include "qapi/visitor.h"
 #include "sysemu/replay.h"
 #include "trace.h"
+#include "trace/trace-softmmu.h"
 
 #define VIRTIO_PCI_REGION_SIZE(dev)     VIRTIO_PCI_CONFIG_OFF(msix_present(dev))
 
@@ -51,9 +60,103 @@
  * configuration space */
 #define VIRTIO_PCI_CONFIG_SIZE(dev)     VIRTIO_PCI_CONFIG_OFF(msix_enabled(dev))
 
+/* The low byte of the same atomic word holds the VirtIO ISR. */
+#define VIRTIO_PCI_ISR_INTX_LOW 0x100UL
+#define VIRTIO_PCI_ISR_ASYNC_INTX 0x200UL
+#define VIRTIO_PCI_ISR_PRESENT 0x400UL
+
 static void virtio_pci_bus_new(VirtioBusState *bus, size_t bus_size,
                                VirtIOPCIProxy *dev);
 static void virtio_pci_reset(DeviceState *qdev);
+
+/* BQL handlers can call other devices while the queue staging is paused. */
+typedef VirtIOPCIProxy VirtIOPCIQueueConfigPause;
+
+static void virtio_pci_update_queue_config_device(VirtIOPCIProxy *proxy,
+                                                  VirtIODevice *vdev)
+{
+    /* Drain IOThread writes before saving the live and staged queue state. */
+    QEMU_LOCK_GUARD(&proxy->queue_config_lock);
+    qatomic_set(&proxy->queue_config_device,
+                vdev && vdev->vm_running ? vdev : NULL);
+}
+
+static VirtIOPCIQueueConfigPause *
+virtio_pci_pause_queue_config(VirtIOPCIProxy *p)
+{
+    if (!qatomic_read(&p->queue_config_device)) {
+        return NULL;
+    }
+
+    QEMU_LOCK_GUARD(&p->queue_config_lock);
+    ++p->queue_config_paused;
+    return p;
+}
+
+static void virtio_pci_resume_queue_config(VirtIOPCIQueueConfigPause *p)
+{
+    QEMU_LOCK_GUARD(&p->queue_config_lock);
+    --p->queue_config_paused;
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(VirtIOPCIQueueConfigPause,
+                              virtio_pci_resume_queue_config)
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static void virtio_pci_queue_config_map_begin(MemoryListener *listener)
+{
+    VirtIOPCIProxy *proxy = container_of(listener, VirtIOPCIProxy,
+                                         queue_config_listener);
+
+    QEMU_LOCK_GUARD(&proxy->queue_config_lock);
+    ++proxy->queue_config_paused;
+}
+
+static void virtio_pci_queue_config_map_end(MemoryListener *listener)
+{
+    VirtIOPCIProxy *proxy = container_of(listener, VirtIOPCIProxy,
+                                         queue_config_listener);
+
+    QEMU_LOCK_GUARD(&proxy->queue_config_lock);
+    --proxy->queue_config_paused;
+}
+
+static void virtio_pci_queue_trace_enabled(Notifier *notifier, void *event)
+{
+    VirtIOPCIProxy *proxy = container_of(notifier, VirtIOPCIProxy,
+                                         queue_trace_enabled);
+
+    if (event == &_TRACE_MEMORY_REGION_OPS_WRITE_EVENT ||
+        event == &_TRACE_MEMORY_REGION_OPS_READ_EVENT) {
+        /* Complete accesses that already observed tracing disabled. */
+        qemu_mutex_lock(&proxy->queue_config_lock);
+        qemu_mutex_unlock(&proxy->queue_config_lock);
+    }
+}
+
+static bool virtio_pci_pause_split_queue_config(void *opaque, hwaddr addr,
+                                                unsigned size)
+{
+    VirtIOPCIProxy *proxy = opaque;
+
+    /*
+     * The common and legacy BARs have no per-address access filter. Pieces
+     * can dispatch under the BQL without a CPU transaction failure.
+     */
+    if (!qatomic_read(&proxy->queue_config_device) ||
+        addr >= proxy->common.size || size > proxy->common.size - addr ||
+        DEVICE(proxy)->mem_reentrancy_guard.engaged_in_io) {
+        return false;
+    }
+
+    return virtio_pci_pause_queue_config(proxy) != NULL;
+}
+
+static void virtio_pci_resume_split_queue_config(void *opaque)
+{
+    virtio_pci_resume_queue_config(opaque);
+}
+#endif
 
 /* virtio device */
 /* DeviceState to VirtIOPCIProxy. For use off data-path. TODO: use QOM. */
@@ -70,6 +173,304 @@ static inline VirtIOPCIProxy *to_virtio_pci_proxy_fast(DeviceState *d)
     return container_of(d, VirtIOPCIProxy, pci_dev.qdev);
 }
 
+/*
+ * Keep the ISR in the same word as the route version. A successful edge
+ * commits the ISR and APIC together. Config writers revoke the old version
+ * before touching PCI, VirtIO, or the address map.
+ */
+#define VIRTIO_PCI_DIRECT_IRQ UINT64_C(0x800)
+#define VIRTIO_PCI_ROUTE_SHIFT 13
+#define VIRTIO_PCI_ROUTE_MASK (IRQ_COMMIT_PAYLOAD & ~UINT64_C(0x1fff))
+
+typedef struct VirtIOPCIDirectRoutes {
+    struct rcu_head rcu;
+    uint64_t version;
+    unsigned queues;
+    struct {
+        MSIMessage msi;
+        bool valid;
+        bool no_vector;
+    } entries[];
+} VirtIOPCIDirectRoutes;
+
+static void virtio_pci_irq_routes_begin(VirtIOPCIProxy *proxy)
+{
+    if (!proxy->direct_irq_enabled) {
+        return;
+    }
+    if (proxy->direct_irq_depth++ == 0) {
+        irq_commit_source_update(&proxy->bus.interrupt_state,
+                                 VIRTIO_PCI_DIRECT_IRQ, 0);
+    }
+}
+
+static void virtio_pci_irq_routes_end(VirtIOPCIProxy *proxy)
+{
+    VirtIOPCIDirectRoutes *old, *routes = NULL;
+    PCIDevice *dev = &proxy->pci_dev;
+    VirtIODevice *vdev = proxy->fast_notify_device;
+    unsigned queues = proxy->fast_notify_queues;
+    uint64_t enabled = 0;
+
+    if (!proxy->direct_irq_enabled) {
+        return;
+    }
+    g_assert(proxy->direct_irq_depth);
+    if (--proxy->direct_irq_depth) {
+        return;
+    }
+
+    if (proxy->direct_irq_device != VIRTIO_ID_SCSI) {
+        /* Completion routing is independent of guest kick delivery. */
+        vdev = virtio_bus_get_device(&proxy->bus);
+        queues = vdev ? virtio_get_num_queues(vdev) : 0;
+    }
+    ++proxy->direct_irq_version;
+    g_assert(proxy->direct_irq_version < (VIRTIO_PCI_ROUTE_MASK >>
+                                          VIRTIO_PCI_ROUTE_SHIFT));
+    if (vdev && queues && !proxy->guest_reset_pending && !vdev->disabled &&
+        (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) &&
+        dev->has_power &&
+        (pci_get_word(dev->config + PCI_COMMAND) & PCI_COMMAND_MASTER) &&
+        msix_enabled(dev)) {
+        routes = g_malloc0(sizeof(*routes) + queues * sizeof(routes->entries[0]));
+        routes->version = proxy->direct_irq_version;
+        routes->queues = queues;
+        for (unsigned i = 0; i < queues; i++) {
+            unsigned vector = virtio_queue_vector(vdev, i);
+
+            routes->entries[i].no_vector = vector == VIRTIO_NO_VECTOR;
+            if (vector < dev->msix_entries_nr && dev->msix_entry_used[vector] &&
+                !msix_is_masked(dev, vector)) {
+                routes->entries[i].msi = msix_get_message(dev, vector);
+                routes->entries[i].valid = true;
+            }
+        }
+        enabled = VIRTIO_PCI_DIRECT_IRQ;
+    }
+
+    old = proxy->direct_irq_routes;
+    qatomic_rcu_set(&proxy->direct_irq_routes, routes);
+    irq_commit_source_update(&proxy->bus.interrupt_state,
+                             VIRTIO_PCI_ROUTE_MASK | VIRTIO_PCI_DIRECT_IRQ,
+                             enabled | (proxy->direct_irq_version <<
+                                        VIRTIO_PCI_ROUTE_SHIFT));
+    if (old) {
+        g_free_rcu(old, rcu);
+    }
+}
+
+static void virtio_pci_irq_route_change(PCIDevice *dev, bool before)
+{
+    VirtIOPCIProxy *proxy = VIRTIO_PCI(dev);
+
+    VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    if (before) {
+        qemu_mutex_lock(&proxy->queue_config_lock);
+        ++proxy->queue_config_paused;
+        qemu_mutex_unlock(&proxy->queue_config_lock);
+        if (vdev && vdev->flush_output_irqs) {
+            qemu_rec_mutex_lock(vdev->network_mutex);
+            vdev->flush_output_irqs(vdev);
+        }
+        virtio_pci_irq_routes_begin(proxy);
+    } else {
+        virtio_pci_irq_routes_end(proxy);
+        if (vdev && vdev->flush_output_irqs) {
+            qemu_rec_mutex_unlock(vdev->network_mutex);
+        }
+        qemu_mutex_lock(&proxy->queue_config_lock);
+        --proxy->queue_config_paused;
+        qemu_mutex_unlock(&proxy->queue_config_lock);
+    }
+}
+
+typedef VirtIOPCIProxy VirtIOPCIIRQRouteGuard;
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(VirtIOPCIIRQRouteGuard, virtio_pci_irq_routes_end)
+
+static VirtIOPCIIRQRouteGuard *virtio_pci_guard_irq_routes(VirtIOPCIProxy *proxy)
+{
+    if (!proxy->direct_irq_enabled) {
+        return NULL;
+    }
+    virtio_pci_irq_routes_begin(proxy);
+    return proxy;
+}
+
+static void virtio_pci_irq_map_begin(MemoryListener *listener)
+{
+    VirtIOPCIProxy *proxy = container_of(listener, VirtIOPCIProxy,
+                                        direct_irq_listener);
+
+    virtio_pci_irq_routes_begin(proxy);
+}
+
+static void virtio_pci_irq_map_end(MemoryListener *listener)
+{
+    VirtIOPCIProxy *proxy = container_of(listener, VirtIOPCIProxy,
+                                        direct_irq_listener);
+
+    virtio_pci_irq_routes_end(proxy);
+}
+
+static uint64_t trial_scsi_offers, trial_scsi_direct;
+static bool trial_scsi_disable_direct;
+static uint64_t trial_net_offers, trial_net_direct;
+
+void trial_scsi_enable_notifier_counts(void);
+uint64_t trial_scsi_notifier_count(void);
+void trial_exclusive_work_counts(const char *phase) __attribute__((weak));
+bool apic_msi_commit_configured(void) __attribute__((weak));
+
+static void trial_scsi_counts(const char *phase)
+{
+    if (trial_exclusive_work_counts) {
+        trial_exclusive_work_counts(phase);
+    }
+    fprintf(stderr, "SCSI_ATOMIC %s offered=%" PRIu64
+                    " direct=%" PRIu64 " notifier=%" PRIu64 "\n",
+            phase, qatomic_read(&trial_scsi_offers),
+            qatomic_read(&trial_scsi_direct), trial_scsi_notifier_count());
+}
+
+static void trial_scsi_vmstate(void *opaque, bool running, RunState state)
+{
+    if (!running && state == RUN_STATE_PAUSED) {
+        trial_scsi_counts("menu");
+    }
+}
+
+static void trial_scsi_exit(void)
+{
+    trial_scsi_counts("exit");
+}
+
+static void trial_net_irq_counts(const char *phase)
+{
+    fprintf(stderr, "NET_ATOMIC %s offered=%" PRIu64 " direct=%" PRIu64 "\n",
+            phase, qatomic_read(&trial_net_offers),
+            qatomic_read(&trial_net_direct));
+}
+
+static void trial_net_irq_vmstate(void *opaque, bool running, RunState state)
+{
+    if (!running && state == RUN_STATE_PAUSED) {
+        trial_net_irq_counts("pause");
+    }
+}
+
+static void trial_net_irq_exit(void)
+{
+    trial_net_irq_counts("exit");
+}
+
+static VirtIOPCIDirectRoutes *virtio_pci_queue_routes(VirtIOPCIProxy *proxy,
+                                                      unsigned queue, uint64_t state)
+{
+    if (!(state & VIRTIO_PCI_DIRECT_IRQ) || (state & VIRTIO_ISR_BROKEN)) {
+        return NULL;
+    }
+    VirtIOPCIDirectRoutes *routes = qatomic_rcu_read(&proxy->direct_irq_routes);
+    return routes && (state >> VIRTIO_PCI_ROUTE_SHIFT) == routes->version &&
+           queue < routes->queues ? routes : NULL;
+}
+
+static bool virtio_pci_queue_irq_ready(DeviceState *dev, unsigned queue)
+{
+    VirtIOPCIProxy *proxy = to_virtio_pci_proxy_fast(dev);
+    RCU_READ_LOCK_GUARD();
+    uint64_t state = irq_commit_source_read(&proxy->bus.interrupt_state);
+    VirtIOPCIDirectRoutes *routes = virtio_pci_queue_routes(proxy, queue, state);
+    return routes && (routes->entries[queue].valid || routes->entries[queue].no_vector);
+}
+
+static bool virtio_pci_try_queue_irq(DeviceState *d, unsigned queue)
+{
+    VirtIOPCIProxy *proxy = to_virtio_pci_proxy_fast(d);
+    uint64_t *source = &proxy->bus.interrupt_state;
+    VirtIOPCIDirectRoutes *routes;
+    uint64_t state;
+    MSIMessage msi;
+
+    if (!qatomic_load_acquire(&proxy->direct_irq_enabled)) {
+        return false;
+    }
+    RCU_READ_LOCK_GUARD();
+    if (proxy->direct_irq_device == VIRTIO_ID_NET) {
+        qatomic_inc(&trial_net_offers);
+    } else if (proxy->direct_irq_device == VIRTIO_ID_SCSI) {
+        qatomic_inc(&trial_scsi_offers);
+        if (trial_scsi_disable_direct) {
+            return false;
+        }
+    }
+    bool committed = false;
+    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+        state = irq_commit_source_read(source);
+        routes = virtio_pci_queue_routes(proxy, queue, state);
+        if (!routes) {
+            return false;
+        }
+        if (proxy->direct_irq_device == VIRTIO_ID_CONSOLE &&
+            routes->entries[queue].no_vector) {
+            /* MSI-X with no queue vector only publishes the ISR bit. */
+            if (qatomic_cmpxchg(source, state, state | 1) == state) {
+                committed = true;
+                break;
+            }
+            continue;
+        }
+        if (!routes->entries[queue].valid) {
+            return false;
+        }
+        msi = routes->entries[queue].msi;
+        if (address_space_try_commit_msi(&proxy->pci_dev.bus_master_as,
+                                         msi.address, msi.data, source,
+                                         state, state | 1,
+                                         proxy->direct_irq_device == VIRTIO_ID_SCSI)) {
+            committed = true;
+            break;
+        }
+        if (irq_commit_source_read(source) == state ||
+            (proxy->direct_irq_device == VIRTIO_ID_SCSI &&
+             g_getenv("LATS_SCSI_COMMIT_TEST_DIR"))) {
+            return false;
+        }
+    }
+    if (!committed) {
+        return false;
+    }
+    if (proxy->direct_irq_device == VIRTIO_ID_NET) {
+        qatomic_inc(&trial_net_direct);
+    } else if (proxy->direct_irq_device == VIRTIO_ID_SCSI) {
+        g_assert(!qemu_mutex_iothread_locked());
+        qatomic_inc(&trial_scsi_direct);
+    }
+    return true;
+}
+
+static void virtio_pci_publish_intx_low(VirtIOPCIProxy *proxy)
+{
+    uint64_t *state = &proxy->bus.interrupt_state;
+    unsigned long flags = irq_commit_source_read(state);
+
+    if (!qatomic_read(&proxy->pci_dev.irq_state) &&
+        (flags & (VIRTIO_PCI_ISR_PRESENT | VIRTIO_PCI_ISR_INTX_LOW)) ==
+            VIRTIO_PCI_ISR_PRESENT) {
+        irq_commit_source_update(state, 0, VIRTIO_PCI_ISR_INTX_LOW);
+    }
+}
+
+static uint8_t virtio_pci_ack_isr(VirtIOPCIProxy *proxy, VirtIODevice *vdev)
+{
+    uint8_t ret = virtio_clear_isr(vdev, VIRTIO_ISR_MASK);
+
+    pci_irq_deassert(&proxy->pci_dev);
+    virtio_pci_publish_intx_low(proxy);
+    return ret;
+}
+
 static void virtio_pci_notify(DeviceState *d, uint16_t vector)
 {
     VirtIOPCIProxy *proxy = to_virtio_pci_proxy_fast(d);
@@ -80,7 +481,24 @@ static void virtio_pci_notify(DeviceState *d, uint16_t vector)
         }
     } else {
         VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
-        pci_set_irq(&proxy->pci_dev, qatomic_read(&vdev->isr) & 1);
+        uint64_t *state = &proxy->bus.interrupt_state;
+        bool tracked = irq_commit_source_read(state) & VIRTIO_PCI_ISR_PRESENT;
+        bool locked = qemu_mutex_iothread_locked();
+
+        /*
+         * Withdraw the idle state before testing the ISR or changing INTx.
+         * An async assertion cannot be serialized with a later deassert by
+         * the BQL, so keep the idle shortcut disabled once one has occurred.
+         */
+        if (!locked) {
+            irq_commit_source_update(state, 0, VIRTIO_PCI_ISR_ASYNC_INTX);
+        } else if (tracked) {
+            irq_commit_source_update(state, VIRTIO_PCI_ISR_INTX_LOW, 0);
+        }
+        pci_set_irq(&proxy->pci_dev, virtio_get_isr(vdev) & 1);
+        if (tracked && locked) {
+            virtio_pci_publish_intx_low(proxy);
+        }
     }
 }
 
@@ -181,8 +599,11 @@ static int virtio_pci_load_config(DeviceState *d, QEMUFile *f)
     VirtIOPCIProxy *proxy = to_virtio_pci_proxy(d);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
     uint16_t vector;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        virtio_pci_guard_irq_routes(proxy);
 
     int ret;
+    irq_commit_source_update(&proxy->bus.interrupt_state, VIRTIO_PCI_ISR_INTX_LOW, 0);
     ret = pci_device_load(&proxy->pci_dev, f);
     if (ret) {
         return ret;
@@ -202,6 +623,7 @@ static int virtio_pci_load_config(DeviceState *d, QEMUFile *f)
     if (vector != VIRTIO_NO_VECTOR) {
         msix_vector_use(&proxy->pci_dev, vector);
     }
+    virtio_pci_publish_intx_low(proxy);
     return 0;
 }
 
@@ -211,6 +633,8 @@ static int virtio_pci_load_queue(DeviceState *d, int n, QEMUFile *f)
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
 
     uint16_t vector;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        virtio_pci_guard_irq_routes(proxy);
     if (msix_present(&proxy->pci_dev)) {
         qemu_get_be16s(f, &vector);
         if (vector != VIRTIO_NO_VECTOR && vector >= proxy->nvectors) {
@@ -326,6 +750,74 @@ static inline int virtio_pci_queue_mem_mult(struct VirtIOPCIProxy *proxy)
         QEMU_VIRTIO_PCI_QUEUE_MEM_MULT : 4;
 }
 
+/* Configuration is serialized by the BQL. A queue notification never waits
+ * for configuration or for a notification on another vCPU. */
+static void virtio_pci_set_fast_notifiers(DeviceState *d, VirtIODevice *vdev,
+                                          unsigned queues)
+{
+    VirtIOPCIProxy *proxy = to_virtio_pci_proxy(d);
+    unsigned *state = &proxy->fast_notify_state;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        proxy->direct_irq_device == VIRTIO_ID_SCSI ?
+        virtio_pci_guard_irq_routes(proxy) : NULL;
+    unsigned old = qatomic_fetch_and(state, ~1u);
+
+    if ((old & 1) && old > 1) {
+        unsigned pending;
+        while ((pending = qatomic_load_acquire(state)) != 0) {
+#ifdef CONFIG_LINUX
+            qemu_futex_wait(state, pending);
+#else
+            g_usleep(50);
+#endif
+        }
+    }
+    proxy->fast_notify_queues = queues;
+    proxy->fast_notify_stride = virtio_pci_queue_mem_mult(proxy);
+    proxy->fast_notify_device = vdev;
+    if (queues) {
+        bitmap_zero(proxy->fast_notify_present, VIRTIO_QUEUE_MAX);
+        for (unsigned i = 0; i < queues; ++i) {
+            if (virtio_queue_get_num(vdev, i)) {
+                set_bit(i, proxy->fast_notify_present);
+            }
+        }
+        qatomic_or(state, 1u);
+    }
+}
+
+static bool virtio_pci_try_notify_eventfd(void *opaque, hwaddr addr,
+                                         unsigned size)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    unsigned *state = &proxy->fast_notify_state;
+    bool handled = false;
+
+    if (size != 2 || !(qatomic_read(state) & 1)) {
+        return false;
+    }
+    /* Admission and pinning the notifier must be one indivisible operation. */
+    if (qatomic_fetch_add(state, 2u) & 1) {
+        hwaddr index = addr / proxy->fast_notify_stride;
+        if (!(addr % proxy->fast_notify_stride) &&
+            index < proxy->fast_notify_queues &&
+            test_bit(index, proxy->fast_notify_present)) {
+            VirtQueue *vq = virtio_get_queue(proxy->fast_notify_device, index);
+            VirtIODevice *vdev = proxy->fast_notify_device;
+            if (!vdev->try_output || !vdev->try_output(vdev, vq)) {
+                event_notifier_set(virtio_queue_get_host_notifier(vq));
+            }
+            handled = true;
+        }
+    }
+    if (qatomic_fetch_sub(state, 2u) == 2) {
+#ifdef CONFIG_LINUX
+        qemu_futex_wake(state, 1);
+#endif
+    }
+    return handled;
+}
+
 static int virtio_pci_ioeventfd_assign(DeviceState *d, EventNotifier *notifier,
                                        int n, bool assign)
 {
@@ -362,6 +854,7 @@ static int virtio_pci_ioeventfd_assign(DeviceState *d, EventNotifier *notifier,
                                       true, n, notifier);
         }
     } else {
+        virtio_pci_set_fast_notifiers(d, NULL, 0);
         if (modern) {
             if (fast_mmio) {
                 memory_region_del_eventfd(modern_mr, modern_addr, 0,
@@ -390,6 +883,7 @@ static void virtio_pci_start_ioeventfd(VirtIOPCIProxy *proxy)
 
 static void virtio_pci_stop_ioeventfd(VirtIOPCIProxy *proxy)
 {
+    virtio_pci_set_fast_notifiers(DEVICE(proxy), NULL, 0);
     virtio_bus_stop_ioeventfd(&proxy->bus);
 }
 
@@ -399,6 +893,9 @@ static void virtio_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
     uint16_t vector;
     hwaddr pa;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        addr != VIRTIO_PCI_QUEUE_NOTIFY ?
+        virtio_pci_guard_irq_routes(proxy) : NULL;
 
     if (proxy->guest_reset_pending) {
         return;
@@ -467,6 +964,9 @@ static void virtio_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         vdev->config_vector = val;
         break;
     case VIRTIO_MSI_QUEUE_VECTOR:
+        if (vdev->flush_output_irqs) {
+            vdev->flush_output_irqs(vdev);
+        }
         vector = virtio_queue_vector(vdev, vdev->queue_sel);
         if (vector != VIRTIO_NO_VECTOR) {
             msix_vector_unuse(&proxy->pci_dev, vector);
@@ -514,8 +1014,7 @@ static uint32_t virtio_ioport_read(VirtIOPCIProxy *proxy, uint32_t addr)
         break;
     case VIRTIO_PCI_ISR:
         /* reading from the ISR also clears it. */
-        ret = qatomic_xchg(&vdev->isr, 0);
-        pci_irq_deassert(&proxy->pci_dev);
+        ret = virtio_pci_ack_isr(proxy, vdev);
         break;
     case VIRTIO_MSI_CONFIG_VECTOR:
         ret = vdev->config_vector;
@@ -535,6 +1034,7 @@ static uint64_t virtio_pci_config_read(void *opaque, hwaddr addr,
 {
     VirtIOPCIProxy *proxy = opaque;
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
     uint32_t config = VIRTIO_PCI_CONFIG_SIZE(&proxy->pci_dev);
     uint64_t val = 0;
 
@@ -543,6 +1043,9 @@ static uint64_t virtio_pci_config_read(void *opaque, hwaddr addr,
     }
 
     if (addr < config) {
+        g_autoptr(VirtIOPCIQueueConfigPause) paused =
+            virtio_pci_pause_queue_config(proxy);
+
         return virtio_ioport_read(proxy, addr);
     }
     addr -= config;
@@ -573,12 +1076,16 @@ static void virtio_pci_config_write(void *opaque, hwaddr addr,
     VirtIOPCIProxy *proxy = opaque;
     uint32_t config = VIRTIO_PCI_CONFIG_SIZE(&proxy->pci_dev);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
 
     if (vdev == NULL) {
         return;
     }
 
     if (addr < config) {
+        g_autoptr(VirtIOPCIQueueConfigPause) paused =
+            virtio_pci_pause_queue_config(proxy);
+
         virtio_ioport_write(proxy, addr, val);
         return;
     }
@@ -609,6 +1116,10 @@ static void virtio_pci_config_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps virtio_pci_config_ops = {
     .read = virtio_pci_config_read,
     .write = virtio_pci_config_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .mmio_split_pause = virtio_pci_pause_split_queue_config,
+    .mmio_split_resume = virtio_pci_resume_split_queue_config,
+#endif
     .impl = {
         .min_access_size = 1,
         .max_access_size = 4,
@@ -757,10 +1268,19 @@ static void pcie_ats_config_write(PCIDevice *dev, uint32_t address,
 static void virtio_write_config(PCIDevice *pci_dev, uint32_t address,
                                 uint32_t val, int len)
 {
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
     VirtIOPCIProxy *proxy = VIRTIO_PCI(pci_dev);
+    g_autoptr(VirtIOPCIQueueConfigPause) paused =
+        virtio_pci_pause_queue_config(proxy);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
     struct virtio_pci_cfg_cap *cfg;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        virtio_pci_guard_irq_routes(proxy);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(pci_dev);
+#endif
     pci_default_write_config(pci_dev, address, val, len);
 
     if (proxy->flags & VIRTIO_PCI_FLAG_INIT_FLR) {
@@ -806,6 +1326,9 @@ static void virtio_write_config(PCIDevice *pci_dev, uint32_t address,
             virtio_address_space_write(proxy, off, cfg->pci_cfg_data, len);
         }
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(pci_dev);
+#endif
 }
 
 static uint32_t virtio_read_config(PCIDevice *pci_dev,
@@ -1373,6 +1896,9 @@ static void virtio_pci_vmstate_change(DeviceState *d, bool running)
     VirtIOPCIProxy *proxy = to_virtio_pci_proxy(d);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
 
+    if (proxy->queue_trace_enabled.notify) {
+        virtio_pci_update_queue_config_device(proxy, vdev);
+    }
     if (running) {
         /* Old QEMU versions did not set bus master enable on status write.
          * Detect DRIVER set and enable it.
@@ -1470,17 +1996,11 @@ int virtio_pci_add_shm_cap(VirtIOPCIProxy *proxy,
     return virtio_pci_add_mem_cap(proxy, &cap.cap);
 }
 
-static uint64_t virtio_pci_common_read(void *opaque, hwaddr addr,
-                                       unsigned size)
+static uint32_t virtio_pci_common_read_value(VirtIOPCIProxy *proxy,
+                                             VirtIODevice *vdev, hwaddr addr)
 {
-    VirtIOPCIProxy *proxy = opaque;
-    VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
     uint32_t val = 0;
     int i;
-
-    if (vdev == NULL) {
-        return UINT64_MAX;
-    }
 
     switch (addr) {
     case VIRTIO_PCI_COMMON_DFSELECT:
@@ -1562,6 +2082,79 @@ static uint64_t virtio_pci_common_read(void *opaque, hwaddr addr,
     return val;
 }
 
+static uint64_t virtio_pci_common_read(void *opaque, hwaddr addr,
+                                       unsigned size)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    g_autoptr(VirtIOPCIQueueConfigPause) paused =
+        virtio_pci_pause_queue_config(proxy);
+    VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
+
+    return vdev ? virtio_pci_common_read_value(proxy, vdev, addr) : UINT64_MAX;
+}
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool virtio_pci_common_read_size_ok(hwaddr addr, unsigned size)
+{
+    switch (size) {
+    case 1:
+        return addr == VIRTIO_PCI_COMMON_STATUS ||
+               addr == VIRTIO_PCI_COMMON_CFGGENERATION;
+    case 2:
+        return addr == VIRTIO_PCI_COMMON_MSIX ||
+               addr == VIRTIO_PCI_COMMON_NUMQ ||
+               addr == VIRTIO_PCI_COMMON_Q_SELECT ||
+               addr == VIRTIO_PCI_COMMON_Q_SIZE ||
+               addr == VIRTIO_PCI_COMMON_Q_MSIX ||
+               addr == VIRTIO_PCI_COMMON_Q_ENABLE ||
+               addr == VIRTIO_PCI_COMMON_Q_NOFF ||
+               addr == VIRTIO_PCI_COMMON_Q_RESET;
+    case 4:
+        return addr == VIRTIO_PCI_COMMON_DFSELECT ||
+               addr == VIRTIO_PCI_COMMON_DF ||
+               addr == VIRTIO_PCI_COMMON_GFSELECT ||
+               addr == VIRTIO_PCI_COMMON_GF ||
+               (addr >= VIRTIO_PCI_COMMON_Q_DESCLO &&
+                addr <= VIRTIO_PCI_COMMON_Q_USEDHI && !(addr & 3));
+    default:
+        return false;
+    }
+}
+
+static bool virtio_pci_try_read_queue_config(void *opaque, hwaddr addr,
+                                             MemOp op, MemTxAttrs attrs,
+                                             uint64_t *value)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    VirtIODevice *vdev;
+    g_autoptr(VirtioNetworkLock) guard = NULL;
+    bool handled;
+
+    if (!virtio_pci_common_read_size_ok(addr, memop_size(op)) ||
+        !qatomic_read(&proxy->queue_config_device) ||
+        qemu_mutex_trylock(&proxy->queue_config_lock)) {
+        return false;
+    }
+
+    vdev = qatomic_read(&proxy->queue_config_device);
+    handled = vdev && !proxy->queue_config_paused &&
+              !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ);
+    if (handled && vdev->network_mutex) {
+        if (qemu_rec_mutex_trylock(vdev->network_mutex)) {
+            handled = false;
+        } else {
+            guard = vdev->network_mutex;
+        }
+    }
+    if (handled) {
+        *value = virtio_pci_common_read_value(proxy, vdev, addr);
+    }
+    qemu_mutex_unlock(&proxy->queue_config_lock);
+    return handled;
+}
+#endif
+
 static void virtio_pci_cancel_deferred_guest_reset(VirtIOPCIProxy *proxy)
 {
     VirtIODevice *vdev;
@@ -1582,6 +2175,10 @@ static void virtio_pci_cancel_deferred_guest_reset(VirtIOPCIProxy *proxy)
 static void virtio_pci_deferred_guest_reset(void *opaque)
 {
     VirtIOPCIProxy *proxy = opaque;
+    g_autoptr(VirtIOPCIQueueConfigPause) paused =
+        virtio_pci_pause_queue_config(proxy);
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        virtio_pci_guard_irq_routes(proxy);
     VirtIODevice *vdev;
 
     if (!proxy->guest_reset_pending) {
@@ -1590,14 +2187,21 @@ static void virtio_pci_deferred_guest_reset(void *opaque)
 
     proxy->guest_reset_pending = false;
     vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
     if (vdev) {
         if (proxy->guest_flr_pending) {
             uint8_t *devctl = proxy->pci_dev.config +
                               proxy->pci_dev.exp.exp_cap + PCI_EXP_DEVCTL;
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            pci_config_read_slot_begin(&proxy->pci_dev);
+#endif
             pci_word_test_and_set_mask(devctl, PCI_EXP_DEVCTL_BCR_FLR);
             pci_device_reset(&proxy->pci_dev);
             pci_word_test_and_clear_mask(devctl, PCI_EXP_DEVCTL_BCR_FLR);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            pci_config_read_slot_end(&proxy->pci_dev);
+#endif
         }
         if (vdev->reset_pending) {
             virtio_pci_reset(DEVICE(proxy));
@@ -1608,12 +2212,340 @@ static void virtio_pci_deferred_guest_reset(void *opaque)
     proxy->guest_flr_pending = false;
 }
 
+static void virtio_pci_stage_queue_config(VirtIOPCIProxy *proxy,
+                                           VirtIODevice *vdev,
+                                           hwaddr addr, uint32_t value)
+{
+    VirtIOPCIQueue *queue;
+    unsigned word = (addr >> 2) & 1;
+
+    if (addr == VIRTIO_PCI_COMMON_Q_SELECT) {
+        if (value < VIRTIO_QUEUE_MAX) {
+            qatomic_set(&vdev->queue_sel, value);
+        }
+        return;
+    }
+
+    queue = &proxy->vqs[qatomic_read(&vdev->queue_sel)];
+    switch (addr) {
+    case VIRTIO_PCI_COMMON_Q_DESCLO:
+    case VIRTIO_PCI_COMMON_Q_DESCHI:
+        queue->desc[word] = value;
+        break;
+    case VIRTIO_PCI_COMMON_Q_AVAILLO:
+    case VIRTIO_PCI_COMMON_Q_AVAILHI:
+        queue->avail[word] = value;
+        break;
+    case VIRTIO_PCI_COMMON_Q_USEDLO:
+    case VIRTIO_PCI_COMMON_Q_USEDHI:
+        queue->used[word] = value;
+        break;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void virtio_pci_set_queue_size(VirtIOPCIProxy *proxy,
+                                      VirtIODevice *vdev, uint16_t size)
+{
+    unsigned n = vdev->queue_sel;
+
+    proxy->vqs[n].num = size;
+    virtio_queue_set_num(vdev, n, size);
+    virtio_init_region_cache(vdev, n);
+}
+
+static uint64_t virtio_pci_ring_address(const uint32_t words[2])
+{
+    return ((uint64_t)words[1] << 32) | words[0];
+}
+
+static bool virtio_pci_try_configure_queue(VirtIOPCIProxy *proxy,
+                                           VirtIODevice *vdev, hwaddr addr,
+                                           uint16_t value)
+{
+    unsigned n = vdev->queue_sel;
+    VirtIOPCIQueue *queue = &proxy->vqs[n];
+    g_autoptr(VirtioNetworkLock) guard = NULL;
+
+    if (vdev->network_mutex) {
+        /* The legacy port acquires the device lock before pausing configuration. */
+        if (qemu_rec_mutex_trylock(vdev->network_mutex)) {
+            return false;
+        }
+        guard = vdev->network_mutex;
+    } else if (vdev->device_id == VIRTIO_ID_CONSOLE ||
+               (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
+        return false;
+    }
+
+    /* Live rings can remap guest memory and report mapping errors. */
+    if (proxy->vqs[n].enabled || virtio_queue_get_desc_addr(vdev, n) ||
+        virtio_queue_get_avail_addr(vdev, n)) {
+        return false;
+    }
+    if (addr == VIRTIO_PCI_COMMON_Q_SIZE) {
+        virtio_pci_set_queue_size(proxy, vdev, value);
+        return true;
+    }
+
+    /* A driver may leave the default queue size untouched. */
+    if (value != 1 ||
+        (queue->num && queue->num != virtio_queue_get_num(vdev, n)) ||
+        (VIRTIO_DEVICE_GET_CLASS(vdev)->queue_enable &&
+         !(vdev->device_id == VIRTIO_ID_NET && !vdev->vhost_started)) ||
+        !virtio_queue_try_set_rings(vdev, n,
+                                    virtio_pci_ring_address(queue->desc),
+                                    virtio_pci_ring_address(queue->avail),
+                                    virtio_pci_ring_address(queue->used))) {
+        return false;
+    }
+    queue->enabled = true;
+    queue->reset = false;
+    return true;
+}
+
+static bool virtio_pci_try_set_queue_vector(VirtIOPCIProxy *proxy,
+                                            VirtIODevice *vdev,
+                                            uint16_t value)
+{
+    PCIDevice *dev = &proxy->pci_dev;
+    unsigned n = vdev->queue_sel;
+    uint16_t old_vector;
+    g_autoptr(VirtioNetworkLock) guard = NULL;
+
+    if (vdev->network_mutex) {
+        /* The legacy port acquires the device lock before pausing configuration. */
+        if (qemu_rec_mutex_trylock(vdev->network_mutex)) {
+            return false;
+        }
+        guard = vdev->network_mutex;
+    } else if (vdev->device_id == VIRTIO_ID_CONSOLE) {
+        return false;
+    }
+
+    /* Live drivers or IRQFD notifiers need BQL. */
+    if (!msix_present(dev) ||
+        (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) ||
+        vdev->output_irqs_may_be_pending ||
+        proxy->nvqs_with_notifiers ||
+        dev->msix_vector_use_notifier ||
+        dev->msix_vector_poll_notifier) {
+        return false;
+    }
+    if (value < proxy->nvectors && value >= dev->msix_entries_nr) {
+        return false;
+    }
+    old_vector = virtio_queue_vector(vdev, n);
+    if (old_vector != VIRTIO_NO_VECTOR) {
+        msix_vector_unuse(dev, old_vector);
+    }
+    if (value < proxy->nvectors) {
+        msix_vector_use(dev, value);
+    } else {
+        value = VIRTIO_NO_VECTOR;
+    }
+    virtio_queue_set_vector(vdev, n, value);
+    return true;
+}
+
+static bool virtio_pci_try_set_config_vector(VirtIOPCIProxy *proxy,
+                                             VirtIODevice *vdev,
+                                             uint16_t value)
+{
+    PCIDevice *dev = &proxy->pci_dev;
+    g_autoptr(VirtioNetworkLock) guard = NULL;
+
+    if (vdev->network_mutex) {
+        if (qemu_rec_mutex_trylock(vdev->network_mutex)) {
+            return false;
+        }
+        guard = vdev->network_mutex;
+    } else if (vdev->device_id == VIRTIO_ID_CONSOLE) {
+        return false;
+    }
+
+    if (!msix_present(dev) ||
+        (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) ||
+        vdev->output_irqs_may_be_pending ||
+        proxy->nvqs_with_notifiers ||
+        dev->msix_vector_use_notifier ||
+        dev->msix_vector_poll_notifier) {
+        return false;
+    }
+    if (value < proxy->nvectors && value >= dev->msix_entries_nr) {
+        return false;
+    }
+    if (vdev->config_vector != VIRTIO_NO_VECTOR) {
+        msix_vector_unuse(dev, vdev->config_vector);
+    }
+    if (value < proxy->nvectors) {
+        msix_vector_use(dev, value);
+    } else {
+        value = VIRTIO_NO_VECTOR;
+    }
+    vdev->config_vector = value;
+    return true;
+}
+
+static bool virtio_pci_try_set_guest_features(VirtIOPCIProxy *proxy,
+                                              VirtIODevice *vdev,
+                                              uint32_t value)
+{
+    VirtioDeviceClass *vdc = VIRTIO_DEVICE_GET_CLASS(vdev);
+    uint32_t words[2];
+    uint64_t features;
+    g_autoptr(VirtioNetworkLock) guard = NULL;
+
+    if (proxy->gfselect >= ARRAY_SIZE(proxy->guest_features)) {
+        return true;
+    }
+    if ((vdev->status & (VIRTIO_CONFIG_S_FEATURES_OK |
+                         VIRTIO_CONFIG_S_DRIVER_OK)) ||
+        (vdc->set_features &&
+         !(vdev->device_id == VIRTIO_ID_NET && !vdev->vhost_started &&
+           vdev->network_mutex))) {
+        return false;
+    }
+    if (vdev->network_mutex) {
+        if (qemu_rec_mutex_trylock(vdev->network_mutex)) {
+            return false;
+        }
+        guard = vdev->network_mutex;
+    }
+
+    words[0] = proxy->guest_features[0];
+    words[1] = proxy->guest_features[1];
+    words[proxy->gfselect] = value;
+    features = (((uint64_t)words[1]) << 32) | words[0];
+    if (features & (1ULL << VIRTIO_F_BAD_FEATURE)) {
+        return false;
+    }
+    if (vdev->device_id == VIRTIO_ID_NET &&
+        (features & ((1ULL << 22 /* VIRTIO_NET_F_MQ */) |
+                     (1ULL << 60 /* VIRTIO_NET_F_RSS */)))) {
+        return false;
+    }
+
+    proxy->guest_features[proxy->gfselect] = value;
+    {
+        RCU_READ_LOCK_GUARD();
+        virtio_set_features(vdev, features);
+    }
+    return true;
+}
+
+static bool virtio_pci_try_set_status(VirtIOPCIProxy *proxy,
+                                      VirtIODevice *vdev,
+                                      uint8_t value)
+{
+    g_autoptr(VirtioNetworkLock) guard = NULL;
+
+    /*
+     * Only handle non-reset, pre-DRIVER_OK staging writes
+     * (ACKNOWLEDGE / DRIVER / FEATURES_OK) without BQL.
+     */
+    if (value == 0 ||
+        (value & VIRTIO_CONFIG_S_DRIVER_OK) ||
+        (vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) ||
+        proxy->bus.ioeventfd_started ||
+        !vdev->vm_running ||
+        trace_event_get_state_backends(TRACE_VIRTIO_SET_STATUS)) {
+        return false;
+    }
+    if (vdev->device_id == VIRTIO_ID_NET &&
+        (vdev->vhost_started || !vdev->network_mutex)) {
+        return false;
+    }
+    if (vdev->network_mutex) {
+        if (qemu_rec_mutex_trylock(vdev->network_mutex)) {
+            return false;
+        }
+        guard = vdev->network_mutex;
+    }
+
+    virtio_set_status(vdev, value);
+    return true;
+}
+
+static void virtio_pci_common_write(void *opaque, hwaddr addr,
+                                    uint64_t val, unsigned size);
+
+static bool virtio_pci_try_stage_queue_config(void *opaque, hwaddr addr,
+                                              unsigned size, uint64_t value)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    VirtIODevice *vdev;
+    bool staged;
+
+    if (!((size == 1 && addr == VIRTIO_PCI_COMMON_STATUS) ||
+          (size == 2 && (addr == VIRTIO_PCI_COMMON_MSIX ||
+                         addr == VIRTIO_PCI_COMMON_Q_SELECT ||
+                         addr == VIRTIO_PCI_COMMON_Q_SIZE ||
+                         addr == VIRTIO_PCI_COMMON_Q_MSIX ||
+                         addr == VIRTIO_PCI_COMMON_Q_ENABLE)) ||
+          (size == 4 && (addr == VIRTIO_PCI_COMMON_DFSELECT ||
+                         addr == VIRTIO_PCI_COMMON_GFSELECT ||
+                         addr == VIRTIO_PCI_COMMON_GF ||
+                         (addr >= VIRTIO_PCI_COMMON_Q_DESCLO &&
+                          addr <= VIRTIO_PCI_COMMON_Q_USEDHI &&
+                          !(addr & 3))))) ||
+        !qatomic_read(&proxy->queue_config_device) ||
+        qemu_mutex_trylock(&proxy->queue_config_lock)) {
+        if (lats_nobql_enabled() &&
+            !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE)) {
+            qemu_memory_topology_lock();
+            virtio_pci_common_write(opaque, addr, value, size);
+            qemu_memory_topology_unlock();
+            return true;
+        }
+        return false;
+    }
+
+    vdev = qatomic_read(&proxy->queue_config_device);
+    staged = vdev && !proxy->queue_config_paused &&
+             !proxy->guest_reset_pending &&
+             !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE);
+    if (staged && addr == VIRTIO_PCI_COMMON_DFSELECT) {
+        proxy->dfselect = value;
+    } else if (staged && addr == VIRTIO_PCI_COMMON_GFSELECT) {
+        proxy->gfselect = value;
+    } else if (staged && addr == VIRTIO_PCI_COMMON_GF) {
+        staged = virtio_pci_try_set_guest_features(proxy, vdev, value);
+    } else if (staged && addr == VIRTIO_PCI_COMMON_MSIX) {
+        staged = virtio_pci_try_set_config_vector(proxy, vdev, value);
+    } else if (staged && addr == VIRTIO_PCI_COMMON_STATUS) {
+        staged = virtio_pci_try_set_status(proxy, vdev, value & 0xff);
+    } else if (staged && addr == VIRTIO_PCI_COMMON_Q_MSIX) {
+        staged = virtio_pci_try_set_queue_vector(proxy, vdev, value);
+    } else if (staged && (addr == VIRTIO_PCI_COMMON_Q_SIZE ||
+                          addr == VIRTIO_PCI_COMMON_Q_ENABLE)) {
+        staged = virtio_pci_try_configure_queue(proxy, vdev, addr, value);
+    } else if (staged) {
+        virtio_pci_stage_queue_config(proxy, vdev, addr, value);
+    }
+    qemu_mutex_unlock(&proxy->queue_config_lock);
+    if (!staged && lats_nobql_enabled() &&
+        !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE)) {
+        qemu_memory_topology_lock();
+        virtio_pci_common_write(opaque, addr, value, size);
+        qemu_memory_topology_unlock();
+        return true;
+    }
+    return staged;
+}
+
 static void virtio_pci_common_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned size)
 {
     VirtIOPCIProxy *proxy = opaque;
+    g_autoptr(VirtIOPCIQueueConfigPause) paused =
+        virtio_pci_pause_queue_config(proxy);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
     uint16_t vector;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        virtio_pci_guard_irq_routes(proxy);
 
     if (vdev == NULL) {
         return;
@@ -1688,18 +2620,13 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
         }
 
         break;
-    case VIRTIO_PCI_COMMON_Q_SELECT:
-        if (val < VIRTIO_QUEUE_MAX) {
-            vdev->queue_sel = val;
-        }
-        break;
     case VIRTIO_PCI_COMMON_Q_SIZE:
-        proxy->vqs[vdev->queue_sel].num = val;
-        virtio_queue_set_num(vdev, vdev->queue_sel,
-                             proxy->vqs[vdev->queue_sel].num);
-        virtio_init_region_cache(vdev, vdev->queue_sel);
+        virtio_pci_set_queue_size(proxy, vdev, val);
         break;
     case VIRTIO_PCI_COMMON_Q_MSIX:
+        if (vdev->flush_output_irqs) {
+            vdev->flush_output_irqs(vdev);
+        }
         vector = virtio_queue_vector(vdev, vdev->queue_sel);
         if (vector != VIRTIO_NO_VECTOR) {
             msix_vector_unuse(&proxy->pci_dev, vector);
@@ -1714,15 +2641,13 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
         break;
     case VIRTIO_PCI_COMMON_Q_ENABLE:
         if (val == 1) {
-            virtio_queue_set_num(vdev, vdev->queue_sel,
-                                 proxy->vqs[vdev->queue_sel].num);
+            VirtIOPCIQueue *queue = &proxy->vqs[vdev->queue_sel];
+
+            virtio_queue_set_num(vdev, vdev->queue_sel, queue->num);
             virtio_queue_set_rings(vdev, vdev->queue_sel,
-                       ((uint64_t)proxy->vqs[vdev->queue_sel].desc[1]) << 32 |
-                       proxy->vqs[vdev->queue_sel].desc[0],
-                       ((uint64_t)proxy->vqs[vdev->queue_sel].avail[1]) << 32 |
-                       proxy->vqs[vdev->queue_sel].avail[0],
-                       ((uint64_t)proxy->vqs[vdev->queue_sel].used[1]) << 32 |
-                       proxy->vqs[vdev->queue_sel].used[0]);
+                       virtio_pci_ring_address(queue->desc),
+                       virtio_pci_ring_address(queue->avail),
+                       virtio_pci_ring_address(queue->used));
             proxy->vqs[vdev->queue_sel].enabled = 1;
             proxy->vqs[vdev->queue_sel].reset = 0;
             virtio_queue_enable(vdev, vdev->queue_sel);
@@ -1730,23 +2655,14 @@ static void virtio_pci_common_write(void *opaque, hwaddr addr,
             virtio_error(vdev, "wrong value for queue_enable %"PRIx64, val);
         }
         break;
+    case VIRTIO_PCI_COMMON_Q_SELECT:
     case VIRTIO_PCI_COMMON_Q_DESCLO:
-        proxy->vqs[vdev->queue_sel].desc[0] = val;
-        break;
     case VIRTIO_PCI_COMMON_Q_DESCHI:
-        proxy->vqs[vdev->queue_sel].desc[1] = val;
-        break;
     case VIRTIO_PCI_COMMON_Q_AVAILLO:
-        proxy->vqs[vdev->queue_sel].avail[0] = val;
-        break;
     case VIRTIO_PCI_COMMON_Q_AVAILHI:
-        proxy->vqs[vdev->queue_sel].avail[1] = val;
-        break;
     case VIRTIO_PCI_COMMON_Q_USEDLO:
-        proxy->vqs[vdev->queue_sel].used[0] = val;
-        break;
     case VIRTIO_PCI_COMMON_Q_USEDHI:
-        proxy->vqs[vdev->queue_sel].used[1] = val;
+        virtio_pci_stage_queue_config(proxy, vdev, addr, val);
         break;
     case VIRTIO_PCI_COMMON_Q_RESET:
         if (val == 1) {
@@ -1810,15 +2726,35 @@ static uint64_t virtio_pci_isr_read(void *opaque, hwaddr addr,
 {
     VirtIOPCIProxy *proxy = opaque;
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
-    uint64_t val;
 
     if (vdev == NULL) {
         return UINT64_MAX;
     }
 
-    val = qatomic_xchg(&vdev->isr, 0);
-    pci_irq_deassert(&proxy->pci_dev);
-    return val;
+    return virtio_pci_ack_isr(proxy, vdev);
+}
+
+static bool virtio_pci_try_read_isr(void *opaque, hwaddr addr, MemOp op,
+                                    MemTxAttrs attrs, uint64_t *value)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    unsigned long required = VIRTIO_PCI_ISR_PRESENT | VIRTIO_PCI_ISR_INTX_LOW;
+    unsigned long mask = required | VIRTIO_PCI_ISR_ASYNC_INTX | VIRTIO_ISR_MASK;
+
+    if (addr || memop_size(op) > 4 ||
+        (irq_commit_source_read(&proxy->bus.interrupt_state) & mask) != required) {
+        if (lats_nobql_enabled() &&
+            !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+            qemu_memory_topology_lock();
+            *value = virtio_pci_isr_read(opaque, addr, memop_size(op));
+            qemu_memory_topology_unlock();
+            return true;
+        }
+        return false;
+    }
+
+    *value = 0;
+    return true;
 }
 
 static void virtio_pci_isr_write(void *opaque, hwaddr addr,
@@ -1830,7 +2766,10 @@ static uint64_t virtio_pci_device_read(void *opaque, hwaddr addr,
                                        unsigned size)
 {
     VirtIOPCIProxy *proxy = opaque;
+    g_autoptr(VirtIOPCIQueueConfigPause) paused =
+        virtio_pci_pause_queue_config(proxy);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
     uint64_t val;
 
     if (vdev == NULL) {
@@ -1854,11 +2793,121 @@ static uint64_t virtio_pci_device_read(void *opaque, hwaddr addr,
     return val;
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool virtio_pci_try_read_device_config(void *opaque, hwaddr addr,
+                                              MemOp op, MemTxAttrs attrs,
+                                              uint64_t *value)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    VirtIODevice *vdev;
+    unsigned size = memop_size(op);
+    g_autoptr(VirtioNetworkLock) guard = NULL;
+    bool handled;
+
+    if ((size != 1 && size != 2 && size != 4) ||
+        !qatomic_read(&proxy->queue_config_device) ||
+        qemu_mutex_trylock(&proxy->queue_config_lock)) {
+        return false;
+    }
+
+    vdev = qatomic_read(&proxy->queue_config_device);
+    handled = vdev && !proxy->queue_config_paused &&
+              (vdev->device_id == VIRTIO_ID_SCSI ||
+               vdev->device_id == VIRTIO_ID_NET ||
+               vdev->device_id == VIRTIO_ID_CONSOLE ||
+               vdev->device_id == VIRTIO_ID_BALLOON) &&
+              !vdev->vhost_started &&
+              !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ);
+    if (handled && vdev->network_mutex) {
+        if (qemu_rec_mutex_trylock(vdev->network_mutex)) {
+            handled = false;
+        } else {
+            guard = vdev->network_mutex;
+        }
+    }
+    if (handled) {
+        switch (size) {
+        case 1:
+            *value = virtio_config_modern_readb(vdev, addr);
+            break;
+        case 2:
+            *value = virtio_config_modern_readw(vdev, addr);
+            break;
+        case 4:
+            *value = virtio_config_modern_readl(vdev, addr);
+            break;
+        default:
+            handled = false;
+            break;
+        }
+    }
+    qemu_mutex_unlock(&proxy->queue_config_lock);
+    return handled;
+}
+
+static bool virtio_pci_try_notify_lockless(void *opaque, hwaddr addr,
+                                           unsigned size, uint64_t value)
+{
+    VirtIOPCIProxy *proxy = opaque;
+    VirtIODevice *vdev;
+    unsigned stride;
+    unsigned queue;
+    bool handled = false;
+
+    if (!qatomic_read(&proxy->queue_config_device) ||
+        qemu_mutex_trylock(&proxy->queue_config_lock)) {
+        if (lats_nobql_enabled() &&
+            !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE)) {
+            qemu_memory_topology_lock();
+            virtio_pci_notify_write(opaque, addr, value, size);
+            qemu_memory_topology_unlock();
+            return true;
+        }
+        return false;
+    }
+
+    vdev = qatomic_read(&proxy->queue_config_device);
+    if (vdev && !proxy->queue_config_paused &&
+        !proxy->guest_reset_pending && !vdev->broken &&
+        !vdev->start_on_kick &&
+        virtio_vdev_has_feature(vdev, VIRTIO_F_VERSION_1) &&
+        !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE) &&
+        !trace_event_get_state_backends(TRACE_VIRTIO_PCI_NOTIFY_WRITE) &&
+        !trace_event_get_state_backends(TRACE_VIRTIO_QUEUE_NOTIFY)) {
+        stride = virtio_pci_queue_mem_mult(proxy);
+        queue = stride ? addr / stride : VIRTIO_QUEUE_MAX;
+        if (queue < VIRTIO_QUEUE_MAX) {
+            /*
+             * virtio-serial c_ivq (queue 2) handler control_in() is a no-op;
+             * virtio-scsi event queue (queue 1) pre-DRIVER_OK kick is a no-op.
+             */
+            if ((vdev->device_id == VIRTIO_ID_CONSOLE && queue == 2) ||
+                (vdev->device_id == VIRTIO_ID_SCSI && queue == 1 &&
+                 !(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK))) {
+                handled = true;
+            }
+        }
+    }
+    qemu_mutex_unlock(&proxy->queue_config_lock);
+    if (!handled && lats_nobql_enabled() &&
+        !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE)) {
+        qemu_memory_topology_lock();
+        virtio_pci_notify_write(opaque, addr, value, size);
+        qemu_memory_topology_unlock();
+        return true;
+    }
+    return handled;
+}
+#endif
+
 static void virtio_pci_device_write(void *opaque, hwaddr addr,
                                     uint64_t val, unsigned size)
 {
     VirtIOPCIProxy *proxy = opaque;
+    g_autoptr(VirtIOPCIQueueConfigPause) paused =
+        virtio_pci_pause_queue_config(proxy);
     VirtIODevice *vdev = virtio_bus_get_device(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) network = virtio_lock_network(vdev);
 
     if (vdev == NULL || proxy->guest_reset_pending) {
         return;
@@ -1877,12 +2926,33 @@ static void virtio_pci_device_write(void *opaque, hwaddr addr,
     }
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool virtio_pci_try_write_device_config(void *opaque, hwaddr addr,
+                                               unsigned size, uint64_t val)
+{
+    if (!lats_nobql_enabled() ||
+        trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE)) {
+        return false;
+    }
+    qemu_memory_topology_lock();
+    virtio_pci_device_write(opaque, addr, val, size);
+    qemu_memory_topology_unlock();
+    return true;
+}
+#endif
+
 static void virtio_pci_modern_regions_init(VirtIOPCIProxy *proxy,
                                            const char *vdev_name)
 {
     static const MemoryRegionOps common_ops = {
         .read = virtio_pci_common_read,
         .write = virtio_pci_common_write,
+        .try_write_lockless = virtio_pci_try_stage_queue_config,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        .try_read_lockless = virtio_pci_try_read_queue_config,
+        .mmio_split_pause = virtio_pci_pause_split_queue_config,
+        .mmio_split_resume = virtio_pci_resume_split_queue_config,
+#endif
         .impl = {
             .min_access_size = 1,
             .max_access_size = 4,
@@ -1892,6 +2962,7 @@ static void virtio_pci_modern_regions_init(VirtIOPCIProxy *proxy,
     static const MemoryRegionOps isr_ops = {
         .read = virtio_pci_isr_read,
         .write = virtio_pci_isr_write,
+        .try_read_lockless = virtio_pci_try_read_isr,
         .impl = {
             .min_access_size = 1,
             .max_access_size = 4,
@@ -1901,6 +2972,10 @@ static void virtio_pci_modern_regions_init(VirtIOPCIProxy *proxy,
     static const MemoryRegionOps device_ops = {
         .read = virtio_pci_device_read,
         .write = virtio_pci_device_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        .try_read_lockless = virtio_pci_try_read_device_config,
+        .try_write_lockless = virtio_pci_try_write_device_config,
+#endif
         .impl = {
             .min_access_size = 1,
             .max_access_size = 4,
@@ -1910,6 +2985,10 @@ static void virtio_pci_modern_regions_init(VirtIOPCIProxy *proxy,
     static const MemoryRegionOps notify_ops = {
         .read = virtio_pci_notify_read,
         .write = virtio_pci_notify_write,
+        .try_write_eventfd = virtio_pci_try_notify_eventfd,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        .try_write_lockless = virtio_pci_try_notify_lockless,
+#endif
         .impl = {
             .min_access_size = 1,
             .max_access_size = 4,
@@ -2177,6 +3256,81 @@ static void virtio_pci_device_plugged(DeviceState *d, Error **errp)
         pci_register_bar(&proxy->pci_dev, proxy->legacy_io_bar_idx,
                          PCI_BASE_ADDRESS_SPACE_IO, &proxy->bar);
     }
+    if (modern) {
+        irq_commit_source_update(&proxy->bus.interrupt_state, 0, VIRTIO_PCI_ISR_PRESENT);
+        virtio_pci_publish_intx_low(proxy);
+    }
+
+    proxy->direct_irq_device = 0;
+    if (modern && tcg_enabled() &&
+        ((vdev->device_id == VIRTIO_ID_NET &&
+          lats_nobql_enabled()) ||
+         (vdev->device_id == VIRTIO_ID_CONSOLE &&
+          vdev->try_output)) &&
+        apic_msi_commit_configured && apic_msi_commit_configured()) {
+        proxy->direct_irq_device = vdev->device_id;
+    }
+    if (proxy->direct_irq_device == VIRTIO_ID_NET) {
+        static bool report_installed;
+
+        if (!report_installed) {
+            report_installed = true;
+            qemu_add_vm_change_state_handler(trial_net_irq_vmstate, NULL);
+            atexit(trial_net_irq_exit);
+        }
+    }
+
+    if (vdev->device_id == VIRTIO_ID_SCSI && tcg_enabled() &&
+        lats_nobql_enabled()) {
+        static bool report_installed;
+
+        proxy->direct_irq_device = VIRTIO_ID_SCSI;
+
+        if (!report_installed) {
+            report_installed = true;
+            trial_scsi_disable_direct = false;
+            qemu_add_vm_change_state_handler(trial_scsi_vmstate, NULL);
+            atexit(trial_scsi_exit);
+            trial_scsi_enable_notifier_counts();
+        }
+    }
+    if (proxy->direct_irq_device) {
+        qatomic_store_release(&proxy->direct_irq_enabled, true);
+        proxy->direct_irq_listener.begin = virtio_pci_irq_map_begin;
+        proxy->direct_irq_listener.commit = virtio_pci_irq_map_end;
+        proxy->direct_irq_listener.nobql_safe = true;
+        memory_listener_register(&proxy->direct_irq_listener,
+                                 &proxy->pci_dev.bus_master_as);
+    }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (modern && pci_config_size(&proxy->pci_dev) == PCI_CONFIG_SPACE_SIZE &&
+        (vdev->device_id == VIRTIO_ID_NET || vdev->device_id == VIRTIO_ID_SCSI ||
+         vdev->device_id == VIRTIO_ID_BALLOON ||
+         vdev->device_id == VIRTIO_ID_CONSOLE)) {
+        unsigned data = proxy->config_cap +
+                        offsetof(struct virtio_pci_cfg_cap, pci_cfg_data);
+        pci_config_read_slot_register(&proxy->pci_dev, data,
+            vdev->flush_output_irqs ? vdev->network_mutex : NULL,
+            vdev->flush_output_irqs ? &vdev->output_irqs_may_be_pending : NULL);
+    }
+    if (modern && tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        ((vdev->device_id == VIRTIO_ID_CONSOLE ||
+          vdev->device_id == VIRTIO_ID_SCSI ||
+          vdev->device_id == VIRTIO_ID_NET ||
+          vdev->device_id == VIRTIO_ID_BALLOON) &&
+         lats_nobql_enabled())) {
+        proxy->queue_config_listener.begin = virtio_pci_queue_config_map_begin;
+        proxy->queue_config_listener.commit = virtio_pci_queue_config_map_end;
+        proxy->queue_config_listener.nobql_safe = true;
+        memory_listener_register(&proxy->queue_config_listener,
+                                 &address_space_memory);
+        proxy->queue_config_listener_registered = true;
+        proxy->queue_trace_enabled.notify = virtio_pci_queue_trace_enabled;
+        trace_add_enable_notifier(&proxy->queue_trace_enabled);
+        virtio_pci_update_queue_config_device(proxy, vdev);
+    }
+#endif
 }
 
 static void virtio_pci_device_unplugged(DeviceState *d)
@@ -2184,7 +3338,23 @@ static void virtio_pci_device_unplugged(DeviceState *d)
     VirtIOPCIProxy *proxy = VIRTIO_PCI(d);
     bool modern = virtio_pci_modern(proxy);
     bool modern_pio = proxy->flags & VIRTIO_PCI_FLAG_MODERN_PIO_NOTIFY;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        virtio_pci_guard_irq_routes(proxy);
 
+    if (proxy->queue_trace_enabled.notify) {
+        virtio_pci_update_queue_config_device(proxy, NULL);
+        trace_remove_enable_notifier(&proxy->queue_trace_enabled);
+        proxy->queue_trace_enabled.notify = NULL;
+    }
+    if (proxy->queue_config_listener_registered) {
+        memory_listener_unregister(&proxy->queue_config_listener);
+        proxy->queue_config_listener_registered = false;
+    }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_remove(&proxy->pci_dev);
+#endif
+    irq_commit_source_update(&proxy->bus.interrupt_state, VIRTIO_PCI_ISR_PRESENT, 0);
     virtio_pci_cancel_deferred_guest_reset(proxy);
     virtio_pci_stop_ioeventfd(proxy);
 
@@ -2195,6 +3365,17 @@ static void virtio_pci_device_unplugged(DeviceState *d)
         virtio_pci_modern_mem_region_unmap(proxy, &proxy->notify);
         if (modern_pio) {
             virtio_pci_modern_io_region_unmap(proxy, &proxy->notify_pio);
+        }
+    }
+    if (proxy->direct_irq_enabled) {
+        memory_listener_unregister(&proxy->direct_irq_listener);
+        /* Wait-free for the completion path: revoke the source first. */
+        qatomic_store_release(&proxy->direct_irq_enabled, false);
+        proxy->direct_irq_depth = 0;
+        VirtIOPCIDirectRoutes *old = proxy->direct_irq_routes;
+        qatomic_rcu_set(&proxy->direct_irq_routes, NULL);
+        if (old) {
+            g_free_rcu(old, rcu);
         }
     }
 }
@@ -2372,9 +3553,16 @@ static void virtio_pci_exit(PCIDevice *pci_dev)
 static void virtio_pci_reset(DeviceState *qdev)
 {
     VirtIOPCIProxy *proxy = VIRTIO_PCI(qdev);
+    g_autoptr(VirtIOPCIQueueConfigPause) paused =
+        virtio_pci_pause_queue_config(proxy);
     VirtioBusState *bus = VIRTIO_BUS(&proxy->bus);
+    g_autoptr(VirtioNetworkLock) lock =
+        virtio_lock_network(virtio_bus_get_device(bus));
     int i;
+    g_autoptr(VirtIOPCIIRQRouteGuard) route_guard G_GNUC_UNUSED =
+        virtio_pci_guard_irq_routes(proxy);
 
+    virtio_pci_set_fast_notifiers(qdev, NULL, 0);
     virtio_pci_cancel_deferred_guest_reset(proxy);
     virtio_bus_reset(bus);
     msix_unuse_all_vectors(&proxy->pci_dev);
@@ -2412,6 +3600,9 @@ static void virtio_pci_bus_reset_hold(Object *obj)
         return;
     }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(dev);
+#endif
     virtio_pci_reset(qdev);
 
     if (pci_is_express(dev)) {
@@ -2426,6 +3617,9 @@ static void virtio_pci_bus_reset_hold(Object *obj)
             dev->config + dev->exp.pm_cap + PCI_PM_CTRL,
             PCI_PM_CTRL_STATE_MASK);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(dev);
+#endif
 }
 
 static Property virtio_pci_properties[] = {
@@ -2474,6 +3668,32 @@ static void virtio_pci_dc_realize(DeviceState *qdev, Error **errp)
     vpciklass->parent_dc_realize(qdev, errp);
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool virtio_pci_try_topo_command_write(PCIDevice *pci_dev,
+                                              uint16_t old_cmd,
+                                              uint16_t new_cmd)
+{
+    VirtIOPCIProxy *proxy = VIRTIO_PCI(pci_dev);
+    VirtIODevice *vdev;
+
+    QEMU_LOCK_GUARD(&proxy->queue_config_lock);
+    vdev = virtio_bus_get_device(&proxy->bus);
+    if (!vdev) {
+        return true;
+    }
+    if (!(new_cmd & PCI_COMMAND_MASTER)) {
+        if ((vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) ||
+            proxy->bus.ioeventfd_started) {
+            return false;
+        }
+        virtio_set_disabled(vdev, true);
+    } else {
+        virtio_set_disabled(vdev, false);
+    }
+    return true;
+}
+#endif
+
 static void virtio_pci_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -2482,6 +3702,10 @@ static void virtio_pci_class_init(ObjectClass *klass, void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     device_class_set_props(dc, virtio_pci_properties);
+    k->msi_route_change = virtio_pci_irq_route_change;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    k->try_topo_command_write = virtio_pci_try_topo_command_write;
+#endif
     k->realize = virtio_pci_realize;
     k->exit = virtio_pci_exit;
     k->vendor_id = PCI_VENDOR_ID_REDHAT_QUMRANET;
@@ -2492,10 +3716,22 @@ static void virtio_pci_class_init(ObjectClass *klass, void *data)
     rc->phases.hold = virtio_pci_bus_reset_hold;
 }
 
+static void virtio_pci_instance_init(Object *obj)
+{
+    qemu_mutex_init(&VIRTIO_PCI(obj)->queue_config_lock);
+}
+
+static void virtio_pci_instance_finalize(Object *obj)
+{
+    qemu_mutex_destroy(&VIRTIO_PCI(obj)->queue_config_lock);
+}
+
 static const TypeInfo virtio_pci_info = {
     .name          = TYPE_VIRTIO_PCI,
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(VirtIOPCIProxy),
+    .instance_init = virtio_pci_instance_init,
+    .instance_finalize = virtio_pci_instance_finalize,
     .class_init    = virtio_pci_class_init,
     .class_size    = sizeof(VirtioPCIClass),
     .abstract      = true,
@@ -2684,6 +3920,9 @@ static void virtio_pci_bus_class_init(ObjectClass *klass, void *data)
     k->query_nvectors = virtio_pci_query_nvectors;
     k->ioeventfd_enabled = virtio_pci_ioeventfd_enabled;
     k->ioeventfd_assign = virtio_pci_ioeventfd_assign;
+    k->try_queue_irq = virtio_pci_try_queue_irq;
+    k->queue_irq_ready = virtio_pci_queue_irq_ready;
+    k->set_fast_notifiers = virtio_pci_set_fast_notifiers;
     k->get_dma_as = virtio_pci_get_dma_as;
     k->iommu_enabled = virtio_pci_iommu_enabled;
     k->queue_enabled = virtio_pci_queue_enabled;

@@ -2,6 +2,7 @@
 #define QEMU_PCI_BUS_H
 
 #include "hw/pci/pci.h"
+#include "qemu/seqlock.h"
 
 /*
  * PCI Bus datastructures.
@@ -30,6 +31,8 @@ enum PCIBusFlags {
 
 #define PCI_NO_PASID UINT32_MAX
 
+typedef struct PCIConfigReadSlot PCIConfigReadSlot;
+
 struct PCIBus {
     BusState qbus;
     enum PCIBusFlags flags;
@@ -48,6 +51,14 @@ struct PCIBus {
 
     QLIST_HEAD(, PCIBus) child; /* this will be replaced by qdev later */
     QLIST_ENTRY(PCIBus) sibling;/* this will be replaced by qdev later */
+    /* Writers hold the BQL. Unlocked config probes read only presence. */
+    QemuSeqLock config_topology;
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    Notifier config_trace_enabled;
+    QemuSpin config_selector_lock;
+    PCIConfigReadSlot *config_read_slots;
+#endif
 
     /* The bus IRQ state is the logical OR of the connected devices.
        Keep a count of the number of devices with raised IRQs.  */
@@ -56,6 +67,33 @@ struct PCIBus {
 
     Notifier machine_done;
 };
+
+void pci_bus_add_child(PCIBus *bus, PCIBus *child);
+void pci_bus_remove_child(PCIBus *bus, PCIBus *child);
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+void pci_bus_enable_config_read_slots(PCIBus *bus);
+void pci_config_read_slot_register(PCIDevice *dev, unsigned cfg_data,
+                                   QemuRecMutex *irq_lock,
+                                   const bool *irq_pending);
+bool pci_config_try_interrupt_line_write(PCIBus *bus, uint8_t devfn,
+                                         uint8_t value);
+void pci_config_read_slot_remove(PCIDevice *dev);
+bool pci_config_try_unused_bar_write(PCIBus *bus, uint8_t devfn, unsigned addr,
+                                     const uint32_t *config_reg, uint32_t selector);
+bool pci_config_try_local_write(PCIBus *bus, uint8_t devfn, unsigned addr,
+                                unsigned size, uint64_t value);
+bool pci_config_read_slot_begin(PCIDevice *dev);
+void pci_config_read_slot_end(PCIDevice *dev);
+bool pci_msix_table_pause(PCIDevice *dev);
+void pci_msix_table_resume(PCIDevice *dev);
+void pci_msix_table_unregister(PCIDevice *dev);
+bool pci_msix_table_try_access(PCIDevice *dev, hwaddr addr, unsigned size,
+                               uint64_t *value, bool write);
+bool pci_config_read_slot_try(PCIBus *bus, uint8_t devfn, unsigned addr,
+                              unsigned size, uint64_t *value,
+                              const uint32_t *config_reg, uint32_t selector);
+#endif
 
 static inline bool pci_bus_is_cxl(PCIBus *bus)
 {

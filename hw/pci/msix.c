@@ -18,6 +18,7 @@
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pci_bus.h"
 #include "hw/xen/xen.h"
 #include "sysemu/xen.h"
 #include "migration/qemu-file-types.h"
@@ -32,6 +33,53 @@
 #define MSIX_CONTROL_OFFSET (PCI_MSIX_FLAGS + 1)
 #define MSIX_ENABLE_MASK (PCI_MSIX_FLAGS_ENABLE >> 8)
 #define MSIX_MASKALL_MASK (PCI_MSIX_FLAGS_MASKALL >> 8)
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+/*
+ * Slow accesses may call device callbacks or block on migration I/O.
+ * Revoke the local path without holding the device spinlock across either.
+ */
+typedef PCIDevice MSIXTableWriter;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MSIXTableWriter, pci_msix_table_resume)
+
+static MSIXTableWriter *msix_table_writer(PCIDevice *dev)
+{
+    return pci_msix_table_pause(dev) ? dev : NULL;
+}
+
+static bool msix_table_pause_split(void *opaque, hwaddr addr, unsigned size)
+{
+    PCIDevice *dev = opaque;
+    unsigned limit = dev->msix_entries_nr * PCI_MSIX_ENTRY_SIZE;
+
+    return addr < limit && size <= limit - addr && pci_msix_table_pause(dev);
+}
+
+static void msix_table_resume_split(void *opaque)
+{
+    pci_msix_table_resume(opaque);
+}
+
+static bool msix_table_try_read(void *opaque, hwaddr addr, MemOp op,
+                                MemTxAttrs attrs, uint64_t *value)
+{
+    return !attrs.memory && pci_msix_table_try_access(opaque, addr,
+                                                       memop_size(op),
+                                                       value, false);
+}
+
+static bool msix_table_try_write(void *opaque, hwaddr addr, unsigned size,
+                                 uint64_t value)
+{
+    return pci_msix_table_try_access(opaque, addr, size, &value, true);
+}
+
+#define MSIX_TABLE_GUARD(dev) \
+    g_autoptr(MSIXTableWriter) table_guard G_GNUC_UNUSED = \
+        msix_table_writer(dev)
+#else
+#define MSIX_TABLE_GUARD(dev)
+#endif
 
 static MSIMessage msix_prepare_message(PCIDevice *dev, unsigned vector)
 {
@@ -55,10 +103,14 @@ MSIMessage msix_get_message(PCIDevice *dev, unsigned vector)
 void msix_set_message(PCIDevice *dev, int vector, struct MSIMessage msg)
 {
     uint8_t *table_entry = dev->msix_table + vector * PCI_MSIX_ENTRY_SIZE;
+    MSIX_TABLE_GUARD(dev);
+
+    pci_msi_route_change(dev, true);
 
     pci_set_quad(table_entry + PCI_MSIX_ENTRY_LOWER_ADDR, msg.address);
     pci_set_long(table_entry + PCI_MSIX_ENTRY_DATA, msg.data);
     table_entry[PCI_MSIX_ENTRY_VECTOR_CTRL] &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
+    pci_msi_route_change(dev, false);
 }
 
 static uint8_t msix_pending_mask(int vector)
@@ -149,12 +201,14 @@ void msix_set_mask(PCIDevice *dev, int vector, bool mask)
 {
     unsigned offset;
     bool was_masked;
+    MSIX_TABLE_GUARD(dev);
 
     assert(vector < dev->msix_entries_nr);
 
     offset = vector * PCI_MSIX_ENTRY_SIZE + PCI_MSIX_ENTRY_VECTOR_CTRL;
 
     was_masked = msix_is_masked(dev, vector);
+    pci_msi_route_change(dev, true);
 
     if (mask) {
         dev->msix_table[offset] |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
@@ -163,6 +217,7 @@ void msix_set_mask(PCIDevice *dev, int vector, bool mask)
     }
 
     msix_handle_mask_update(dev, vector, was_masked);
+    pci_msi_route_change(dev, false);
 }
 
 static bool msix_masked(PCIDevice *dev)
@@ -212,7 +267,11 @@ static uint64_t msix_table_mmio_read(void *opaque, hwaddr addr,
                                      unsigned size)
 {
     PCIDevice *dev = opaque;
+    MSIX_TABLE_GUARD(dev);
 
+    if (!dev->msix_table) {
+        return 0;
+    }
     assert(addr + size <= dev->msix_entries_nr * PCI_MSIX_ENTRY_SIZE);
     return pci_get_long(dev->msix_table + addr);
 }
@@ -223,15 +282,27 @@ static void msix_table_mmio_write(void *opaque, hwaddr addr,
     PCIDevice *dev = opaque;
     int vector = addr / PCI_MSIX_ENTRY_SIZE;
     bool was_masked;
+    MSIX_TABLE_GUARD(dev);
 
+    if (!dev->msix_table) {
+        return;
+    }
     assert(addr + size <= dev->msix_entries_nr * PCI_MSIX_ENTRY_SIZE);
 
     was_masked = msix_is_masked(dev, vector);
+    pci_msi_route_change(dev, true);
     pci_set_long(dev->msix_table + addr, val);
     msix_handle_mask_update(dev, vector, was_masked);
+    pci_msi_route_change(dev, false);
 }
 
 static const MemoryRegionOps msix_table_mmio_ops = {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .mmio_split_pause = msix_table_pause_split,
+    .mmio_split_resume = msix_table_resume_split,
+    .try_read_lockless = msix_table_try_read,
+    .try_write_lockless = msix_table_try_write,
+#endif
     .read = msix_table_mmio_read,
     .write = msix_table_mmio_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
@@ -452,6 +523,9 @@ void msix_uninit(PCIDevice *dev, MemoryRegion *table_bar, MemoryRegion *pba_bar)
     if (!msix_present(dev)) {
         return;
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_msix_table_unregister(dev);
+#endif
     pci_del_capability(dev, PCI_CAP_ID_MSIX, MSIX_CAP_LENGTH);
     dev->msix_cap = 0;
     msix_free_irq_entries(dev);
@@ -478,6 +552,7 @@ void msix_uninit_exclusive_bar(PCIDevice *dev)
 void msix_save(PCIDevice *dev, QEMUFile *f)
 {
     unsigned n = dev->msix_entries_nr;
+    MSIX_TABLE_GUARD(dev);
 
     if (!msix_present(dev)) {
         return;
@@ -492,10 +567,12 @@ void msix_load(PCIDevice *dev, QEMUFile *f)
 {
     unsigned n = dev->msix_entries_nr;
     unsigned int vector;
+    MSIX_TABLE_GUARD(dev);
 
     if (!msix_present(dev)) {
         return;
     }
+    pci_msi_route_change(dev, true);
 
     msix_clear_all_vectors(dev);
     qemu_get_buffer(f, dev->msix_table, n * PCI_MSIX_ENTRY_SIZE);
@@ -505,6 +582,7 @@ void msix_load(PCIDevice *dev, QEMUFile *f)
     for (vector = 0; vector < n; vector++) {
         msix_handle_mask_update(dev, vector, true);
     }
+    pci_msi_route_change(dev, false);
 }
 
 /* Does device support MSI-X? */
@@ -528,7 +606,7 @@ void msix_notify(PCIDevice *dev, unsigned vector)
 
     assert(vector < dev->msix_entries_nr);
 
-    if (!dev->msix_entry_used[vector]) {
+    if (!qatomic_read(&dev->msix_entry_used[vector])) {
         return;
     }
 
@@ -544,15 +622,20 @@ void msix_notify(PCIDevice *dev, unsigned vector)
 
 void msix_reset(PCIDevice *dev)
 {
+    MSIX_TABLE_GUARD(dev);
+
     if (!msix_present(dev)) {
         return;
     }
+    pci_msi_route_change(dev, true);
     msix_clear_all_vectors(dev);
     dev->config[dev->msix_cap + MSIX_CONTROL_OFFSET] &=
             ~dev->wmask[dev->msix_cap + MSIX_CONTROL_OFFSET];
     memset(dev->msix_table, 0, dev->msix_entries_nr * PCI_MSIX_ENTRY_SIZE);
     memset(dev->msix_pba, 0, QEMU_ALIGN_UP(dev->msix_entries_nr, 64) / 8);
     msix_mask_all(dev, dev->msix_entries_nr);
+    msix_update_function_masked(dev);
+    pci_msi_route_change(dev, false);
 }
 
 /* PCI spec suggests that devices make it possible for software to configure
@@ -567,17 +650,22 @@ void msix_reset(PCIDevice *dev)
 void msix_vector_use(PCIDevice *dev, unsigned vector)
 {
     assert(vector < dev->msix_entries_nr);
-    dev->msix_entry_used[vector]++;
+    qatomic_set(&dev->msix_entry_used[vector],
+                dev->msix_entry_used[vector] + 1);
 }
 
 /* Mark vector as unused. */
 void msix_vector_unuse(PCIDevice *dev, unsigned vector)
 {
+    unsigned used;
+
     assert(vector < dev->msix_entries_nr);
-    if (!dev->msix_entry_used[vector]) {
+    used = dev->msix_entry_used[vector];
+    if (!used) {
         return;
     }
-    if (--dev->msix_entry_used[vector]) {
+    qatomic_set(&dev->msix_entry_used[vector], used - 1);
+    if (used - 1) {
         return;
     }
     msix_clr_pending(dev, vector);

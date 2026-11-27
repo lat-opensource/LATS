@@ -35,10 +35,14 @@ typedef struct VirtioBusState VirtioBusState;
 DECLARE_OBJ_CHECKERS(VirtioBusState, VirtioBusClass,
                      VIRTIO_BUS, TYPE_VIRTIO_BUS)
 
+#define VIRTIO_ISR_MASK 0xffUL
+#define VIRTIO_ISR_BROKEN UINT64_C(0x1000)
 
 struct VirtioBusClass {
     /* This is what a VirtioBus must implement */
     BusClass parent;
+    bool (*try_queue_irq)(DeviceState *d, unsigned queue);
+    bool (*queue_irq_ready)(DeviceState *d, unsigned queue);
     void (*notify)(DeviceState *d, uint16_t vector);
     void (*save_config)(DeviceState *d, QEMUFile *f);
     void (*save_queue)(DeviceState *d, int n, QEMUFile *f);
@@ -48,6 +52,8 @@ struct VirtioBusClass {
     int (*load_done)(DeviceState *d, QEMUFile *f);
     int (*load_extra_state)(DeviceState *d, QEMUFile *f);
     bool (*has_extra_state)(DeviceState *d);
+    /* Publish already registered SCSI queue notifiers, or withdraw them. */
+    void (*set_fast_notifiers)(DeviceState *d, VirtIODevice *vdev, unsigned queues);
     bool (*query_guest_notifiers)(DeviceState *d);
     int (*set_guest_notifiers)(DeviceState *d, int nvqs, bool assign);
     int (*set_host_notifier_mr)(DeviceState *d, int n,
@@ -98,6 +104,9 @@ struct VirtioBusClass {
 
 struct VirtioBusState {
     BusState parent_obj;
+
+    /* The low byte is the device ISR. The transport may use the upper bits. */
+    uint64_t interrupt_state;
 
     /*
      * Set if ioeventfd has been started.

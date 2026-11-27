@@ -28,6 +28,7 @@
 #include "hw/isa/isa.h"
 #include "hw/intc/intc.h"
 #include "hw/intc/i8259.h"
+#include "qemu/thread.h"
 #include "qom/object.h"
 
 
@@ -68,10 +69,45 @@ struct PICCommonState {
     uint32_t elcr_addr;
     MemoryRegion base_io;
     MemoryRegion elcr_io;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex local_lock;
+    bool local_pic;
+    bool int_out_level;
+#endif
 };
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#include "qemu/lockdep-lite.h"
+
+typedef PICCommonState PICLocalLock;
+
+QemuRecMutex *pic_shared_lock(void);
+
+static inline PICLocalLock *pic_local_lock_begin(PICCommonState *s)
+{
+    if (s && s->local_pic) {
+        QemuRecMutex *lock = pic_shared_lock();
+        lats_lockdep_acquire(lock, LOCK_RANK_INTC, "pic_shared_lock");
+        qemu_rec_mutex_lock(lock);
+        return s;
+    }
+    return NULL;
+}
+
+static inline void pic_local_lock_end(PICLocalLock *s)
+{
+    if (s) {
+        qemu_rec_mutex_unlock(pic_shared_lock());
+    }
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(PICLocalLock, pic_local_lock_end)
+#endif
 
 void pic_reset_common(PICCommonState *s);
 ISADevice *i8259_init_chip(const char *name, ISABus *bus, bool master);
 void pic_stat_update_irq(int irq, int level);
+bool pic_hpet_irq0_stats_idle(void);
+void pic_hpet_irq0_add_edges(uint64_t count);
 
 #endif /* QEMU_I8259_INTERNAL_H */

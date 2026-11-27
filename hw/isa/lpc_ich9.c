@@ -567,6 +567,9 @@ static void ich9_lpc_reset(DeviceState *qdev)
     uint32_t rcba_old = pci_get_long(d->config + ICH9_LPC_RCBA);
     int i;
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(d);
+#endif
     for (i = 0; i < 4; i++) {
         pci_set_byte(d->config + ICH9_LPC_PIRQA_ROUT + i,
                      ICH9_LPC_PIRQ_ROUT_DEFAULT);
@@ -579,6 +582,9 @@ static void ich9_lpc_reset(DeviceState *qdev)
 
     pci_set_long(d->config + ICH9_LPC_PMBASE, ICH9_LPC_PMBASE_DEFAULT);
     pci_set_long(d->config + ICH9_LPC_RCBA, ICH9_LPC_RCBA_DEFAULT);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(d);
+#endif
 
     ich9_cc_reset(lpc);
 
@@ -607,6 +613,9 @@ static void ich9_lpc_machine_ready(Notifier *n, void *opaque)
     uint8_t *pci_conf;
 
     pci_conf = s->d.config;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(&s->d);
+#endif
     if (memory_region_present(io_as, 0x3f8)) {
         /* com1 */
         pci_conf[0x82] |= 0x01;
@@ -623,6 +632,9 @@ static void ich9_lpc_machine_ready(Notifier *n, void *opaque)
         /* floppy */
         pci_conf[0x82] |= 0x08;
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(&s->d);
+#endif
 }
 
 /* reset control */
@@ -845,6 +857,27 @@ static void build_ich9_isa_aml(AcpiDevAmlIf *adev, Aml *scope)
     qbus_build_aml(bus, scope);
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool ich9_lpc_try_topo_write_config(PCIDevice *d, uint32_t addr,
+                                           uint32_t val, int len)
+{
+    if (ranges_overlap(addr, len, ICH9_LPC_PIRQA_ROUT, 4) ||
+        ranges_overlap(addr, len, ICH9_LPC_PIRQE_ROUT, 4)) {
+        PCIBus *bus = pci_get_bus(d);
+        if (!QLIST_EMPTY(&bus->child)) {
+            return false;
+        }
+        for (int i = 0; i < ARRAY_SIZE(bus->devices); ++i) {
+            if (bus->devices[i] && bus->devices[i]->intx_routing_notifier) {
+                return false;
+            }
+        }
+    }
+    ich9_lpc_config_write(d, addr, val, len);
+    return true;
+}
+#endif
+
 static void ich9_lpc_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
@@ -859,6 +892,11 @@ static void ich9_lpc_class_init(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_ich9_lpc;
     device_class_set_props(dc, ich9_lpc_properties);
     k->config_write = ich9_lpc_config_write;
+    k->plain_config_header = true;
+    k->plain_config_space = true;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    k->try_topo_write_config = ich9_lpc_try_topo_write_config;
+#endif
     dc->desc = "ICH9 LPC bridge";
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_ICH9_8;

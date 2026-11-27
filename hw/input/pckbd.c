@@ -23,8 +23,10 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
+#include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
 #include "hw/isa/isa.h"
@@ -36,8 +38,10 @@
 #include "hw/qdev-properties.h"
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
+#include "sysemu/tcg.h"
 
 #include "trace.h"
+#include "trace/trace-softmmu.h"
 
 /* Keyboard Controller Commands */
 
@@ -146,6 +150,39 @@
 #define KBD_OBSRC_MOUSE         0x02
 #define KBD_OBSRC_CTRL          0x04
 
+typedef KBDState KBDStatusUpdate;
+
+/*
+ * PS/2 queue callbacks can update the status again before an I/O operation
+ * returns. Keep the snapshot private until the outermost update unlocks.
+ * Loading vmstate writes the original byte, then publishes it in post_load.
+ */
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static inline bool kbd_use_status_lock(const KBDState *s)
+{
+    return s->mr_device_lock;
+}
+#endif
+
+static KBDStatusUpdate *kbd_status_update_begin(KBDState *s)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (kbd_use_status_lock(s)) {
+        qemu_rec_mutex_lock(&s->status_lock);
+        return s;
+    }
+#endif
+    return NULL;
+}
+
+static void kbd_status_update_end(KBDStatusUpdate *s)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_unlock(&s->status_lock);
+#endif
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(KBDStatusUpdate, kbd_status_update_end)
 
 /*
  * XXX: not generating the irqs if KBD_MODE_DISABLE_KBD is set may be
@@ -193,6 +230,7 @@ static uint8_t kbd_pending(KBDState *s)
 /* update irq and KBD_STAT_[MOUSE_]OBF */
 static void kbd_update_irq(KBDState *s)
 {
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
     uint8_t pending = kbd_pending(s);
 
     s->status &= ~(KBD_STAT_OBF | KBD_STAT_MOUSE_OBF);
@@ -238,6 +276,7 @@ static void kbd_safe_update_irq(KBDState *s)
 static void kbd_update_kbd_irq(void *opaque, int level)
 {
     KBDState *s = opaque;
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
 
     if (level) {
         s->pending |= KBD_PENDING_KBD;
@@ -250,6 +289,7 @@ static void kbd_update_kbd_irq(void *opaque, int level)
 static void kbd_update_aux_irq(void *opaque, int level)
 {
     KBDState *s = opaque;
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
 
     if (level) {
         s->pending |= KBD_PENDING_AUX;
@@ -262,6 +302,7 @@ static void kbd_update_aux_irq(void *opaque, int level)
 static void kbd_throttle_timeout(void *opaque)
 {
     KBDState *s = opaque;
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
 
     if (kbd_pending(s)) {
         kbd_update_irq(s);
@@ -305,6 +346,28 @@ static void outport_write(KBDState *s, uint32_t val)
 {
     trace_pckbd_outport_write(val);
     s->outport = val;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s->mr_device_lock && !qemu_mutex_iothread_locked()) {
+        qemu_rec_mutex_unlock(&s->status_lock);
+        if (lats_nobql_enabled()) {
+            qemu_set_irq(s->a20_out, (val >> 1) & 1);
+            if (!(val & 1)) {
+                qemu_vm_lifecycle_lock();
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+                qemu_vm_lifecycle_unlock();
+            }
+        } else {
+            qemu_mutex_lock_iothread();
+            qemu_set_irq(s->a20_out, (val >> 1) & 1);
+            if (!(val & 1)) {
+                qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            }
+            qemu_mutex_unlock_iothread();
+        }
+        qemu_rec_mutex_lock(&s->status_lock);
+        return;
+    }
+#endif
     qemu_set_irq(s->a20_out, (val >> 1) & 1);
     if (!(val & 1)) {
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
@@ -315,6 +378,13 @@ static void kbd_write_command(void *opaque, hwaddr addr,
                               uint64_t val, unsigned size)
 {
     KBDState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool outer_locked = s->mr_device_lock && !qemu_mutex_iothread_locked();
+    g_autoptr(KBDStatusUpdate) update = outer_locked ? NULL :
+                                        kbd_status_update_begin(s);
+#else
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
+#endif
 
     trace_pckbd_kbd_write_command(val);
 
@@ -376,15 +446,48 @@ static void kbd_write_command(void *opaque, hwaddr addr,
         kbd_queue(s, s->outport, 0);
         break;
     case KBD_CCMD_ENABLE_A20:
-        qemu_irq_raise(s->a20_out);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (outer_locked) {
+            qemu_rec_mutex_unlock(&s->status_lock);
+            qemu_mutex_lock_iothread();
+            qemu_irq_raise(s->a20_out);
+            qemu_mutex_unlock_iothread();
+            qemu_rec_mutex_lock(&s->status_lock);
+        } else
+#endif
+        {
+            qemu_irq_raise(s->a20_out);
+        }
         s->outport |= KBD_OUT_A20;
         break;
     case KBD_CCMD_DISABLE_A20:
-        qemu_irq_lower(s->a20_out);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (outer_locked) {
+            qemu_rec_mutex_unlock(&s->status_lock);
+            qemu_mutex_lock_iothread();
+            qemu_irq_lower(s->a20_out);
+            qemu_mutex_unlock_iothread();
+            qemu_rec_mutex_lock(&s->status_lock);
+        } else
+#endif
+        {
+            qemu_irq_lower(s->a20_out);
+        }
         s->outport &= ~KBD_OUT_A20;
         break;
     case KBD_CCMD_RESET:
-        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (outer_locked) {
+            qemu_rec_mutex_unlock(&s->status_lock);
+            qemu_mutex_lock_iothread();
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            qemu_mutex_unlock_iothread();
+            qemu_rec_mutex_lock(&s->status_lock);
+        } else
+#endif
+        {
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+        }
         break;
     case KBD_CCMD_NO_OP:
         /* ignore that */
@@ -400,6 +503,13 @@ static uint64_t kbd_read_data(void *opaque, hwaddr addr,
                               unsigned size)
 {
     KBDState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool outer_locked = s->mr_device_lock && !qemu_mutex_iothread_locked();
+    g_autoptr(KBDStatusUpdate) update = outer_locked ? NULL :
+                                        kbd_status_update_begin(s);
+#else
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
+#endif
 
     if (s->status & KBD_STAT_OBF) {
         kbd_deassert_irq(s);
@@ -424,6 +534,13 @@ static void kbd_write_data(void *opaque, hwaddr addr,
                            uint64_t val, unsigned size)
 {
     KBDState *s = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool outer_locked = s->mr_device_lock && !qemu_mutex_iothread_locked();
+    g_autoptr(KBDStatusUpdate) update = outer_locked ? NULL :
+                                        kbd_status_update_begin(s);
+#else
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
+#endif
 
     trace_pckbd_kbd_write_data(val);
 
@@ -473,6 +590,7 @@ static void kbd_write_data(void *opaque, hwaddr addr,
 static void kbd_reset(void *opaque)
 {
     KBDState *s = opaque;
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
 
     s->mode = KBD_MODE_KBD_INT | KBD_MODE_MOUSE_INT;
     s->status = KBD_STAT_CMD | KBD_STAT_UNLOCKED;
@@ -564,6 +682,7 @@ static const VMStateDescription vmstate_kbd_extended_state = {
 static int kbd_pre_save(void *opaque)
 {
     KBDState *s = opaque;
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
 
     if (s->extended_state) {
         s->pending_tmp = s->pending;
@@ -591,6 +710,8 @@ static int kbd_pre_load(void *opaque)
 static int kbd_post_load(void *opaque, int version_id)
 {
     KBDState *s = opaque;
+    g_autoptr(KBDStatusUpdate) update = kbd_status_update_begin(s);
+
     if (!s->outport_present) {
         s->outport = kbd_outport_default(s);
     }
@@ -842,14 +963,32 @@ static void i8042_initfn(Object *obj)
     ISAKBDState *isa_s = I8042(obj);
     KBDState *s = &isa_s->kbd;
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    s->mr_device_lock = memory_region_device_lock_enabled();
+    if (kbd_use_status_lock(s)) {
+        qemu_rec_mutex_init(&s->status_lock);
+    }
+#endif
     memory_region_init_io(isa_s->io + 0, obj, &i8042_data_ops, s,
                           "i8042-data", 1);
     memory_region_init_io(isa_s->io + 1, obj, &i8042_cmd_ops, s,
                           "i8042-cmd", 1);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s->mr_device_lock) {
+        memory_region_set_device_lock(isa_s->io + 0, &s->status_lock);
+        memory_region_set_device_lock(isa_s->io + 1, &s->status_lock);
+    }
+#endif
 
     object_initialize_child(obj, "ps2kbd", &s->ps2kbd, TYPE_PS2_KBD_DEVICE);
     object_initialize_child(obj, "ps2mouse", &s->ps2mouse,
                             TYPE_PS2_MOUSE_DEVICE);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s->mr_device_lock) {
+        PS2_DEVICE(&s->ps2kbd)->lock = &s->status_lock;
+        PS2_DEVICE(&s->ps2mouse)->lock = &s->status_lock;
+    }
+#endif
 
     qdev_init_gpio_out_named(DEVICE(obj), &s->a20_out, I8042_A20_LINE, 1);
 
@@ -859,6 +998,17 @@ static void i8042_initfn(Object *obj)
     qdev_init_gpio_in_named(DEVICE(obj), i8042_set_mouse_irq,
                             "ps2-mouse-input-irq", 1);
 }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static void i8042_finalize(Object *obj)
+{
+    KBDState *s = &I8042(obj)->kbd;
+
+    if (kbd_use_status_lock(s)) {
+        qemu_rec_mutex_destroy(&s->status_lock);
+    }
+}
+#endif
 
 static void i8042_realizefn(DeviceState *dev, Error **errp)
 {
@@ -964,6 +1114,9 @@ static const TypeInfo i8042_info = {
     .parent        = TYPE_ISA_DEVICE,
     .instance_size = sizeof(ISAKBDState),
     .instance_init = i8042_initfn,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .instance_finalize = i8042_finalize,
+#endif
     .class_init    = i8042_class_initfn,
     .interfaces = (InterfaceInfo[]) {
         { TYPE_ACPI_DEV_AML_IF },

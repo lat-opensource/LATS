@@ -21,6 +21,7 @@
  */
 
 #include "qemu/notify.h"
+#include "qemu/thread.h"
 #include "exec/memory.h"
 #include "hw/acpi/acpi_dev_interface.h"
 
@@ -138,6 +139,10 @@ struct ACPIGPE {
 
     uint8_t *sts;
     uint8_t *en;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex local_lock;
+    bool local_acpi;
+#endif
 };
 
 struct ACPIREGS {
@@ -148,7 +153,18 @@ struct ACPIREGS {
         ACPIPM1CNT  cnt;
     } pm1;
     Notifier wakeup;
+    QemuRecMutex    local_lock;
+    bool            local_lock_inited;
 };
+
+static inline QemuRecMutex *acpi_regs_ensure_lock(ACPIREGS *ar)
+{
+    if (!ar->local_lock_inited) {
+        qemu_rec_mutex_init(&ar->local_lock);
+        ar->local_lock_inited = true;
+    }
+    return &ar->local_lock;
+}
 
 /* PM_TMR */
 void acpi_pm_tmr_update(ACPIREGS *ar, bool enable);

@@ -29,14 +29,17 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qemu/log.h"
 #include "hw/i386/pc.h"
 #include "hw/pci-host/q35.h"
+#include "hw/pci/pci_bus.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "qemu/module.h"
+#include "sysemu/tcg.h"
 
 /****************************************************************************
  * Q35 host
@@ -67,6 +70,13 @@ static void q35_host_realize(DeviceState *dev, Error **errp)
                                 s->mch.address_space_io,
                                 0, TYPE_PCIE_BUS);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    PCIE_HOST_BRIDGE(dev)->mmcfg_empty_read =
+        lats_nobql_enabled();
+    if (tcg_enabled() && lats_nobql_enabled()) {
+        pci_bus_enable_config_read_slots(pci->bus);
+    }
+#endif
     qdev_realize(DEVICE(&s->mch), BUS(pci->bus), &error_fatal);
 }
 
@@ -209,10 +219,20 @@ static void q35_host_initfn(Object *obj)
     Q35PCIHost *s = Q35_HOST_DEVICE(obj);
     PCIHostState *phb = PCI_HOST_BRIDGE(obj);
     PCIExpressHost *pehb = PCIE_HOST_BRIDGE(obj);
+    const MemoryRegionOps *data_ops = &pci_host_data_le_ops;
 
     memory_region_init_io(&phb->conf_mem, obj, &pci_host_conf_le_ops, phb,
                           "pci-conf-idx", 4);
-    memory_region_init_io(&phb->data_mem, obj, &pci_host_data_le_ops, phb,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (tcg_enabled() &&
+        lats_nobql_enabled()) {
+        /* CF8 is atomic; TCG has no pending coalesced CF8 writes to flush. */
+        phb->conf_mem.disable_reentrancy_guard = true;
+        memory_region_disable_locking(&phb->conf_mem);
+        data_ops = &pci_host_data_root0_ops;
+    }
+#endif
+    memory_region_init_io(&phb->data_mem, obj, data_ops, phb,
                           "pci-conf-data", 4);
 
     object_initialize_child(OBJECT(s), "mch", &s->mch, TYPE_MCH_PCI_DEVICE);
@@ -471,6 +491,9 @@ static void mch_write_config(PCIDevice *d,
 {
     MCHPCIState *mch = MCH_PCI_DEVICE(d);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(d);
+#endif
     pci_default_write_config(d, address, val, len);
 
     if (ranges_overlap(address, len, MCH_HOST_BRIDGE_PAM0,
@@ -496,7 +519,26 @@ static void mch_write_config(PCIDevice *d,
     if (ranges_overlap(address, len, MCH_HOST_BRIDGE_F_SMBASE, 1)) {
         mch_update_smbase_smram(mch);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(d);
+#endif
 }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool mch_try_topo_write_config(PCIDevice *d, uint32_t address,
+                                      uint32_t val, int len)
+{
+    if (ranges_overlap(address, len, MCH_HOST_BRIDGE_PCIEXBAR,
+                       MCH_HOST_BRIDGE_PCIEXBAR_SIZE) ||
+        ranges_overlap(address, len, MCH_HOST_BRIDGE_EXT_TSEG_MBYTES,
+                       MCH_HOST_BRIDGE_EXT_TSEG_MBYTES_SIZE) ||
+        ranges_overlap(address, len, MCH_HOST_BRIDGE_F_SMBASE, 1)) {
+        return false;
+    }
+    mch_write_config(d, address, val, len);
+    return true;
+}
+#endif
 
 static void mch_update(MCHPCIState *mch)
 {
@@ -542,6 +584,9 @@ static void mch_reset(DeviceState *qdev)
     PCIDevice *d = PCI_DEVICE(qdev);
     MCHPCIState *mch = MCH_PCI_DEVICE(d);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(d);
+#endif
     pci_set_quad(d->config + MCH_HOST_BRIDGE_PCIEXBAR,
                  MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT);
 
@@ -559,6 +604,9 @@ static void mch_reset(DeviceState *qdev)
     d->wmask[MCH_HOST_BRIDGE_F_SMBASE] = 0xff;
 
     mch_update(mch);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(d);
+#endif
 }
 
 static void mch_realize(PCIDevice *d, Error **errp)
@@ -676,6 +724,11 @@ static void mch_class_init(ObjectClass *klass, void *data)
 
     k->realize = mch_realize;
     k->config_write = mch_write_config;
+    k->plain_config_header = true;
+    k->plain_config_space = true;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    k->try_topo_write_config = mch_try_topo_write_config;
+#endif
     dc->reset = mch_reset;
     device_class_set_props(dc, mch_props);
     set_bit(DEVICE_CATEGORY_BRIDGE, dc->categories);

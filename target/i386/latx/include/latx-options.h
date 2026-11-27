@@ -158,6 +158,7 @@ extern int option_split_strins;
 extern int option_tb_flush_on_reboot;
 extern int option_htimer;
 extern int option_irq_gate_nobql;
+extern int option_irq_kick_fast;
 
 extern int option_pushpop;
 extern int option_pushpop_ret;

@@ -73,6 +73,12 @@ struct VirtIOSerialPortClass {
          */
     void (*guest_writable)(VirtIOSerialPort *port);
 
+    /* Restore queue hints while the old receive ring is still mapped. */
+    void (*restore_rx_notifications)(VirtIOSerialPort *port);
+
+    /* One nonblocking write to the published backend, under the device lock. */
+    ssize_t (*try_write)(VirtIOSerialPort *port, const struct iovec *iov, unsigned int niov);
+
     /*
      * Guest wrote some data to the port. This data is handed over to
      * the app via this callback.  The app can return a size less than
@@ -126,6 +132,12 @@ struct VirtIOSerialPort {
      */
     VirtQueueElement *elem;
 
+    /* Published and revoked under the device lock when the backend changes. */
+    Chardev *direct_write_backend;
+    bool tx_irq_pending;
+    bool rx_irq_pending;
+    bool direct_partial;
+
     /*
      * The index and the offset into the iov buffer that was popped in
      * elem above.
@@ -169,6 +181,11 @@ typedef struct VirtIOSerialPostLoad {
 struct VirtIOSerial {
     VirtIODevice parent_obj;
 
+    QemuRecMutex tx_mutex;
+    QemuMutex socket_io_mutex;
+    bool direct_rx;
+    bool ctrl_irq_pending;
+    QEMUBH *tx_irq_bh;
     VirtQueue *c_ivq, *c_ovq;
     /* Arrays of ivqs and ovqs: one per port */
     VirtQueue **ivqs, **ovqs;

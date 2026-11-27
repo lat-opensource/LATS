@@ -18,7 +18,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "exec/irq-commit.h"
 #include "exec/page-vary.h"
+#include "trace.h"
 #include "qapi/error.h"
 
 #include "qemu/cutils.h"
@@ -147,6 +149,10 @@ typedef struct subpage_t {
     MemoryRegion iomem;
     FlatView *fv;
     hwaddr base;
+    bool has_immutable_bytes;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool has_split_pause;
+#endif
     uint16_t sub_section[];
 } subpage_t;
 
@@ -399,6 +405,45 @@ address_space_translate_internal(AddressSpaceDispatch *d, hwaddr addr, hwaddr *x
     return section;
 }
 
+const void *flatview_ram_read_ptr(FlatView *view, hwaddr addr, hwaddr len)
+{
+    hwaddr offset, available = len;
+    MemoryRegionSection *section = address_space_translate_internal(
+        flatview_to_dispatch(view), addr, &offset, &available, false);
+    MemoryRegion *mr = section->mr;
+
+    if (!memory_region_is_ram(mr) || memory_region_is_ram_device(mr) ||
+        memory_region_is_romd(mr) || available != len || (offset & 3) ||
+        memory_region_has_ram_discard_manager(mr) || xen_enabled()) {
+        return NULL;
+    }
+    return qemu_map_ram_ptr(mr->ram_block, offset);
+}
+
+
+bool address_space_try_commit_msi(AddressSpace *as, hwaddr addr,
+                                  uint32_t data, uint64_t *source,
+                                  uint64_t before, uint64_t after, bool scsi)
+{
+    hwaddr len = sizeof(data), offset;
+    MemoryRegionSection *section;
+    MemoryRegion *mr;
+
+    if ((addr & (sizeof(data) - 1)) || irq_commit_tagged(before) ||
+        irq_commit_tagged(after)) {
+        return false;
+    }
+
+    RCU_READ_LOCK_GUARD();
+    section = address_space_translate_internal(
+        flatview_to_dispatch(address_space_to_flatview(as)), addr, &offset,
+        &len, true);
+    mr = section->mr;
+    return len >= sizeof(data) && mr->ops->try_commit_msi &&
+           mr->ops->try_commit_msi(mr->opaque, offset, data,
+                                   source, before, after, scsi);
+}
+
 /**
  * address_space_translate_iommu - translate an address through an IOMMU
  * memory region and then through the target address space.
@@ -567,9 +612,9 @@ iotlb_fail:
 }
 
 /* Called from RCU critical section */
-MemoryRegion *flatview_translate(FlatView *fv, hwaddr addr, hwaddr *xlat,
-                                 hwaddr *plen, bool is_write,
-                                 MemTxAttrs attrs)
+MemoryRegion *flatview_translate_with_span(FlatView *fv, hwaddr addr, hwaddr *xlat,
+                                           hwaddr *plen, bool is_write,
+                                           MemTxAttrs attrs, hwaddr *span)
 {
     MemoryRegion *mr;
     MemoryRegionSection section;
@@ -585,7 +630,26 @@ MemoryRegion *flatview_translate(FlatView *fv, hwaddr addr, hwaddr *xlat,
         *plen = MIN(page, *plen);
     }
 
+    if (span) {
+        *span = 0;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (!memory_access_is_direct(mr, is_write) &&
+            (mr->ops->mmio_split_lock || mr->ops->mmio_split_pause)) {
+            /* MMIO dispatch may extend past this section. Group only its bytes. */
+            Int128 left = int128_sub(section.size,
+                                     int128_make64(*xlat - section.offset_within_region));
+            *span = int128_get64(int128_min(left, int128_make64(*plen)));
+        }
+#endif
+    }
     return mr;
+}
+
+MemoryRegion *flatview_translate(FlatView *fv, hwaddr addr, hwaddr *xlat,
+                                 hwaddr *plen, bool is_write,
+                                 MemTxAttrs attrs)
+{
+    return flatview_translate_with_span(fv, addr, xlat, plen, is_write, attrs, NULL);
 }
 
 typedef struct TCGIOMMUNotifier {
@@ -781,6 +845,7 @@ void cpu_address_space_init(CPUState *cpu, int asidx,
         newas->tcg_as_listener.log_global_after_sync = tcg_log_global_after_sync;
         newas->tcg_as_listener.commit = tcg_commit;
         newas->tcg_as_listener.name = "tcg";
+        newas->tcg_as_listener.nobql_safe = true;
         memory_listener_register(&newas->tcg_as_listener, as);
     }
 }
@@ -1038,8 +1103,13 @@ static uint16_t phys_section_add(PhysPageMap *map,
         map->sections = g_renew(MemoryRegionSection, map->sections,
                                 map->sections_nb_alloc);
     }
-    map->sections[map->sections_nb] = *section;
-    memory_region_ref(section->mr);
+    MemoryRegion *mr = section->mr;
+    MemoryRegionSection *entry = &map->sections[map->sections_nb];
+
+    *entry = *section;
+    entry->unmanaged_ram = memory_region_is_ram(mr) && !mr->ram_device &&
+                           !mr->rom_device && !mr->rdm;
+    memory_region_ref(mr);
     return map->sections_nb++;
 }
 
@@ -1047,7 +1117,7 @@ static void phys_section_destroy(MemoryRegion *mr)
 {
     bool have_sub_page = mr->subpage;
 
-    memory_region_unref(mr);
+    memory_region_unref_nobql(mr);
 
     if (have_sub_page) {
         subpage_t *subpage = container_of(mr, subpage_t, iomem);
@@ -1065,6 +1135,10 @@ static void phys_sections_free(PhysPageMap *map)
     g_free(map->sections);
     g_free(map->nodes);
 }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static const MemoryRegionOps subpage_split_ops;
+#endif
 
 static void register_subpage(FlatView *fv, MemoryRegionSection *section)
 {
@@ -1090,8 +1164,22 @@ static void register_subpage(FlatView *fv, MemoryRegionSection *section)
     } else {
         subpage = container_of(existing->mr, subpage_t, iomem);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (section->mr->ops->mmio_split_lock) {
+        /* The FlatView and its subpages are still under construction. */
+        subpage->iomem.ops = &subpage_split_ops;
+    }
+#endif
     start = section->offset_within_address_space & ~TARGET_PAGE_MASK;
     end = start + int128_get64(section->size) - 1;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (section->mr->ops->mmio_split_pause) {
+        subpage->has_split_pause = true;
+    }
+#endif
+    if (section->mr->immutable_byte_array) {
+        subpage->has_immutable_bytes = true;
+    }
     subpage_register(subpage, start, end,
                      phys_section_add(&d->map, section));
 }
@@ -2514,6 +2602,33 @@ static MemTxResult flatview_write(FlatView *fv, hwaddr addr, MemTxAttrs attrs,
 static bool flatview_access_valid(FlatView *fv, hwaddr addr, hwaddr len,
                                   bool is_write, MemTxAttrs attrs);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+/* The vCPU pins this mapping until dispatch completes. Require the entire
+ * access to land in the same constant region, including any partial page. */
+static const uint8_t *subpage_constant_bytes(subpage_t *subpage, hwaddr addr,
+                                              unsigned len, MemTxAttrs attrs)
+{
+    AddressSpaceDispatch *d;
+    MemoryRegionSection *section;
+    hwaddr phys, offset;
+
+    if (!subpage->has_immutable_bytes || attrs.memory || !len || len > 8 ||
+        addr > TARGET_PAGE_SIZE - len) {
+        return NULL;
+    }
+    d = flatview_to_dispatch(subpage->fv);
+    section = &d->map.sections[subpage->sub_section[addr]];
+    phys = subpage->base + addr;
+    if (!section->mr->immutable_byte_array ||
+        !section_covers_addr(section, phys + len - 1)) {
+        return NULL;
+    }
+    offset = phys - section->offset_within_address_space +
+             section->offset_within_region;
+    return (const uint8_t *)section->mr->opaque + offset;
+}
+#endif
+
 static MemTxResult subpage_read(void *opaque, hwaddr addr, uint64_t *data,
                                 unsigned len, MemTxAttrs attrs)
 {
@@ -2524,6 +2639,20 @@ static MemTxResult subpage_read(void *opaque, hwaddr addr, uint64_t *data,
 #if defined(DEBUG_SUBPAGE)
     printf("%s: subpage %p len %u addr " HWADDR_FMT_plx "\n", __func__,
            subpage, len, addr);
+#endif
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    const uint8_t *bytes = subpage_constant_bytes(subpage, addr, len, attrs);
+
+    /* Sample the leaf trace once. On fallback the ordinary leaf still takes
+     * the BQL before its trace looks up the region's absolute address. */
+    g_autoptr(IOThreadLockAuto) trace_lock = NULL;
+    if (bytes) {
+        if (!trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+            *data = ldn_p(bytes, len);
+            return MEMTX_OK;
+        }
+        trace_lock = qemu_iothread_auto_lock(__FILE__, __LINE__);
+    }
 #endif
     res = flatview_read(subpage->fv, addr + subpage->base, attrs, buf, len);
     if (res) {
@@ -2544,9 +2673,59 @@ static MemTxResult subpage_write(void *opaque, hwaddr addr,
            " value %"PRIx64"\n",
            __func__, subpage, len, addr, value);
 #endif
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(IOThreadLockAuto) trace_lock = NULL;
+    if (subpage_constant_bytes(subpage, addr, len, attrs)) {
+        if (!trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE)) {
+            return MEMTX_OK;
+        }
+        trace_lock = qemu_iothread_auto_lock(__FILE__, __LINE__);
+    }
+#endif
     stn_p(buf, len, value);
     return flatview_write(subpage->fv, addr + subpage->base, attrs, buf, len);
 }
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+/* TCG can dispatch the bytes of one instruction separately through a subpage. */
+MemoryRegionSplitPause *subpage_pause_split(MemoryRegion *mr, hwaddr addr,
+                                            unsigned size)
+{
+    subpage_t *sub = container_of(mr, subpage_t, iomem);
+    AddressSpaceDispatch *dispatch;
+    MemoryRegionSection *section;
+    hwaddr phys = sub->base + addr;
+    hwaddr offset, remaining = size;
+    Int128 span;
+
+    if (!sub->has_split_pause || size < 2 || size > TARGET_PAGE_SIZE ||
+        addr > TARGET_PAGE_SIZE - size) {
+        return NULL;
+    }
+    dispatch = flatview_to_dispatch(sub->fv);
+    section = address_space_translate_internal(dispatch, phys, &offset,
+                                               &remaining, true);
+    if (!section->mr->ops->mmio_split_pause) {
+        return NULL;
+    }
+    span = int128_sub(section->size,
+                      int128_make64(phys - section->offset_within_address_space));
+    if (int128_lt(span, int128_make64(size))) {
+        unsigned prefix = int128_get64(span);
+
+        /* Only mapped padding can complete without a guest fault. */
+        for (unsigned i = prefix; i < size; i++) {
+            MemoryRegion *tail = address_space_lookup_region(dispatch, phys + i,
+                                                             true)->mr;
+            if (tail->ops != &unassigned_io_ops) {
+                return NULL;
+            }
+        }
+        size = prefix;
+    }
+    return memory_region_pause_split(section->mr, offset, size);
+}
+#endif
 
 static bool subpage_accepts(void *opaque, hwaddr addr,
                             unsigned len, bool is_write,
@@ -2577,6 +2756,28 @@ static bool subpage_access_lockless(void *opaque, hwaddr addr,
         mr = mr->alias;
     }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (qatomic_read(&mr->subpage_dispatch_lockless) && !attrs.memory &&
+        len == sizeof(uint32_t) && !(xlat & (len - 1)) &&
+        addr <= TARGET_PAGE_SIZE - len) {
+        AddressSpaceDispatch *d = flatview_to_dispatch(subpage->fv);
+        MemoryRegionSection *s = &d->map.sections[subpage->sub_section[addr]];
+
+        if (s->mr == mr &&
+            section_covers_addr(s, subpage->base + addr + len - 1)) {
+            return true;
+        }
+    }
+    if (mr->immutable_byte_array &&
+        subpage_constant_bytes(subpage, addr, len, attrs)) {
+        return is_write ?
+            !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE) :
+            !trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ);
+    }
+    if (qatomic_read(&mr->device_lock) != NULL && plen == len) {
+        return true;
+    }
+#endif
     return qatomic_read(&mr->disable_locking) ||
            (mr->ops->access_lockless &&
             mr->ops->access_lockless(mr->opaque, xlat, len, is_write, attrs));
@@ -2593,6 +2794,49 @@ static const MemoryRegionOps subpage_ops = {
     .endianness = DEVICE_NATIVE_ENDIAN,
     .access_lockless = subpage_access_lockless,
 };
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static QemuRecMutex *subpage_split_lock(void *opaque, hwaddr addr, unsigned size)
+{
+    subpage_t *subpage = opaque;
+    AddressSpaceDispatch *dispatch = flatview_to_dispatch(subpage->fv);
+    MemoryRegionSection *section;
+    MemoryRegion *mr;
+    hwaddr phys, xlat, remaining = size;
+
+    if (!size || size > TARGET_PAGE_SIZE || addr > TARGET_PAGE_SIZE - size) {
+        return NULL;
+    }
+    phys = addr + subpage->base;
+    section = address_space_translate_internal(dispatch, phys, &xlat,
+                                               &remaining, true);
+    /* MMIO translations need not truncate their returned length. */
+    if (!section_covers_addr(section, phys + size - 1)) {
+        return NULL;
+    }
+
+    mr = section->mr;
+    while (mr->alias) {
+        xlat += mr->alias_offset;
+        mr = mr->alias;
+    }
+    return mr->ops->mmio_split_lock ?
+        mr->ops->mmio_split_lock(mr->opaque, xlat, size) : NULL;
+}
+
+static const MemoryRegionOps subpage_split_ops = {
+    .read_with_attrs = subpage_read,
+    .write_with_attrs = subpage_write,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 8,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 8,
+    .valid.accepts = subpage_accepts,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+    .access_lockless = subpage_access_lockless,
+    .mmio_split_lock = subpage_split_lock,
+};
+#endif
 
 static int subpage_register(subpage_t *mmio, uint32_t start, uint32_t end,
                             uint16_t section)
@@ -2724,7 +2968,7 @@ static void tcg_log_global_after_sync(MemoryListener *listener)
          * record/replay is enabled.
          */
         cpuas = container_of(listener, CPUAddressSpace, tcg_as_listener);
-        run_on_cpu(cpuas->cpu, do_nothing, RUN_ON_CPU_NULL);
+        run_on_cpu_nobql(cpuas->cpu, do_nothing, RUN_ON_CPU_NULL);
     }
 }
 
@@ -2732,7 +2976,9 @@ static void tcg_commit_cpu(CPUState *cpu, run_on_cpu_data data)
 {
     CPUAddressSpace *cpuas = data.host_ptr;
 
-    cpuas->memory_dispatch = address_space_to_dispatch(cpuas->as);
+    WITH_RCU_READ_LOCK_GUARD() {
+        cpuas->memory_dispatch = address_space_to_dispatch(cpuas->as);
+    }
     tlb_flush(cpu);
 }
 
@@ -2760,7 +3006,7 @@ static void tcg_commit(MemoryListener *listener)
      * all of the tcg machinery for run-on is initialized: thus halt_cond.
      */
     if (cpu->halt_cond) {
-        async_run_on_cpu(cpu, tcg_commit_cpu, RUN_ON_CPU_HOST_PTR(cpuas));
+        async_run_on_cpu_nobql(cpu, tcg_commit_cpu, RUN_ON_CPU_HOST_PTR(cpuas));
     } else {
         tcg_commit_cpu(cpu, RUN_ON_CPU_HOST_PTR(cpuas));
     }
@@ -2776,6 +3022,10 @@ static void memory_map_init(void)
     system_io = g_malloc(sizeof(*system_io));
     memory_region_init_io(system_io, NULL, &unassigned_io_ops, NULL, "io",
                           65536);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* Only holes reach the root I/O callbacks, which have no state. */
+    memory_region_disable_locking(system_io);
+#endif
     address_space_init(&address_space_io, system_io, "I/O");
 }
 
@@ -2877,6 +3127,7 @@ bool prepare_mmio_access(MemoryRegion *mr, hwaddr addr, unsigned size,
         target_mr = target_mr->alias;
     }
     lockless = qatomic_read(&target_mr->disable_locking) ||
+               qatomic_read(&target_mr->device_lock) != NULL ||
                (target_mr->ops->access_lockless &&
                 target_mr->ops->access_lockless(target_mr->opaque,
                                                 target_addr, size,
@@ -2889,7 +3140,13 @@ bool prepare_mmio_access(MemoryRegion *mr, hwaddr addr, unsigned size,
 #endif
 
     if (!lockless && !qemu_mutex_iothread_locked()) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        qemu_mutex_lock_iothread_mmio_profile_impl(
+            target_mr, memory_region_name(target_mr), target_addr,
+            is_write, __FILE__, __LINE__);
+#else
         qemu_mutex_lock_iothread();
+#endif
         release_lock = true;
     }
     if (mr->flush_coalesced_mmio) {
@@ -2897,6 +3154,44 @@ bool prepare_mmio_access(MemoryRegion *mr, hwaddr addr, unsigned size,
     }
 
     return release_lock;
+}
+
+static inline MemTxResult address_space_read_io(MemoryRegion *mr, hwaddr addr,
+                                               uint64_t *value, MemOp op,
+                                               MemTxAttrs attrs,
+                                               bool *release_lock)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (!qatomic_read(&mr->device_lock) && mr->ops->try_read_lockless &&
+        !qemu_mutex_iothread_locked() &&
+        memory_region_try_read_lockless(mr, addr, value, op, attrs)) {
+        return MEMTX_OK;
+    }
+#endif
+    *release_lock |= prepare_mmio_access(mr, addr, memop_size(op), false, attrs);
+    return memory_region_dispatch_read(mr, addr, value, op, attrs);
+}
+
+static inline MemTxResult address_space_write_io(MemoryRegion *mr, hwaddr addr,
+                                                 hwaddr available, uint64_t val,
+                                                 MemOp op, MemTxAttrs attrs,
+                                                 bool *release_lock)
+{
+    unsigned size = memop_size(op);
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* Only KVM has a coalesced write buffer to drain before dispatch. */
+    if (!qatomic_read(&mr->device_lock) && mr->ops->try_write_lockless &&
+        available >= size &&
+        (!(addr & (size - 1)) || mr->ops->valid.unaligned) &&
+        !attrs.memory && !qemu_mutex_iothread_locked() &&
+        (!mr->flush_coalesced_mmio || !kvm_enabled()) &&
+        memory_region_try_write_lockless(mr, addr, val, op, attrs)) {
+        return MEMTX_OK;
+    }
+#endif
+    *release_lock |= prepare_mmio_access(mr, addr, size, true, attrs);
+    return memory_region_dispatch_write(mr, addr, val, op, attrs);
 }
 
 /**
@@ -2926,31 +3221,93 @@ static bool flatview_access_allowed(MemoryRegion *mr, MemTxAttrs attrs,
     return false;
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+typedef QemuRecMutex FlatviewSplitLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(FlatviewSplitLock, qemu_rec_mutex_unlock)
+
+static FlatviewSplitLock *flatview_lock_split_access(
+    MemoryRegion *mr, hwaddr offset, hwaddr len, hwaddr span)
+{
+    FlatviewSplitLock *lock;
+
+    /*
+     * Only group transfers whose caller already holds the BQL. The other
+     * transfers can release the BQL between dispatches.
+     */
+    if (!mr->ops->mmio_split_lock || len < 2 || len > UINT_MAX ||
+        span < len || !qemu_mutex_iothread_locked() ||
+        memory_access_size(mr, len, offset) == len) {
+        return NULL;
+    }
+
+    lock = mr->ops->mmio_split_lock(mr->opaque, offset, len);
+    if (lock) {
+        qemu_rec_mutex_lock(lock);
+    }
+    return lock;
+}
+
+/* A transfer can enter a device after starting in RAM or another region. */
+static void flatview_pause_split_access(MemoryRegion *mr, hwaddr offset,
+                                        hwaddr span, MemTxAttrs attrs,
+                                        MemoryRegionSplitPause **pause)
+{
+    if (*pause == mr) {
+        return;
+    }
+    g_clear_pointer(pause, memory_region_resume_split);
+    if (!mr->ops->mmio_split_pause || span < 2 || span > UINT_MAX ||
+        attrs.memory || !qemu_mutex_iothread_locked()) {
+        return;
+    }
+    if (memory_access_size(mr, span, offset) < span) {
+        *pause = memory_region_pause_split(mr, offset, span);
+    }
+}
+#endif
+
 /* Called within RCU critical section.  */
 static MemTxResult flatview_write_continue(FlatView *fv, hwaddr addr,
                                            MemTxAttrs attrs,
                                            const void *ptr,
                                            hwaddr len, hwaddr addr1,
-                                           hwaddr l, MemoryRegion *mr)
+                                           hwaddr l, MemoryRegion *mr, hwaddr span)
 {
     uint8_t *ram_ptr;
     uint64_t val;
     MemTxResult result = MEMTX_OK;
     bool release_lock = false;
     const uint8_t *buf = ptr;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(FlatviewSplitLock) lock =
+        flatview_lock_split_access(mr, addr1, len, span);
+    g_autoptr(MemoryRegionSplitPause) pause = NULL;
+#endif
 
     for (;;) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (pause || mr->ops->mmio_split_pause) {
+            flatview_pause_split_access(mr, addr1, span, attrs, &pause);
+        }
+#endif
         if (!flatview_access_allowed(mr, attrs, addr1, l)) {
             result |= MEMTX_ACCESS_ERROR;
             /* Keep going. */
         } else if (!memory_access_is_direct(mr, true)) {
             l = memory_access_size(mr, l, addr1);
-            release_lock |= prepare_mmio_access(mr, addr1, l, true, attrs);
-            /* XXX: could force current_cpu to NULL to avoid
-               potential bugs */
             val = ldn_he_p(buf, l);
-            result |= memory_region_dispatch_write(mr, addr1, val,
-                                                   size_memop(l), attrs);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            if (qatomic_read(&mr->subpage_dispatch_lockless)) {
+                result |= address_space_write_io(mr, addr1, span, val,
+                                                 size_memop(l), attrs,
+                                                 &release_lock);
+            } else
+#endif
+            {
+                release_lock |= prepare_mmio_access(mr, addr1, l, true, attrs);
+                result |= memory_region_dispatch_write(mr, addr1, val,
+                                                       size_memop(l), attrs);
+            }
         } else {
             /* RAM case */
             ram_ptr = qemu_ram_ptr_length(mr->ram_block, addr1, &l, false);
@@ -2972,7 +3329,8 @@ static MemTxResult flatview_write_continue(FlatView *fv, hwaddr addr,
         }
 
         l = len;
-        mr = flatview_translate(fv, addr, &addr1, &l, true, attrs);
+        mr = flatview_translate_with_span(fv, addr, &addr1, &l, true, attrs,
+                                          &span);
     }
 
     return result;
@@ -2985,21 +3343,23 @@ static MemTxResult flatview_write(FlatView *fv, hwaddr addr, MemTxAttrs attrs,
     hwaddr l;
     hwaddr addr1;
     MemoryRegion *mr;
+    hwaddr span;
 
     l = len;
-    mr = flatview_translate(fv, addr, &addr1, &l, true, attrs);
+    mr = flatview_translate_with_span(fv, addr, &addr1, &l, true, attrs,
+                                      &span);
     if (!flatview_access_allowed(mr, attrs, addr, len)) {
         return MEMTX_ACCESS_ERROR;
     }
     return flatview_write_continue(fv, addr, attrs, buf, len,
-                                   addr1, l, mr);
+                                   addr1, l, mr, span);
 }
 
 /* Called within RCU critical section.  */
 MemTxResult flatview_read_continue(FlatView *fv, hwaddr addr,
                                    MemTxAttrs attrs, void *ptr,
                                    hwaddr len, hwaddr addr1, hwaddr l,
-                                   MemoryRegion *mr)
+                                   MemoryRegion *mr, hwaddr span)
 {
     uint8_t *ram_ptr;
     uint64_t val;
@@ -3008,16 +3368,25 @@ MemTxResult flatview_read_continue(FlatView *fv, hwaddr addr,
     uint8_t *buf = ptr;
 
     fuzz_dma_read_cb(addr, len, mr);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(FlatviewSplitLock) lock =
+        flatview_lock_split_access(mr, addr1, len, span);
+    g_autoptr(MemoryRegionSplitPause) pause = NULL;
+#endif
     for (;;) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (pause || mr->ops->mmio_split_pause) {
+            flatview_pause_split_access(mr, addr1, span, attrs, &pause);
+        }
+#endif
         if (!flatview_access_allowed(mr, attrs, addr1, l)) {
             result |= MEMTX_ACCESS_ERROR;
             /* Keep going. */
         } else if (!memory_access_is_direct(mr, false)) {
             /* I/O case */
             l = memory_access_size(mr, l, addr1);
-            release_lock |= prepare_mmio_access(mr, addr1, l, false, attrs);
-            result |= memory_region_dispatch_read(mr, addr1, &val,
-                                                  size_memop(l), attrs);
+            result |= address_space_read_io(mr, addr1, &val, size_memop(l),
+                                            attrs, &release_lock);
             stn_he_p(buf, l, val);
         } else {
             /* RAM case */
@@ -3039,7 +3408,8 @@ MemTxResult flatview_read_continue(FlatView *fv, hwaddr addr,
         }
 
         l = len;
-        mr = flatview_translate(fv, addr, &addr1, &l, false, attrs);
+        mr = flatview_translate_with_span(fv, addr, &addr1, &l, false, attrs,
+                                          &span);
     }
 
     return result;
@@ -3052,14 +3422,16 @@ static MemTxResult flatview_read(FlatView *fv, hwaddr addr,
     hwaddr l;
     hwaddr addr1;
     MemoryRegion *mr;
+    hwaddr span;
 
     l = len;
-    mr = flatview_translate(fv, addr, &addr1, &l, false, attrs);
+    mr = flatview_translate_with_span(fv, addr, &addr1, &l, false, attrs,
+                                      &span);
     if (!flatview_access_allowed(mr, attrs, addr, len)) {
         return MEMTX_ACCESS_ERROR;
     }
     return flatview_read_continue(fv, addr, attrs, buf, len,
-                                  addr1, l, mr);
+                                  addr1, l, mr, span);
 }
 
 MemTxResult address_space_read_full(AddressSpace *as, hwaddr addr,
@@ -3376,6 +3748,11 @@ void *address_space_map(AddressSpace *as,
     fv = address_space_to_flatview(as);
     mr = flatview_translate(fv, addr, &xlat, &l, is_write, attrs);
 
+    if (attrs.memory && (!memory_region_is_ram(mr) ||
+                         !memory_access_is_direct(mr, is_write))) {
+        *plen = 0;
+        return NULL;
+    }
     if (!memory_access_is_direct(mr, is_write)) {
         if (qatomic_xchg(&bounce.in_use, true)) {
             *plen = 0;
@@ -3462,16 +3839,16 @@ void cpu_physical_memory_unmap(void *buffer, hwaddr len,
 #define RCU_READ_UNLOCK(...)     rcu_read_unlock()
 #include "memory_ldst.c.inc"
 
-int64_t address_space_cache_init(MemoryRegionCache *cache,
-                                 AddressSpace *as,
-                                 hwaddr addr,
-                                 hwaddr len,
-                                 bool is_write)
+static int64_t address_space_cache_init_internal(MemoryRegionCache *cache,
+                                                 AddressSpace *as, hwaddr addr,
+                                                 hwaddr len, bool is_write,
+                                                 bool ram_only)
 {
     AddressSpaceDispatch *d;
     hwaddr l;
     MemoryRegion *mr;
     Int128 diff;
+    bool direct;
 
     assert(len > 0);
 
@@ -3491,7 +3868,17 @@ int64_t address_space_cache_init(MemoryRegionCache *cache,
 
     mr = cache->mrs.mr;
     memory_region_ref(mr);
-    if (memory_access_is_direct(mr, is_write)) {
+    if (ram_only) {
+        /* Region properties may already be changing in the next memory map. */
+        direct = l == len && cache->mrs.unmanaged_ram &&
+                 (!is_write || !cache->mrs.readonly) && !xen_enabled();
+        if (!direct) {
+            l = 0;
+        }
+    } else {
+        direct = memory_access_is_direct(mr, is_write);
+    }
+    if (direct) {
         /* We don't care about the memory attributes here as we're only
          * doing this if we found actual RAM, which behaves the same
          * regardless of attributes; so UNSPECIFIED is fine.
@@ -3507,6 +3894,20 @@ int64_t address_space_cache_init(MemoryRegionCache *cache,
     cache->len = l;
     cache->is_write = is_write;
     return l;
+}
+
+int64_t address_space_cache_init(MemoryRegionCache *cache, AddressSpace *as,
+                                 hwaddr addr, hwaddr len, bool is_write)
+{
+    return address_space_cache_init_internal(cache, as, addr, len, is_write,
+                                             false);
+}
+
+int64_t address_space_cache_init_ram(MemoryRegionCache *cache, AddressSpace *as,
+                                     hwaddr addr, hwaddr len, bool is_write)
+{
+    return address_space_cache_init_internal(cache, as, addr, len, is_write,
+                                             true);
 }
 
 void address_space_cache_invalidate(MemoryRegionCache *cache,
@@ -3528,7 +3929,7 @@ void address_space_cache_destroy(MemoryRegionCache *cache)
     if (xen_enabled()) {
         xen_invalidate_map_cache_entry(cache->ptr);
     }
-    memory_region_unref(cache->mrs.mr);
+    memory_region_unref_nobql(cache->mrs.mr);
     flatview_unref(cache->fv);
     cache->mrs.mr = NULL;
     cache->fv = NULL;
@@ -3571,15 +3972,11 @@ MemTxResult
 address_space_read_cached_slow(MemoryRegionCache *cache, hwaddr addr,
                                    void *buf, hwaddr len)
 {
-    hwaddr addr1, l;
-    MemoryRegion *mr;
+    hwaddr base = cache->mrs.offset_within_address_space +
+                  (cache->xlat - cache->mrs.offset_within_region);
 
-    l = len;
-    mr = address_space_translate_cached(cache, addr, &addr1, &l, false,
-                                        MEMTXATTRS_UNSPECIFIED);
-    return flatview_read_continue(cache->fv,
-                                  addr, MEMTXATTRS_UNSPECIFIED, buf, len,
-                                  addr1, l, mr);
+    return flatview_read(cache->fv, base + addr, MEMTXATTRS_UNSPECIFIED,
+                          buf, len);
 }
 
 /* Called from RCU critical section. address_space_write_cached uses this
@@ -3589,15 +3986,11 @@ MemTxResult
 address_space_write_cached_slow(MemoryRegionCache *cache, hwaddr addr,
                                     const void *buf, hwaddr len)
 {
-    hwaddr addr1, l;
-    MemoryRegion *mr;
+    hwaddr base = cache->mrs.offset_within_address_space +
+                  (cache->xlat - cache->mrs.offset_within_region);
 
-    l = len;
-    mr = address_space_translate_cached(cache, addr, &addr1, &l, true,
-                                        MEMTXATTRS_UNSPECIFIED);
-    return flatview_write_continue(cache->fv,
-                                   addr, MEMTXATTRS_UNSPECIFIED, buf, len,
-                                   addr1, l, mr);
+    return flatview_write(cache->fv, base + addr, MEMTXATTRS_UNSPECIFIED,
+                          buf, len);
 }
 
 #define ARG1_DECL                MemoryRegionCache *cache
@@ -4016,3 +4409,5 @@ bool ram_block_discard_is_required(void)
     return qatomic_read(&ram_block_discard_required_cnt) ||
            qatomic_read(&ram_block_coordinated_discard_required_cnt);
 }
+
+IRQCommit irq_commit;

@@ -46,7 +46,7 @@ void cpu_set_apic_base(DeviceState *dev, uint64_t val)
         /* switching to x2APIC, reset possibly modified xAPIC ID */
         if (!(s->apicbase & MSR_IA32_APICBASE_EXTD) &&
             (val & MSR_IA32_APICBASE_EXTD)) {
-            s->id = s->initial_apic_id;
+            apic_set_id(dev, s->initial_apic_id);
         }
         info->set_base(s, val);
     }
@@ -99,7 +99,7 @@ void apic_enable_tpr_access_reporting(DeviceState *dev, bool enable)
     APICCommonState *s = APIC_COMMON(dev);
     APICCommonClass *info = APIC_COMMON_GET_CLASS(s);
 
-    apic_report_tpr_access = enable;
+    qatomic_set(&apic_report_tpr_access, enable);
     if (info->enable_tpr_reporting) {
         info->enable_tpr_reporting(s, enable);
     }
@@ -110,8 +110,10 @@ void apic_enable_vapic(DeviceState *dev, hwaddr paddr)
     APICCommonState *s = APIC_COMMON(dev);
     APICCommonClass *info = APIC_COMMON_GET_CLASS(s);
 
+    apic_ipi_quiesce();
     s->vapic_paddr = paddr;
     info->vapic_base_update(s);
+    apic_ipi_resume();
 }
 
 void apic_handle_tpr_access_report(DeviceState *dev, target_ulong ip,
@@ -191,6 +193,7 @@ void apic_init_reset(DeviceState *dev)
     if (!dev) {
         return;
     }
+    apic_ipi_quiesce();
     s = APIC_COMMON(dev);
     s->tpr = 0;
     s->spurious_vec = 0xff;
@@ -203,7 +206,8 @@ void apic_init_reset(DeviceState *dev)
         s->lvt[i] = APIC_LVT_MASKED;
     }
     s->esr = 0;
-    memset(s->icr, 0, sizeof(s->icr));
+    qatomic_set(&s->icr[0], 0);
+    qatomic_set(&s->icr[1], 0);
     s->divide_conf = 0;
     s->count_shift = 0;
     s->initial_count = 0;
@@ -212,7 +216,13 @@ void apic_init_reset(DeviceState *dev)
     s->wait_for_sipi = !cpu_is_bsp(s->cpu);
 
     if (s->timer) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        qemu_rec_mutex_lock(&s->timer_lock);
+#endif
         timer_del(s->timer);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        qemu_rec_mutex_unlock(&s->timer_lock);
+#endif
     }
     s->timer_expiry = -1;
 
@@ -220,6 +230,7 @@ void apic_init_reset(DeviceState *dev)
     if (info->reset) {
         info->reset(s);
     }
+    apic_ipi_resume();
 }
 
 void apic_designate_bsp(DeviceState *dev, bool bsp)
@@ -242,9 +253,10 @@ static void apic_reset_common(DeviceState *dev)
     APICCommonClass *info = APIC_COMMON_GET_CLASS(s);
     uint32_t bsp;
 
+    apic_ipi_quiesce();
     bsp = s->apicbase & MSR_IA32_APICBASE_BSP;
     s->apicbase = APIC_DEFAULT_ADDRESS | bsp | MSR_IA32_APICBASE_ENABLE;
-    s->id = s->initial_apic_id;
+    apic_set_id(dev, s->initial_apic_id);
 
     kvm_reset_irq_delivered();
 
@@ -252,6 +264,7 @@ static void apic_reset_common(DeviceState *dev)
     info->vapic_base_update(s);
 
     apic_init_reset(dev);
+    apic_ipi_resume();
 }
 
 static const VMStateDescription vmstate_apic_common;

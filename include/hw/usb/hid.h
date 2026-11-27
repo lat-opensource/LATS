@@ -14,4 +14,10 @@
 #define USB_DT_REPORT 0x22
 #define USB_DT_PHY    0x23
 
+#define TYPE_USB_TABLET "usb-tablet"
+
+struct USBEndpoint;
+/* Called under BQL for an IN endpoint of the controller's cached queue. */
+bool usb_tablet_can_nak(struct USBEndpoint *ep);
+
 #endif

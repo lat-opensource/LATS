@@ -7,6 +7,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
+#include "qemu/thread.h"
 #include "sysemu/runstate.h"
 #include "migration/vmstate.h"
 #include "hw/irq.h"
@@ -20,6 +22,7 @@ struct Port92State {
     ISADevice parent_obj;
 
     MemoryRegion io;
+    QemuRecMutex local_lock;
     uint8_t outport;
     qemu_irq a20_out;
 };
@@ -28,12 +31,22 @@ static void port92_write(void *opaque, hwaddr addr, uint64_t val,
                          unsigned size)
 {
     Port92State *s = opaque;
-    int oldval = s->outport;
+    int oldval = qatomic_read(&s->outport);
 
     trace_port92_write(val);
-    s->outport = val;
+    qatomic_set(&s->outport, val);
     qemu_set_irq(s->a20_out, (val >> 1) & 1);
     if ((val & 1) && !(oldval & 1)) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (!qemu_mutex_iothread_locked()) {
+            qemu_rec_mutex_unlock(&s->local_lock);
+            qemu_mutex_lock_iothread();
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+            qemu_mutex_unlock_iothread();
+            qemu_rec_mutex_lock(&s->local_lock);
+            return;
+        }
+#endif
         qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
     }
 }
@@ -44,7 +57,7 @@ static uint64_t port92_read(void *opaque, hwaddr addr,
     Port92State *s = opaque;
     uint32_t ret;
 
-    ret = s->outport;
+    ret = qatomic_read(&s->outport);
     trace_port92_read(ret);
 
     return ret;
@@ -64,7 +77,7 @@ static void port92_reset(DeviceState *d)
 {
     Port92State *s = PORT92(d);
 
-    s->outport &= ~1;
+    qatomic_and(&s->outport, (uint8_t)~1u);
 }
 
 static const MemoryRegionOps port92_ops = {
@@ -81,7 +94,11 @@ static void port92_initfn(Object *obj)
 {
     Port92State *s = PORT92(obj);
 
+    qemu_rec_mutex_init(&s->local_lock);
     memory_region_init_io(&s->io, OBJECT(s), &port92_ops, s, "port92", 1);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&s->io, &s->local_lock);
+#endif
 
     s->outport = 0;
 

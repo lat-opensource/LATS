@@ -45,5 +45,31 @@ void address_space_dispatch_free(AddressSpaceDispatch *d);
 
 void mtree_print_dispatch(struct AddressSpaceDispatch *d,
                           MemoryRegion *root);
+
+bool memory_region_try_read_lockless(MemoryRegion *mr, hwaddr addr,
+                                     uint64_t *value, MemOp op,
+                                     MemTxAttrs attrs);
+bool memory_region_try_write_lockless(MemoryRegion *mr, hwaddr addr,
+                                      uint64_t value, MemOp op,
+                                      MemTxAttrs attrs);
+
+typedef MemoryRegion MemoryRegionSplitPause;
+
+MemoryRegionSplitPause *subpage_pause_split(MemoryRegion *mr, hwaddr addr,
+                                            unsigned size);
+
+static inline MemoryRegionSplitPause *memory_region_pause_split(
+    MemoryRegion *mr, hwaddr addr, unsigned size)
+{
+    return mr->ops->mmio_split_pause &&
+           mr->ops->mmio_split_pause(mr->opaque, addr, size) ? mr : NULL;
+}
+
+static inline void memory_region_resume_split(MemoryRegionSplitPause *mr)
+{
+    mr->ops->mmio_split_resume(mr->opaque);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MemoryRegionSplitPause, memory_region_resume_split)
 #endif
 #endif

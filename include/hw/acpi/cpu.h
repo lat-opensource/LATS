@@ -16,6 +16,7 @@
 #include "hw/acpi/acpi.h"
 #include "hw/acpi/aml-build.h"
 #include "hw/hotplug.h"
+#include "qemu/thread.h"
 
 typedef struct AcpiCpuStatus {
     struct CPUState *cpu;
@@ -33,6 +34,10 @@ typedef struct CPUHotplugState {
     uint8_t command;
     uint32_t dev_count;
     AcpiCpuStatus *devs;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex local_lock;
+    bool local_acpi;
+#endif
 } CPUHotplugState;
 
 void acpi_cpu_plug_cb(HotplugHandler *hotplug_dev,

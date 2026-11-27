@@ -652,6 +652,25 @@ static void usb_hid_handle_control(USBDevice *dev, USBPacket *p,
     }
 }
 
+bool usb_tablet_can_nak(USBEndpoint *ep)
+{
+    USBDevice *dev = ep->dev;
+    USBHIDState *us;
+    HIDState *hs;
+
+    if (!object_dynamic_cast(OBJECT(dev), TYPE_USB_TABLET)) {
+        return false;
+    }
+
+    us = USB_HID(dev);
+    hs = &us->hid;
+    return dev->attached && dev->state == USB_STATE_DEFAULT &&
+           ep == us->intr && ep->pid == USB_TOKEN_IN &&
+           ep->type == USB_ENDPOINT_XFER_INT &&
+           QTAILQ_EMPTY(&ep->queue) && !ep->halted && !dev->pcap &&
+           hs->ptr.mouse_grabbed && !hs->idle && !hid_has_events(hs);
+}
+
 static void usb_hid_handle_data(USBDevice *dev, USBPacket *p)
 {
     USBHIDState *us = USB_HID(dev);
@@ -813,7 +832,7 @@ static void usb_tablet_class_initfn(ObjectClass *klass, void *data)
 }
 
 static const TypeInfo usb_tablet_info = {
-    .name          = "usb-tablet",
+    .name          = TYPE_USB_TABLET,
     .parent        = TYPE_USB_HID,
     .class_init    = usb_tablet_class_initfn,
 };

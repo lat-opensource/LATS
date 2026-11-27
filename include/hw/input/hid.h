@@ -2,6 +2,7 @@
 #define QEMU_HID_H
 
 #include "ui/input.h"
+#include "qemu/thread.h"
 
 #define HID_MOUSE     1
 #define HID_TABLET    2
@@ -46,6 +47,8 @@ struct HIDState {
     QEMUTimer *idle_timer;
     HIDEventFunc event;
     QemuInputHandlerState *s;
+    QemuMutex lock;
+    QEMUBH *activate_bh;
 };
 
 void hid_init(HIDState *hs, int kind, HIDEventFunc event);

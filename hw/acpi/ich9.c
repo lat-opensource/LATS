@@ -35,6 +35,9 @@
 #include "sysemu/runstate.h"
 #include "hw/acpi/acpi.h"
 #include "hw/acpi/ich9_tco.h"
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#include "trace/trace-softmmu.h"
+#endif
 
 #include "hw/southbridge/ich9.h"
 #include "hw/mem/pc-dimm.h"
@@ -69,9 +72,83 @@ static void ich9_gpe_writeb(void *opaque, hwaddr addr, uint64_t val,
     acpi_update_sci(&pm->acpi_regs, pm->irq);
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool ich9_gpe_try_read(void *opaque, hwaddr addr, MemOp op,
+                              MemTxAttrs attrs, uint64_t *value)
+{
+    ICH9LPCPMRegs *pm = opaque;
+    ACPIREGS *ar = &pm->acpi_regs;
+    unsigned size = memop_size(op);
+    uint64_t val = 0;
+
+    if (!ar->gpe.local_acpi || attrs.memory ||
+        (size != 1 && size != 2 && size != 4) ||
+        addr + size > ar->gpe.len ||
+        trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+        return false;
+    }
+
+    qemu_rec_mutex_lock(&ar->gpe.local_lock);
+    for (unsigned i = 0; i < size; i++) {
+        val |= (uint64_t)acpi_gpe_ioport_readb(ar, addr + i) << (i * 8);
+    }
+    qemu_rec_mutex_unlock(&ar->gpe.local_lock);
+    *value = val;
+    return true;
+}
+
+static bool ich9_gpe_try_write(void *opaque, hwaddr addr,
+                               unsigned size, uint64_t val)
+{
+    ICH9LPCPMRegs *pm = opaque;
+    ACPIREGS *ar = &pm->acpi_regs;
+    uint8_t half = ar->gpe.len / 2;
+    uint8_t new_sts0, new_en0;
+    bool old_gpe_sci, new_gpe_sci;
+
+    if (!ar->gpe.local_acpi ||
+        (size != 1 && size != 2 && size != 4) ||
+        addr + size > ar->gpe.len) {
+        return false;
+    }
+
+    qemu_rec_mutex_lock(&ar->gpe.local_lock);
+    if (ar->pm1.evt.en & ACPI_BITMASK_TIMER_ENABLE) {
+        qemu_rec_mutex_unlock(&ar->gpe.local_lock);
+        return false;
+    }
+    new_sts0 = ar->gpe.sts[0];
+    new_en0 = ar->gpe.en[0];
+    old_gpe_sci = (new_sts0 & new_en0) != 0;
+    for (unsigned i = 0; i < size; i++) {
+        uint32_t off = addr + i;
+        uint8_t b = (val >> (i * 8)) & 0xff;
+        if (off == 0) {
+            new_sts0 &= ~b;
+        } else if (off == half) {
+            new_en0 = b;
+        }
+    }
+    new_gpe_sci = (new_sts0 & new_en0) != 0;
+    if (old_gpe_sci != new_gpe_sci) {
+        qemu_rec_mutex_unlock(&ar->gpe.local_lock);
+        return false;
+    }
+    for (unsigned i = 0; i < size; i++) {
+        acpi_gpe_ioport_writeb(ar, addr + i, (val >> (i * 8)) & 0xff);
+    }
+    qemu_rec_mutex_unlock(&ar->gpe.local_lock);
+    return true;
+}
+#endif
+
 static const MemoryRegionOps ich9_gpe_ops = {
     .read = ich9_gpe_readb,
     .write = ich9_gpe_writeb,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .try_read_lockless = ich9_gpe_try_read,
+    .try_write_lockless = ich9_gpe_try_write,
+#endif
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
     .impl.min_access_size = 1,
@@ -310,6 +387,10 @@ void ich9_pm_init(PCIDevice *lpc_pci, ICH9LPCPMRegs *pm, qemu_irq sci_irq)
 
     memory_region_init_io(&pm->io_smi, OBJECT(lpc_pci), &ich9_smi_ops, pm,
                           "acpi-smi", 8);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&pm->io_smi,
+                                  acpi_regs_ensure_lock(&pm->acpi_regs));
+#endif
     memory_region_add_subregion(&pm->io, ICH9_PMIO_SMI_EN, &pm->io_smi);
 
     if (pm->enable_tco) {

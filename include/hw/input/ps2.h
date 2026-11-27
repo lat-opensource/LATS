@@ -26,6 +26,7 @@
 #define HW_PS2_H
 
 #include "hw/sysbus.h"
+#include "qemu/thread.h"
 
 #define PS2_MOUSE_BUTTON_LEFT   0x01
 #define PS2_MOUSE_BUTTON_RIGHT  0x02
@@ -59,6 +60,9 @@ struct PS2State {
     PS2Queue queue;
     int32_t write_cmd;
     qemu_irq irq;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex *lock;
+#endif
 };
 
 #define TYPE_PS2_DEVICE "ps2-device"

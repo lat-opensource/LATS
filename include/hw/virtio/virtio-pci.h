@@ -15,6 +15,7 @@
 #ifndef QEMU_VIRTIO_PCI_H
 #define QEMU_VIRTIO_PCI_H
 
+#include "qemu/bitmap.h"
 #include "hw/pci/msi.h"
 #include "hw/virtio/virtio-bus.h"
 #include "qom/object.h"
@@ -164,6 +165,24 @@ struct VirtIOPCIProxy {
     uint32_t gfselect;
     uint32_t guest_features[2];
     VirtIOPCIQueue vqs[VIRTIO_QUEUE_MAX];
+    Notifier queue_trace_enabled;
+    QemuMutex queue_config_lock;
+    VirtIODevice *queue_config_device;
+    unsigned queue_config_paused;
+    MemoryListener queue_config_listener;
+    bool queue_config_listener_registered;
+    /* Bit 0 admits notifications. The upper bits count current writers. */
+    unsigned fast_notify_state;
+    bool direct_irq_enabled;
+    uint16_t direct_irq_device;
+    unsigned direct_irq_depth;
+    uint64_t direct_irq_version;
+    struct VirtIOPCIDirectRoutes *direct_irq_routes;
+    MemoryListener direct_irq_listener;
+    VirtIODevice *fast_notify_device;
+    unsigned fast_notify_queues;
+    unsigned long fast_notify_present[BITS_TO_LONGS(VIRTIO_QUEUE_MAX)];
+    unsigned fast_notify_stride;
     QEMUBH *guest_reset_bh;
     bool guest_reset_pending;
     bool guest_flr_pending;

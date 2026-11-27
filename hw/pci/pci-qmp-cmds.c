@@ -133,7 +133,7 @@ static PciDeviceInfo *qmp_query_pci_device(PCIDevice *dev, PCIBus *bus,
     info->irq_pin = dev->config[PCI_INTERRUPT_PIN];
     if (dev->config[PCI_INTERRUPT_PIN] != 0) {
         info->has_irq = true;
-        info->irq = dev->config[PCI_INTERRUPT_LINE];
+        info->irq = pci_default_read_config(dev, PCI_INTERRUPT_LINE, 1);
     }
 
     type = dev->config[PCI_HEADER_TYPE] & ~PCI_HEADER_TYPE_MULTI_FUNCTION;

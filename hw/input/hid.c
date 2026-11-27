@@ -24,6 +24,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockable.h"
+#include "qemu/main-loop.h"
 #include "ui/console.h"
 #include "qemu/timer.h"
 #include "hw/input/hid.h"
@@ -74,6 +76,7 @@ static const uint8_t hid_usage_keys[0x100] = {
 
 bool hid_has_events(HIDState *hs)
 {
+    QEMU_LOCK_GUARD(&hs->lock);
     return hs->n > 0 || hs->idle_pending;
 }
 
@@ -81,11 +84,13 @@ static void hid_idle_timer(void *opaque)
 {
     HIDState *hs = opaque;
 
+    qemu_mutex_lock(&hs->lock);
     hs->idle_pending = true;
+    qemu_mutex_unlock(&hs->lock);
     hs->event(hs);
 }
 
-static void hid_del_idle_timer(HIDState *hs)
+static void hid_del_idle_timer_locked(HIDState *hs)
 {
     if (hs->idle_timer) {
         timer_free(hs->idle_timer);
@@ -95,6 +100,7 @@ static void hid_del_idle_timer(HIDState *hs)
 
 void hid_set_next_idle(HIDState *hs)
 {
+    QEMU_LOCK_GUARD(&hs->lock);
     if (hs->idle) {
         uint64_t expire_time = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                                NANOSECONDS_PER_SECOND * hs->idle * 4 / 1000;
@@ -103,7 +109,7 @@ void hid_set_next_idle(HIDState *hs)
         }
         timer_mod_ns(hs->idle_timer, expire_time);
     } else {
-        hid_del_idle_timer(hs);
+        hid_del_idle_timer_locked(hs);
     }
 }
 
@@ -122,6 +128,7 @@ static void hid_pointer_event(DeviceState *dev, QemuConsole *src,
     InputMoveEvent *move;
     InputBtnEvent *btn;
 
+    QEMU_LOCK_GUARD(&hs->lock);
     assert(hs->n < QUEUE_LENGTH);
     e = &hs->ptr.queue[(hs->head + hs->n) & QUEUE_MASK];
 
@@ -170,12 +177,15 @@ static void hid_pointer_sync(DeviceState *dev)
     HIDState *hs = (HIDState *)dev;
     HIDPointerEvent *prev, *curr, *next;
     bool event_compression = false;
+    bool notify = false;
 
+    qemu_mutex_lock(&hs->lock);
     if (hs->n == QUEUE_LENGTH-1) {
         /*
          * Queue full.  We are losing information, but we at least
          * keep track of most recent button state.
          */
+        qemu_mutex_unlock(&hs->lock);
         return;
     }
 
@@ -221,6 +231,10 @@ static void hid_pointer_sync(DeviceState *dev)
         next->buttons_state = curr->buttons_state;
         /* make current guest visible, notify guest */
         hs->n++;
+        notify = true;
+    }
+    qemu_mutex_unlock(&hs->lock);
+    if (notify) {
         hs->event(hs);
     }
 }
@@ -236,7 +250,9 @@ static void hid_keyboard_event(DeviceState *dev, QemuConsole *src,
     count = qemu_input_key_value_to_scancode(key->key,
                                              key->down,
                                              scancodes);
+    qemu_mutex_lock(&hs->lock);
     if (hs->n + count > QUEUE_LENGTH) {
+        qemu_mutex_unlock(&hs->lock);
         trace_hid_kbd_queue_full();
         return;
     }
@@ -244,6 +260,7 @@ static void hid_keyboard_event(DeviceState *dev, QemuConsole *src,
         slot = (hs->head + hs->n) & QUEUE_MASK; hs->n++;
         hs->kbd.keycodes[slot] = scancodes[i];
     }
+    qemu_mutex_unlock(&hs->lock);
     hs->event(hs);
 }
 
@@ -347,11 +364,25 @@ static inline int int_clamp(int val, int vmin, int vmax)
     }
 }
 
+static void hid_pointer_activate_bh(void *opaque)
+{
+    HIDState *hs = opaque;
+
+    if (!qatomic_read(&hs->ptr.mouse_grabbed) && hs->s) {
+        qemu_input_handler_activate(hs->s);
+        qatomic_set(&hs->ptr.mouse_grabbed, 1);
+    }
+}
+
 void hid_pointer_activate(HIDState *hs)
 {
-    if (!hs->ptr.mouse_grabbed) {
-        qemu_input_handler_activate(hs->s);
-        hs->ptr.mouse_grabbed = 1;
+    if (!qatomic_read(&hs->ptr.mouse_grabbed)) {
+        if (qemu_mutex_iothread_locked()) {
+            qemu_input_handler_activate(hs->s);
+            qatomic_set(&hs->ptr.mouse_grabbed, 1);
+        } else if (hs->activate_bh) {
+            qemu_bh_schedule(hs->activate_bh);
+        }
     }
 }
 
@@ -361,9 +392,10 @@ int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len)
     int index;
     HIDPointerEvent *e;
 
-    hs->idle_pending = false;
-
     hid_pointer_activate(hs);
+
+    QEMU_LOCK_GUARD(&hs->lock);
+    hs->idle_pending = false;
 
     /* When the buffer is empty, return the last event.  Relative
        movements will all be zero.  */
@@ -439,6 +471,7 @@ int hid_pointer_poll(HIDState *hs, uint8_t *buf, int len)
 
 int hid_keyboard_poll(HIDState *hs, uint8_t *buf, int len)
 {
+    QEMU_LOCK_GUARD(&hs->lock);
     hs->idle_pending = false;
 
     if (len < 2) {
@@ -484,6 +517,7 @@ int hid_keyboard_write(HIDState *hs, uint8_t *buf, int len)
 
 void hid_reset(HIDState *hs)
 {
+    QEMU_LOCK_GUARD(&hs->lock);
     switch (hs->kind) {
     case HID_KEYBOARD:
         memset(hs->kbd.keycodes, 0, sizeof(hs->kbd.keycodes));
@@ -501,13 +535,20 @@ void hid_reset(HIDState *hs)
     hs->protocol = 1;
     hs->idle = 0;
     hs->idle_pending = false;
-    hid_del_idle_timer(hs);
+    hid_del_idle_timer_locked(hs);
 }
 
 void hid_free(HIDState *hs)
 {
+    if (hs->activate_bh) {
+        qemu_bh_delete(hs->activate_bh);
+        hs->activate_bh = NULL;
+    }
     qemu_input_handler_unregister(hs->s);
-    hid_del_idle_timer(hs);
+    qemu_mutex_lock(&hs->lock);
+    hid_del_idle_timer_locked(hs);
+    qemu_mutex_unlock(&hs->lock);
+    qemu_mutex_destroy(&hs->lock);
 }
 
 static QemuInputHandler hid_keyboard_handler = {
@@ -532,6 +573,7 @@ static QemuInputHandler hid_tablet_handler = {
 
 void hid_init(HIDState *hs, int kind, HIDEventFunc event)
 {
+    qemu_mutex_init(&hs->lock);
     hs->kind = kind;
     hs->event = event;
 
@@ -542,9 +584,11 @@ void hid_init(HIDState *hs, int kind, HIDEventFunc event)
     } else if (hs->kind == HID_MOUSE) {
         hs->s = qemu_input_handler_register((DeviceState *)hs,
                                             &hid_mouse_handler);
+        hs->activate_bh = qemu_bh_new(hid_pointer_activate_bh, hs);
     } else if (hs->kind == HID_TABLET) {
         hs->s = qemu_input_handler_register((DeviceState *)hs,
                                             &hid_tablet_handler);
+        hs->activate_bh = qemu_bh_new(hid_pointer_activate_bh, hs);
     }
 }
 

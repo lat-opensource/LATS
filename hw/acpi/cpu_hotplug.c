@@ -16,6 +16,8 @@
 #include "hw/i386/pc.h"
 #include "hw/pci/pci.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
+#include "exec/memory.h"
 
 #define CPU_EJECT_METHOD "CPEJ"
 #define CPU_MAT_METHOD "CPMA"
@@ -46,9 +48,26 @@ static void cpu_status_write(void *opaque, hwaddr addr, uint64_t data,
     }
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool cpu_status_try_write_lockless(void *opaque, hwaddr addr,
+                                          unsigned size, uint64_t data)
+{
+    if (!lats_nobql_enabled()) {
+        return false;
+    }
+    qemu_memory_topology_lock();
+    cpu_status_write(opaque, addr, data, size);
+    qemu_memory_topology_unlock();
+    return true;
+}
+#endif
+
 static const MemoryRegionOps AcpiCpuHotplug_ops = {
     .read = cpu_status_read,
     .write = cpu_status_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .try_write_lockless = cpu_status_try_write_lockless,
+#endif
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 1,

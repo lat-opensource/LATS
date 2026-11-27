@@ -25,6 +25,7 @@
 #include "monitor/monitor.h"
 #include "hw/i386/apic.h"
 #include "hw/i386/x86.h"
+#include "hw/i386/hpet-irq0.h"
 #include "hw/intc/i8259.h"
 #include "hw/intc/ioapic.h"
 #include "hw/intc/ioapic_internal.h"
@@ -32,15 +33,22 @@
 #include "hw/qdev-properties.h"
 #include "sysemu/kvm.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/tcg.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "exec/address-spaces.h"
+#include "qemu/main-loop.h"
 #include "hw/i386/apic-msidef.h"
 #include "hw/i386/x86-iommu.h"
 #include "trace.h"
+#include "trace/trace-softmmu.h"
 
 #define APIC_DELIVERY_MODE_SHIFT 8
 #define APIC_POLARITY_SHIFT 14
 #define APIC_TRIG_MODE_SHIFT 15
 
 static IOAPICCommonState *ioapics[MAX_IOAPICS];
+static IOAPICCommonState *hpet_irq0_ioapic;
 
 /* global variable from ioapic_common.c */
 extern int ioapic_no;
@@ -91,11 +99,23 @@ static void ioapic_entry_parse(uint64_t entry, struct ioapic_entry_info *info)
 static void ioapic_service(IOAPICCommonState *s)
 {
     AddressSpace *ioapic_as = X86_MACHINE(qdev_get_machine())->ioapic_as;
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool unlocked = !qemu_mutex_iothread_locked();
+#endif
     struct ioapic_entry_info info;
     uint8_t i;
     uint32_t mask;
     uint64_t entry;
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_begin();
+    } else
+#endif
+    {
+        hpet_irq0_revoke_route();
+    }
     for (i = 0; i < IOAPIC_NUM_PINS; i++) {
         mask = 1 << i;
         if (s->irr & mask) {
@@ -131,6 +151,17 @@ static void ioapic_service(IOAPICCommonState *s)
                 }
 #endif
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+                if (unlocked && ioapic_as == &address_space_memory) {
+                    uint8_t dest = (info.addr & MSI_ADDR_DEST_ID_MASK) >>
+                                   MSI_ADDR_DEST_ID_SHIFT;
+                    uint8_t dest_mode = (info.addr >> MSI_ADDR_DEST_MODE_SHIFT) & 1;
+
+                    apic_deliver_irq(dest, dest_mode, info.delivery_mode,
+                                     info.vector, info.trig_mode);
+                    continue;
+                }
+#endif
                 /* No matter whether IR is enabled, we translate
                  * the IOAPIC message into a MSI one, and its
                  * address space will decide whether we need a
@@ -139,6 +170,11 @@ static void ioapic_service(IOAPICCommonState *s)
             }
         }
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_end();
+    }
+#endif
 }
 
 #define SUCCESSIVE_IRQ_MAX_COUNT 10000
@@ -153,11 +189,23 @@ static void delayed_ioapic_service_cb(void *opaque)
 static void ioapic_set_irq(void *opaque, int vector, int level)
 {
     IOAPICCommonState *s = opaque;
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool unlocked = !qemu_mutex_iothread_locked();
+#endif
 
     /* ISA IRQs map to GSI 1-1 except for IRQ0 which maps
      * to GSI 2.  GSI maps to ioapic 1-1.  This is not
      * the cleanest way of doing it but it should work. */
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_begin();
+    } else
+#endif
+    {
+        hpet_irq0_revoke_route();
+    }
     trace_ioapic_set_irq(vector, level);
     ioapic_stat_update_irq(s, vector, level);
     if (vector == 0) {
@@ -186,6 +234,55 @@ static void ioapic_set_irq(void *opaque, int vector, int level)
                 ioapic_service(s);
             }
         }
+    }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_end();
+    }
+#endif
+}
+
+bool ioapic_hpet_irq0_route(uint32_t *addr, uint32_t *data)
+{
+    IOAPICCommonState *s = hpet_irq0_ioapic;
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
+    struct ioapic_entry_info info;
+    uint64_t entry;
+
+    if (!s || s->irr || s->irq_level[0]) {
+        return false;
+    }
+    entry = s->ioredtbl[2]; /* ISA IRQ0 is wired to IOAPIC pin 2. */
+    /* Parsing ExtINT can acknowledge the PIC, so filter it first. */
+    if (entry & (IOAPIC_LVT_MASKED | IOAPIC_LVT_TRIGGER_MODE |
+                 IOAPIC_LVT_POLARITY | IOAPIC_LVT_REMOTE_IRR |
+                 IOAPIC_LVT_DELIV_MODE)) {
+        return false;
+    }
+    ioapic_entry_parse(entry, &info);
+    /* dest_idx is entry[63:48]; the xAPIC ID is its high byte. */
+    unsigned dest = info.dest_idx >> 8;
+    if (!info.dest_mode || (info.dest_idx & 0xff) || !dest || dest == 0xff ||
+        info.vector < 16) {
+        return false;
+    }
+    *addr = info.addr;
+    *data = info.data;
+    return true;
+}
+
+void ioapic_hpet_irq0_stats(void)
+{
+    for (int level = 1; level >= 0; --level) {
+        trace_ioapic_set_irq(0, level);
+        ioapic_stat_update_irq(hpet_irq0_ioapic, 0, level);
+    }
+}
+
+void ioapic_hpet_irq0_add_edges(uint64_t count)
+{
+    if (hpet_irq0_ioapic) {
+        hpet_irq0_ioapic->irq_count[0] += count;
     }
 }
 
@@ -225,7 +322,16 @@ void ioapic_eoi_broadcast(int vector)
     IOAPICCommonState *s;
     uint64_t entry;
     int i, n;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool unlocked = !qemu_mutex_iothread_locked();
 
+    if (unlocked) {
+        hpet_irq0_external_begin();
+    } else
+#endif
+    {
+        hpet_irq0_revoke_route();
+    }
     trace_ioapic_eoi_broadcast(vector);
 
     for (i = 0; i < MAX_IOAPICS; i++) {
@@ -233,6 +339,7 @@ void ioapic_eoi_broadcast(int vector)
         if (!s) {
             continue;
         }
+        g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
         for (n = 0; n < IOAPIC_NUM_PINS; n++) {
             entry = s->ioredtbl[n];
 
@@ -290,12 +397,16 @@ void ioapic_eoi_broadcast(int vector)
             }
         }
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (unlocked) {
+        hpet_irq0_external_end();
+    }
+#endif
 }
 
-static uint64_t
-ioapic_mem_read(void *opaque, hwaddr addr, unsigned int size)
+static uint32_t
+ioapic_read_reg(IOAPICCommonState *s, hwaddr addr, unsigned int size)
 {
-    IOAPICCommonState *s = opaque;
     int index;
     uint32_t val = 0;
 
@@ -331,6 +442,18 @@ ioapic_mem_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     }
 
+    return val;
+}
+
+static uint64_t
+ioapic_mem_read(void *opaque, hwaddr addr, unsigned int size)
+{
+    IOAPICCommonState *s = opaque;
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
+    uint32_t val;
+
+    addr &= 0xff;
+    val = ioapic_read_reg(s, addr, size);
     trace_ioapic_mem_read(addr, s->ioregsel, size, val);
 
     return val;
@@ -369,6 +492,7 @@ ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
                  unsigned int size)
 {
     IOAPICCommonState *s = opaque;
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
     int index;
 
     addr &= 0xff;
@@ -393,6 +517,17 @@ ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
             index = (s->ioregsel - IOAPIC_REG_REDTBL_BASE) >> 1;
             if (index >= 0 && index < IOAPIC_NUM_PINS) {
                 uint64_t ro_bits = s->ioredtbl[index] & IOAPIC_RO_BITS;
+
+                /* A lock-free HPET sender may still hold the old route. */
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+                bool unlocked = !qemu_mutex_iothread_locked();
+                if (unlocked) {
+                    hpet_irq0_external_begin();
+                } else
+#endif
+                {
+                    hpet_irq0_revoke_route();
+                }
                 if (s->ioregsel & 1) {
                     s->ioredtbl[index] &= 0xffffffff;
                     s->ioredtbl[index] |= (uint64_t)val << 32;
@@ -407,6 +542,11 @@ ioapic_mem_write(void *opaque, hwaddr addr, uint64_t val,
                 ioapic_fix_edge_remote_irr(&s->ioredtbl[index]);
                 ioapic_update_kvm_routes(s);
                 ioapic_service(s);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+                if (unlocked) {
+                    hpet_irq0_external_end();
+                }
+#endif
             }
         }
         break;
@@ -456,8 +596,22 @@ static void ioapic_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    s->local_ioapic = tcg_enabled() &&
+        (memory_region_device_lock_enabled() ||
+         lats_nobql_enabled());
+    if (s->local_ioapic) {
+        qemu_rec_mutex_init(&s->local_lock);
+    }
+#endif
+
     memory_region_init_io(&s->io_memory, OBJECT(s), &ioapic_io_ops, s,
                           "ioapic", 0x1000);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s->local_ioapic) {
+        memory_region_set_device_lock(&s->io_memory, &s->local_lock);
+    }
+#endif
 
     s->delayed_ioapic_service_timer =
         timer_new_ns(QEMU_CLOCK_VIRTUAL, delayed_ioapic_service_cb, s);
@@ -465,6 +619,9 @@ static void ioapic_realize(DeviceState *dev, Error **errp)
     qdev_init_gpio_in(dev, ioapic_set_irq, IOAPIC_NUM_PINS);
 
     ioapics[ioapic_no] = s;
+    if (ioapic_no == 0) {
+        hpet_irq0_ioapic = s;
+    }
     s->machine_done.notify = ioapic_machine_done_notify;
     qemu_add_machine_init_done_notifier(&s->machine_done);
 }
@@ -473,7 +630,17 @@ static void ioapic_unrealize(DeviceState *dev)
 {
     IOAPICCommonState *s = IOAPIC_COMMON(dev);
 
+    hpet_irq0_revoke_route();
+    if (hpet_irq0_ioapic == s) {
+        hpet_irq0_ioapic = NULL;
+    }
     timer_free(s->delayed_ioapic_service_timer);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s->local_ioapic) {
+        qemu_rec_mutex_destroy(&s->local_lock);
+        s->local_ioapic = false;
+    }
+#endif
 }
 
 static Property ioapic_properties[] = {

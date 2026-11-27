@@ -47,6 +47,11 @@
 #include "hw/i386/topology.h"
 #include "hw/i386/fw_cfg.h"
 #include "hw/intc/i8259.h"
+#include "hw/isa/i8259_internal.h"
+#include "hw/i386/hpet-irq0.h"
+#include "exec/irq-commit.h"
+#include "exec/address-spaces.h"
+#include "qemu/main-loop.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "target/i386/sev.h"
 
@@ -608,6 +613,182 @@ DeviceState *cpu_get_current_apic(void)
         return cpu->apic_state;
     } else {
         return NULL;
+    }
+}
+
+static bool hpet_irq0_enabled;
+static uint64_t hpet_irq0_lease, hpet_irq0_serial;
+/* APIC base MSRs can change PIC acceptance without BQL. */
+static uint64_t hpet_irq0_started, hpet_irq0_completed;
+static uint64_t hpet_irq0_offered, hpet_irq0_sent;
+/* Only the main thread publishes or consumes this snapshot. Other device
+ * threads can only revoke its lease before mutating the route. */
+static uint64_t hpet_irq0_cached_lease;
+static uint32_t hpet_irq0_cached_addr, hpet_irq0_cached_data;
+static uint64_t hpet_irq0_deferred_edges, hpet_irq0_unlocked;
+
+void x86_hpet_irq0_enable(void)
+{
+    hpet_irq0_enabled = true;
+}
+
+static void hpet_irq0_clear(uint64_t *lease)
+{
+    if (hpet_irq0_enabled && qatomic_read(lease)) {
+        irq_commit_source_update(lease, UINT64_MAX, 0);
+    }
+}
+
+void x86_hpet_irq0_revoke_timer(void)
+{
+    /* Timer programming shares the device lock with queue dispatch. */
+    hpet_irq0_clear(&hpet_irq0_lease);
+}
+
+void x86_hpet_irq0_revoke(void)
+{
+    x86_hpet_irq0_revoke_timer();
+    hpet_irq0_clear(&hpet_irq0_cached_lease);
+}
+
+void x86_hpet_irq0_external_begin(void)
+{
+    if (hpet_irq0_enabled) {
+        qatomic_inc(&hpet_irq0_started);
+        x86_hpet_irq0_revoke();
+    }
+}
+
+void x86_hpet_irq0_external_end(void)
+{
+    if (hpet_irq0_enabled) {
+        qatomic_inc(&hpet_irq0_completed);
+    }
+}
+
+static uint64_t hpet_irq0_publish(uint64_t *source, uint64_t epoch)
+{
+    uint64_t lease;
+
+    assert(hpet_irq0_serial < IRQ_COMMIT_PAYLOAD);
+    lease = ++hpet_irq0_serial;
+    qatomic_store_release(source, lease);
+    /* Either detect an earlier writer or let a later writer cancel this
+     * published lease. A writer cannot pass unnoticed between the two. */
+    smp_mb();
+    if (qatomic_read(&hpet_irq0_started) != epoch) {
+        hpet_irq0_clear(source);
+        return 0;
+    }
+    return lease;
+}
+
+static bool hpet_irq0_read_route(uint32_t *addr, uint32_t *data)
+{
+    X86MachineState *x86ms;
+    CPUState *cpu;
+
+    assert(qemu_mutex_iothread_locked());
+    x86ms = X86_MACHINE(qdev_get_machine());
+    if (x86ms->ioapic_as != &address_space_memory ||
+        !isa_pic || (isa_pic->imr & 1) == 0 || (isa_pic->irr & 1) == 0 ||
+        (isa_pic->irr & ~isa_pic->imr) || (isa_pic->last_irr & 1) ||
+        isa_pic->ltim || (isa_pic->elcr & 1) || pic_get_output(isa_pic) ||
+        !pic_hpet_irq0_stats_idle() || !ioapic_hpet_irq0_route(addr, data)) {
+        return false;
+    }
+    CPU_FOREACH(cpu) {
+        DeviceState *apic = X86_CPU(cpu)->apic_state;
+
+        if (!apic || apic_accept_pic_intr(apic)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void x86_hpet_irq0_flush_stats(void)
+{
+    if (hpet_irq0_deferred_edges) {
+        pic_hpet_irq0_add_edges(hpet_irq0_deferred_edges);
+        ioapic_hpet_irq0_add_edges(hpet_irq0_deferred_edges);
+        hpet_irq0_deferred_edges = 0;
+    }
+}
+
+void x86_hpet_irq0_refresh(void)
+{
+    uint64_t epoch;
+
+    if (!hpet_irq0_enabled) {
+        return;
+    }
+    x86_hpet_irq0_flush_stats();
+    hpet_irq0_clear(&hpet_irq0_cached_lease);
+    epoch = qatomic_load_acquire(&hpet_irq0_completed);
+    if (hpet_irq0_read_route(&hpet_irq0_cached_addr, &hpet_irq0_cached_data)) {
+        hpet_irq0_publish(&hpet_irq0_cached_lease, epoch);
+    }
+}
+
+bool x86_hpet_irq0_try_cached(void)
+{
+    uint64_t lease = irq_commit_source_read(&hpet_irq0_cached_lease);
+
+    if (!lease || !address_space_try_commit_msi(&address_space_memory,
+            hpet_irq0_cached_addr, hpet_irq0_cached_data,
+            &hpet_irq0_cached_lease, lease, lease, false)) {
+        return false;
+    }
+    ++hpet_irq0_unlocked;
+    ++hpet_irq0_deferred_edges;
+    return true;
+}
+
+/* Original fast submission under BQL, also used when queue dispatch cannot
+ * certify an isolated wake. */
+bool x86_hpet_irq0_try_pulse(void)
+{
+    uint32_t addr, data;
+    uint64_t lease, epoch;
+
+    if (!hpet_irq0_enabled) {
+        return false;
+    }
+    ++hpet_irq0_offered;
+    epoch = qatomic_load_acquire(&hpet_irq0_completed);
+    if (!hpet_irq0_read_route(&addr, &data)) {
+        return false;
+    }
+    /* The PIC pulse would leave its already pending, masked edge unchanged.
+     * Only the original edge on an otherwise idle IOAPIC is replaced. */
+    lease = hpet_irq0_publish(&hpet_irq0_lease, epoch);
+    if (!lease) {
+        return false;
+    }
+    bool sent = address_space_try_commit_msi(&address_space_memory, addr, data,
+                                              &hpet_irq0_lease,
+                                              lease, 0, false);
+    x86_hpet_irq0_revoke_timer();
+    if (sent) {
+        ++hpet_irq0_sent;
+        trace_x86_gsi_interrupt(0, 1);
+        trace_x86_gsi_interrupt(0, 0);
+        pic_stat_update_irq(0, 1);
+        pic_stat_update_irq(0, 0);
+        ioapic_hpet_irq0_stats();
+    }
+    return sent;
+}
+
+void x86_hpet_irq0_report(const char *phase)
+{
+    if (hpet_irq0_enabled) {
+        x86_hpet_irq0_flush_stats();
+        fprintf(stderr, "HPET_IRQ0_LEASE %s offered=%" PRIu64 " sent=%" PRIu64 "\n",
+                phase, hpet_irq0_offered, hpet_irq0_sent);
+        fprintf(stderr, "HPET_IRQ0_UNLOCKED %s count=%" PRIu64 "\n",
+                phase, hpet_irq0_unlocked);
     }
 }
 

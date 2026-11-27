@@ -254,7 +254,7 @@ static void pxb_register_bus(PCIDevice *dev, PCIBus *pxb_bus, Error **errp)
             return;
         }
     }
-    QLIST_INSERT_HEAD(&pci_get_bus(dev)->child, pxb_bus, sibling);
+    pci_bus_add_child(pci_get_bus(dev), pxb_bus);
 }
 
 static int pxb_map_irq_fn(PCIDevice *pci_dev, int pin)

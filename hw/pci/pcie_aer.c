@@ -219,8 +219,14 @@ pcie_aer_msg_alldev(PCIDevice *dev, const PCIEAERMsg *msg)
      * the PCI Express specific bits in the Device Control register (see
      * Section 7.8.4).
      */
-    pci_word_test_and_set_mask(dev->config + PCI_STATUS,
-                               PCI_STATUS_SIG_SYSTEM_ERROR);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(dev);
+#endif
+    /* INTx can update the low status byte from an I/O thread. */
+    dev->config[PCI_STATUS + 1] |= PCI_STATUS_SIG_SYSTEM_ERROR >> 8;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(dev);
+#endif
 
     if (!(msg->severity &
           pci_get_word(dev->config + dev->exp.exp_cap + PCI_EXP_DEVCTL))) {
@@ -544,7 +550,13 @@ static bool pcie_aer_inject_cor_error(PCIEAERInject *inj,
     if (inj->unsupported_request) {
         inj->devsta |= PCI_EXP_DEVSTA_URD;
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(dev);
+#endif
     pci_set_word(dev->config + dev->exp.exp_cap + PCI_EXP_DEVSTA, inj->devsta);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(dev);
+#endif
 
     if (inj->aer_cap) {
         uint32_t mask;
@@ -589,7 +601,13 @@ static bool pcie_aer_inject_uncor_error(PCIEAERInject *inj, bool is_fatal)
     if (inj->unsupported_request) {
         inj->devsta |= PCI_EXP_DEVSTA_URD;
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(dev);
+#endif
     pci_set_long(dev->config + dev->exp.exp_cap + PCI_EXP_DEVSTA, inj->devsta);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(dev);
+#endif
 
     if (inj->aer_cap) {
         uint32_t mask = pci_get_long(inj->aer_cap + PCI_ERR_UNCOR_MASK);

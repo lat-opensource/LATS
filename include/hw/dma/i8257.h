@@ -4,6 +4,7 @@
 #include "hw/isa/isa.h"
 #include "exec/ioport.h"
 #include "qom/object.h"
+#include "qemu/thread.h"
 
 #define TYPE_I8257 "i8257"
 OBJECT_DECLARE_SIMPLE_TYPE(I8257State, I8257)
@@ -37,6 +38,7 @@ struct I8257State {
     I8257Regs regs[4];
     MemoryRegion channel_io;
     MemoryRegion cont_io;
+    QemuRecMutex local_lock;
 
     QEMUBH *dma_bh;
     bool dma_bh_scheduled;

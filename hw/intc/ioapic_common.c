@@ -26,6 +26,7 @@
 #include "monitor/monitor.h"
 #include "hw/intc/intc.h"
 #include "hw/intc/ioapic.h"
+#include "hw/i386/hpet-irq0.h"
 #include "hw/intc/ioapic_internal.h"
 #include "hw/sysbus.h"
 
@@ -80,6 +81,7 @@ static void ioapic_print_redtbl(Monitor *mon, IOAPICCommonState *s)
 {
     static const char *delm_str[] = {
         "fixed", "lowest", "SMI", "...", "NMI", "INIT", "...", "extINT"};
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
     uint32_t remote_irr = 0;
     int i;
 
@@ -117,6 +119,9 @@ static void ioapic_print_redtbl(Monitor *mon, IOAPICCommonState *s)
 void ioapic_reset_common(DeviceState *dev)
 {
     IOAPICCommonState *s = IOAPIC_COMMON(dev);
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
+
+    hpet_irq0_revoke_route();
     int i;
 
     s->id = 0;
@@ -131,6 +136,7 @@ static int ioapic_dispatch_pre_save(void *opaque)
 {
     IOAPICCommonState *s = IOAPIC_COMMON(opaque);
     IOAPICCommonClass *info = IOAPIC_COMMON_GET_CLASS(s);
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
 
     if (info->pre_save) {
         info->pre_save(s);
@@ -143,7 +149,9 @@ static int ioapic_dispatch_post_load(void *opaque, int version_id)
 {
     IOAPICCommonState *s = IOAPIC_COMMON(opaque);
     IOAPICCommonClass *info = IOAPIC_COMMON_GET_CLASS(s);
+    g_autoptr(IOAPICLocalLock) lock = ioapic_local_lock_begin(s);
 
+    hpet_irq0_revoke_route();
     if (info->post_load) {
         info->post_load(s);
     }

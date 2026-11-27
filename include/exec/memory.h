@@ -95,6 +95,8 @@ struct ReservedRegion {
  *     relative to the region's address space
  * @readonly: writes to this section are ignored
  * @nonvolatile: this section is non-volatile
+ * @unmanaged_ram: the physical dispatch entry maps plain RAM without a
+ *     discard manager
  */
 struct MemoryRegionSection {
     Int128 size;
@@ -104,6 +106,7 @@ struct MemoryRegionSection {
     hwaddr offset_within_address_space;
     bool readonly;
     bool nonvolatile;
+    bool unmanaged_ram;
 };
 
 typedef struct IOMMUTLBEntry IOMMUTLBEntry;
@@ -251,6 +254,10 @@ static inline void iommu_notifier_init(IOMMUNotifier *n, IOMMUNotify fn,
  * Memory region callbacks
  */
 struct MemoryRegionOps {
+    bool (*try_commit_msi)(void *opaque, hwaddr addr, uint32_t data,
+                           uint64_t *source, uint64_t before, uint64_t after,
+                           bool scsi);
+
     /* Read from the memory region. @addr is relative to @mr; @size is
      * in bytes. */
     uint64_t (*read)(void *opaque,
@@ -311,15 +318,53 @@ struct MemoryRegionOps {
         bool unaligned;
     } impl;
 
+    /* A data-independent eventfd write. False leaves the access untouched. */
+    bool (*try_write_eventfd)(void *opaque, hwaddr addr, unsigned size);
+
+    /*
+     * Complete a read before taking the BQL. Return false without side
+     * effects if the read needs normal dispatch. A successful callback
+     * checks the access shape and returns the value as a device read
+     * callback would, before any byte-order adjustment.
+     */
+    bool (*try_read_lockless)(void *opaque, hwaddr addr, MemOp op,
+                              MemTxAttrs attrs, uint64_t *value);
+
+    /*
+     * Complete a single device write before taking the BQL. The value
+     * has device byte order. False leaves the access untouched.
+     * Only use this for regions without write eventfds.
+     */
+    bool (*try_write_lockless)(void *opaque, hwaddr addr, unsigned size,
+                               uint64_t value);
+
     /*
      * Return true when this individual access is safe without the BQL.
      * The callback runs before the BQL is acquired, so it must be
      * thread-safe, side-effect free, and depend only on immutable device
-     * properties or the access parameters.
+     * properties or the access parameters. Matched accesses also skip the
+     * device reentrancy guard. They must not reenter guarded device I/O.
      */
     bool (*access_lockless)(void *opaque, hwaddr addr,
                             unsigned size, bool is_write,
                             MemTxAttrs attrs);
+
+    /*
+     * Optional device lock for a TCG access split into smaller dispatches
+     * while holding the BQL. Return a recursive mutex only when the whole
+     * range stays in this device and its constituent callbacks cannot fail
+     * or call out to another device. Each callback may reacquire this lock.
+     */
+    struct QemuRecMutex *(*mmio_split_lock)(void *opaque, hwaddr addr,
+                                            unsigned size);
+
+    /*
+     * Suspend lockless device accesses across one BQL-held split access.
+     * No extra lock remains held. As with mmio_split_lock, only claim
+     * ranges whose dispatch cannot leave the caller without cleanup.
+     */
+    bool (*mmio_split_pause)(void *opaque, hwaddr addr, unsigned size);
+    void (*mmio_split_resume)(void *opaque);
 };
 
 typedef struct MemoryRegionClass {
@@ -817,6 +862,22 @@ struct MemoryRegion {
      * never changed afterwards.
      */
     bool disable_locking;
+    /* opaque points to immutable register bytes in address order. Reading
+     * has no side effects and writes are ignored. Set before publication. */
+    bool immutable_byte_array;
+    /*
+     * A subpage may defer a complete word access to this leaf. Successful
+     * reads sample tracing under the device lock. Set before enabling the
+     * callback and keep it set for the lifetime of the region.
+     */
+    bool subpage_dispatch_lockless;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /*
+     * Per-device recursive mutex for BQL-free unified MMIO/PIO dispatch.
+     * Attached via memory_region_set_device_lock() before publication.
+     */
+    QemuRecMutex *device_lock;
+#endif
 };
 
 struct IOMMUMemoryRegion {
@@ -1088,6 +1149,9 @@ struct MemoryListener {
      */
     const char *name;
 
+    /* Set true when callbacks are safe under memory_topology_mutex without BQL. */
+    bool nobql_safe;
+
     /* private: */
     AddressSpace *address_space;
     QTAILQ_ENTRY(MemoryListener) link;
@@ -1127,6 +1191,9 @@ struct FlatView {
     struct AddressSpaceDispatch *dispatch;
     MemoryRegion *root;
 };
+
+/* Return a contiguous ordinary RAM span. Caller holds RCU for view and RAM. */
+const void *flatview_ram_read_ptr(FlatView *view, hwaddr addr, hwaddr len);
 
 static inline FlatView *address_space_to_flatview(AddressSpace *as)
 {
@@ -1239,6 +1306,7 @@ void memory_region_ref(MemoryRegion *mr);
  * @mr: the #MemoryRegion
  */
 void memory_region_unref(MemoryRegion *mr);
+void memory_region_unref_nobql(MemoryRegion *mr);
 
 /**
  * memory_region_init_io: Initialize an I/O memory region.
@@ -2109,6 +2177,9 @@ bool memory_region_snapshot_get_dirty(MemoryRegion *mr,
                                       DirtyBitmapSnapshot *snap,
                                       hwaddr addr, hwaddr size);
 
+/* Whether VGA dirty snapshot queries always report dirty for this region. */
+bool memory_region_vga_dirty_tracking_disabled(const MemoryRegion *mr);
+
 /**
  * memory_region_reset_dirty: Mark a range of pages as clean, for a specified
  *                            client.
@@ -2165,6 +2236,20 @@ void memory_region_set_readonly(MemoryRegion *mr, bool readonly);
  * @mr: the region being updated.
  */
 void memory_region_disable_locking(MemoryRegion *mr);
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+/**
+ * memory_region_device_lock_enabled: Return whether unified MemoryRegion
+ * device_lock dispatch (lats_nobql_enabled()) is active.
+ */
+bool memory_region_device_lock_enabled(void);
+
+/**
+ * memory_region_set_device_lock: Attach a per-device recursive mutex to a
+ * MemoryRegion so MMIO/PIO dispatch skips the BQL and serializes on @lock.
+ */
+void memory_region_set_device_lock(MemoryRegion *mr, QemuRecMutex *lock);
+#endif
 
 /**
  * memory_region_set_nonvolatile: Turn a memory region non-volatile
@@ -2524,6 +2609,31 @@ void memory_region_transaction_begin(void);
  */
 void memory_region_transaction_commit(void);
 
+void qemu_memory_topology_lock(void);
+void qemu_memory_topology_unlock(void);
+bool qemu_memory_topology_locked(void);
+bool qemu_memory_topology_nobql_enabled(void);
+
+typedef void MemoryTopologyLockGuard;
+static inline MemoryTopologyLockGuard *qemu_memory_topology_auto_lock(void)
+{
+    qemu_memory_topology_lock();
+    return (void *)(uintptr_t)0x1;
+}
+
+static inline void qemu_memory_topology_auto_unlock(MemoryTopologyLockGuard *g)
+{
+    (void)g;
+    qemu_memory_topology_unlock();
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MemoryTopologyLockGuard,
+                              qemu_memory_topology_auto_unlock)
+
+#define QEMU_MEMORY_TOPOLOGY_LOCK_GUARD() \
+    g_autoptr(MemoryTopologyLockGuard) _mem_topo_guard G_GNUC_UNUSED = \
+        qemu_memory_topology_auto_lock()
+
 /**
  * memory_listener_register: register callbacks to be called when memory
  *                           sections are mapped or unmapped into an address
@@ -2816,6 +2926,13 @@ int64_t address_space_cache_init(MemoryRegionCache *cache,
                                  hwaddr len,
                                  bool is_write);
 
+/*
+ * Map a single direct RAM section, without following device translations.
+ * As with address_space_cache_init(), destroy the cache even on a short map.
+ */
+int64_t address_space_cache_init_ram(MemoryRegionCache *cache, AddressSpace *as,
+                                     hwaddr addr, hwaddr len, bool is_write);
+
 /**
  * address_space_cache_invalidate: complete a write to a #MemoryRegionCache
  *
@@ -2858,6 +2975,11 @@ MemoryRegion *flatview_translate(FlatView *fv,
                                  hwaddr addr, hwaddr *xlat,
                                  hwaddr *len, bool is_write,
                                  MemTxAttrs attrs);
+MemoryRegion *flatview_translate_with_span(FlatView *fv, hwaddr addr,
+                                           hwaddr *xlat, hwaddr *len,
+                                           bool is_write, MemTxAttrs attrs,
+                                           hwaddr *span);
+
 
 static inline MemoryRegion *address_space_translate(AddressSpace *as,
                                                     hwaddr addr, hwaddr *xlat,
@@ -2884,6 +3006,10 @@ static inline MemoryRegion *address_space_translate(AddressSpace *as,
  * @is_write: indicates the transfer direction
  * @attrs: memory attributes
  */
+bool address_space_try_commit_msi(AddressSpace *as, hwaddr addr,
+                                  uint32_t data, uint64_t *source,
+                                  uint64_t before, uint64_t after, bool scsi);
+
 bool address_space_access_valid(AddressSpace *as, hwaddr addr, hwaddr len,
                                 bool is_write, MemTxAttrs attrs);
 
@@ -2926,7 +3052,7 @@ MemTxResult address_space_read_full(AddressSpace *as, hwaddr addr,
 MemTxResult flatview_read_continue(FlatView *fv, hwaddr addr,
                                    MemTxAttrs attrs, void *buf,
                                    hwaddr len, hwaddr addr1, hwaddr l,
-                                   MemoryRegion *mr);
+                                   MemoryRegion *mr, hwaddr span);
 void *qemu_map_ram_ptr(RAMBlock *ram_block, ram_addr_t addr);
 
 /* Internal functions, part of the implementation of address_space_read_cached
@@ -2978,16 +3104,19 @@ MemTxResult address_space_read(AddressSpace *as, hwaddr addr,
 
     if (__builtin_constant_p(len)) {
         if (len) {
+            hwaddr span;
+
             RCU_READ_LOCK_GUARD();
             fv = address_space_to_flatview(as);
             l = len;
-            mr = flatview_translate(fv, addr, &addr1, &l, false, attrs);
+            mr = flatview_translate_with_span(fv, addr, &addr1, &l, false,
+                                              attrs, &span);
             if (len == l && memory_access_is_direct(mr, false)) {
                 ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
                 memcpy(buf, ptr, len);
             } else {
                 result = flatview_read_continue(fv, addr, attrs, buf, len,
-                                                addr1, l, mr);
+                                                addr1, l, mr, span);
             }
         }
     } else {

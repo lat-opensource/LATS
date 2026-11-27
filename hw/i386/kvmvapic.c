@@ -10,7 +10,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "exec/memory.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/cpus.h"
 #include "sysemu/hw_accel.h"
@@ -57,6 +59,7 @@ typedef struct GuestROMState {
 
 struct VAPICROMState {
     SysBusDevice busdev;
+    QemuRecMutex local_lock;
     MemoryRegion io;
     MemoryRegion rom;
     uint32_t state;
@@ -508,7 +511,13 @@ static void vapic_enable_tpr_reporting(bool enable)
     CPU_FOREACH(cs) {
         cpu = X86_CPU(cs);
         info.apic = cpu->apic_state;
-        run_on_cpu(cs, vapic_do_enable_tpr_reporting, RUN_ON_CPU_HOST_PTR(&info));
+        if (!kvm_enabled()) {
+            run_on_cpu_nobql(cs, vapic_do_enable_tpr_reporting,
+                             RUN_ON_CPU_HOST_PTR(&info));
+        } else {
+            run_on_cpu(cs, vapic_do_enable_tpr_reporting,
+                       RUN_ON_CPU_HOST_PTR(&info));
+        }
     }
 }
 
@@ -715,9 +724,30 @@ static uint64_t vapic_read(void *opaque, hwaddr addr, unsigned size)
     return 0xffffffff;
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool vapic_try_write_lockless(void *opaque, hwaddr addr,
+                                     unsigned size, uint64_t data)
+{
+    VAPICROMState *s = opaque;
+
+    if (!lats_nobql_enabled()) {
+        return false;
+    }
+    qemu_memory_topology_lock();
+    qemu_rec_mutex_lock(&s->local_lock);
+    vapic_write(opaque, addr, data, size);
+    qemu_rec_mutex_unlock(&s->local_lock);
+    qemu_memory_topology_unlock();
+    return true;
+}
+#endif
+
 static const MemoryRegionOps vapic_ops = {
     .write = vapic_write,
     .read = vapic_read,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .try_write_lockless = vapic_try_write_lockless,
+#endif
     .endianness = DEVICE_NATIVE_ENDIAN,
 };
 
@@ -726,6 +756,7 @@ static void vapic_realize(DeviceState *dev, Error **errp)
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     VAPICROMState *s = VAPIC(dev);
 
+    qemu_rec_mutex_init(&s->local_lock);
     memory_region_init_io(&s->io, OBJECT(s), &vapic_ops, s, "kvmvapic", 2);
     sysbus_add_io(sbd, VAPIC_IO_PORT, &s->io);
     sysbus_init_ioports(sbd, VAPIC_IO_PORT, 2);

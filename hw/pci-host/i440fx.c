@@ -227,7 +227,12 @@ static void i440fx_pcihost_initfn(Object *obj)
 
     memory_region_init_io(&phb->conf_mem, obj, &pci_host_conf_le_ops, phb,
                           "pci-conf-idx", 4);
-    memory_region_init_io(&phb->data_mem, obj, &pci_host_data_le_ops, phb,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* CF8 is one shared atomic selector. CFC takes a snapshot of it. */
+    phb->conf_mem.disable_reentrancy_guard = true;
+    memory_region_disable_locking(&phb->conf_mem);
+#endif
+    memory_region_init_io(&phb->data_mem, obj, &pci_host_data_root0_ops, phb,
                           "pci-conf-data", 4);
 
     object_property_add_link(obj, PCI_HOST_PROP_RAM_MEM, TYPE_MEMORY_REGION,
@@ -261,9 +266,6 @@ static void i440fx_pcihost_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(s->io_memory, 0xcf8, &phb->conf_mem);
     sysbus_init_ioports(sbd, 0xcf8, 4);
 
-    memory_region_add_subregion(s->io_memory, 0xcfc, &phb->data_mem);
-    sysbus_init_ioports(sbd, 0xcfc, 4);
-
     /* register i440fx 0xcf8 port as coalesced pio */
     memory_region_set_flush_coalesced(&phb->data_mem);
     memory_region_add_coalescing(&phb->conf_mem, 0, 4);
@@ -271,6 +273,8 @@ static void i440fx_pcihost_realize(DeviceState *dev, Error **errp)
     b = pci_root_bus_new(dev, NULL, s->pci_address_space,
                          s->io_memory, 0, TYPE_PCI_BUS);
     phb->bus = b;
+    memory_region_add_subregion(s->io_memory, 0xcfc, &phb->data_mem);
+    sysbus_init_ioports(sbd, 0xcfc, 4);
 
     d = pci_create_simple(b, 0, s->pci_type);
     f = I440FX_PCI_DEVICE(d);

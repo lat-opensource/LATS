@@ -2,6 +2,7 @@
 #define APM_H
 
 #include "exec/memory.h"
+#include "qemu/thread.h"
 
 #define APM_CNT_IOPORT  0xb2
 #define ACPI_PORT_SMI_CMD APM_CNT_IOPORT
@@ -15,6 +16,7 @@ typedef struct APMState {
     apm_ctrl_changed_t callback;
     void *arg;
     MemoryRegion io;
+    QemuRecMutex local_lock;
 } APMState;
 
 void apm_init(PCIDevice *dev, APMState *s, apm_ctrl_changed_t callback,

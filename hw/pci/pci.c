@@ -23,7 +23,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qemu/datadir.h"
+#include "qemu/rcu_queue.h"
 #include "qemu/units.h"
 #include "hw/irq.h"
 #include "hw/pci/pci.h"
@@ -42,6 +44,7 @@
 #include "qemu/error-report.h"
 #include "qemu/range.h"
 #include "trace.h"
+#include "trace/trace-softmmu.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
 #include "hw/hotplug.h"
@@ -51,6 +54,7 @@
 #include "pci-internal.h"
 
 #include "hw/xen/xen.h"
+#include "sysemu/xen.h"
 #include "hw/i386/kvm/xen_evtchn.h"
 
 //#define DEBUG_PCI
@@ -185,6 +189,847 @@ static void pci_bus_unrealize(BusState *qbus)
     vmstate_unregister(NULL, &vmstate_pcibus, bus);
 }
 
+/* No device callback or migration stream operation runs under this lock. */
+typedef QemuSpin PCIStatusLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(PCIStatusLock, qemu_spin_unlock)
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+/*
+ * Each device function has a slot owned by the root bus. Readers never
+ * reference the device or its config buffer, which may be freed on removal.
+ * BQL writers publish ordinary config bytes using one sequence per slot.
+ */
+struct PCIConfigReadSlot {
+    QemuSeqLock seq;
+    QemuSpin status_lock;
+    /* Revoked before a BQL config writer, power change or device removal. */
+    uint8_t *interrupt_line;
+    PCIDevice *local_write_dev;
+    PCIDevice *msix_owner;
+    bool msix_writable;
+    unsigned msix_pauses;
+    QemuRecMutex *irq_lock;
+    const bool *irq_pending;
+    unsigned writers;
+    bool valid;
+    uint8_t unused_bars;
+    uint16_t limit; /* Zero while unregistered. */
+    uint16_t cfg_data; /* Indirect VirtIO data register, if present. */
+    uint32_t words[PCI_CONFIG_SPACE_SIZE / sizeof(uint32_t)];
+};
+
+typedef struct PCIConfigReadSlots {
+    struct rcu_head rcu;
+    PCIConfigReadSlot slot[PCI_DEVFN_MAX];
+} PCIConfigReadSlots;
+
+static void pci_config_trace_enabled(Notifier *notifier, void *event)
+{
+    PCIBus *bus = container_of(notifier, PCIBus, config_trace_enabled);
+
+    if (event != &_TRACE_PCI_CFG_WRITE_EVENT &&
+        event != &_TRACE_MEMORY_REGION_OPS_READ_EVENT &&
+        event != &_TRACE_MEMORY_REGION_OPS_WRITE_EVENT) {
+        return;
+    }
+    /*
+     * An access may already have seen tracing off. Finish it before
+     * returning to the monitor.
+     */
+    for (unsigned i = 0; i < PCI_DEVFN_MAX; i++) {
+        PCIConfigReadSlot *slot = &bus->config_read_slots[i];
+
+        qemu_spin_lock(&slot->status_lock);
+        qemu_spin_unlock(&slot->status_lock);
+    }
+}
+
+void pci_bus_enable_config_read_slots(PCIBus *bus)
+{
+    PCIConfigReadSlots *slots;
+
+    assert(!bus->config_read_slots);
+    qemu_spin_init(&bus->config_selector_lock);
+    slots = g_new0(PCIConfigReadSlots, 1);
+    bus->config_read_slots = slots->slot;
+    for (unsigned i = 0; i < PCI_DEVFN_MAX; i++) {
+        qemu_spin_init(&bus->config_read_slots[i].status_lock);
+    }
+    bus->config_trace_enabled.notify = pci_config_trace_enabled;
+    trace_add_enable_notifier(&bus->config_trace_enabled);
+}
+
+static PCIConfigReadSlot *pci_config_read_slot(PCIDevice *dev)
+{
+    PCIBus *bus = pci_get_bus(dev);
+
+    return bus->config_read_slots ? &bus->config_read_slots[dev->devfn] : NULL;
+}
+
+static bool pci_local_writes_enabled(void)
+{
+    static int enabled = -1;
+
+    if (unlikely(enabled < 0)) {
+        enabled = lats_nobql_enabled();
+    }
+    return enabled;
+}
+
+static void pci_config_slot_write_begin(PCIConfigReadSlot *slot)
+{
+    QEMU_LOCK_GUARD(&slot->status_lock);
+    slot->interrupt_line = NULL;
+    slot->local_write_dev = NULL;
+    slot->msix_owner = NULL;
+    seqlock_write_begin(&slot->seq);
+}
+
+/*
+ * Caller holds the device lock. Config changes and slow table accesses may
+ * nest, including when a callback delivers a pending interrupt.
+ */
+static void pci_msix_table_publish(PCIDevice *dev, PCIConfigReadSlot *slot)
+{
+    if (dev->msix_config_slot && !slot->writers && !slot->msix_pauses &&
+        slot->limit && dev->has_power) {
+        slot->msix_owner = dev;
+        slot->msix_writable = !msix_enabled(dev) && dev->msix_function_masked;
+    }
+}
+
+static void pci_config_read_slot_publish(PCIDevice *dev,
+                                         PCIConfigReadSlot *slot)
+{
+    bool valid = slot->limit && dev->has_power;
+    if (valid) {
+        for (unsigned i = 0; i < slot->limit / sizeof(uint32_t); i++) {
+            unsigned addr = i * sizeof(uint32_t);
+            if (addr == PCI_COMMAND) {
+                QEMU_LOCK_GUARD(&slot->status_lock);
+                qatomic_set(&slot->words[i], pci_get_long(dev->config + addr));
+            } else if (!slot->cfg_data ||
+                       !ranges_overlap(addr, sizeof(uint32_t), slot->cfg_data,
+                                       sizeof(uint32_t))) {
+                qatomic_set(&slot->words[i], pci_get_long(dev->config + addr));
+            }
+        }
+    }
+    QEMU_LOCK_GUARD(&slot->status_lock);
+    /* VirtIO checks FLR on every config write, even on the q35 root bus. */
+    bool line_has_side_effects = valid && (slot->cfg_data ?
+        pci_get_word(dev->config + dev->exp.exp_cap + PCI_EXP_DEVCTL) &
+        PCI_EXP_DEVCTL_BCR_FLR :
+        PCI_DEVICE_GET_CLASS(dev)->msi_route_change != NULL);
+
+    if (valid && !line_has_side_effects &&
+        dev->wmask[PCI_INTERRUPT_LINE] == 0xff &&
+        !dev->w1cmask[PCI_INTERRUPT_LINE]) {
+        slot->interrupt_line = dev->config + PCI_INTERRUPT_LINE;
+    }
+    if (valid && !line_has_side_effects &&
+        pci_local_writes_enabled() && !pci_is_vf(dev) &&
+        (dev->config[PCI_HEADER_TYPE] & ~PCI_HEADER_TYPE_MULTI_FUNCTION) ==
+            PCI_HEADER_TYPE_NORMAL) {
+        slot->local_write_dev = dev;
+    }
+    pci_msix_table_publish(dev, slot);
+    qatomic_set(&slot->valid, valid);
+    seqlock_write_end(&slot->seq);
+}
+
+/* Only audited type 0 headers can discard a BAR probe. The high half of
+ * a 64-bit BAR belongs to the preceding region and may lack its own region. */
+static uint8_t pci_unused_header_bars(PCIDevice *dev)
+{
+    uint8_t mask = 0;
+
+    if (PCI_DEVICE_GET_CLASS(dev)->msi_route_change) {
+        return 0;
+    }
+    for (unsigned i = 0; i < PCI_NUM_REGIONS; i++) {
+        unsigned addr = i == PCI_ROM_SLOT ? PCI_ROM_ADDRESS :
+                                            PCI_BASE_ADDRESS_0 + i * 4;
+        if (i && i < PCI_ROM_SLOT &&
+            (dev->io_regions[i - 1].type & PCI_BASE_ADDRESS_MEM_TYPE_64)) {
+            continue;
+        }
+        if (!dev->io_regions[i].size && !pci_get_long(dev->wmask + addr) &&
+            !pci_get_long(dev->w1cmask + addr)) {
+            mask |= 1U << i;
+        }
+    }
+    return mask;
+}
+
+void pci_config_read_slot_register(PCIDevice *dev, unsigned cfg_data,
+                                   QemuRecMutex *irq_lock,
+                                   const bool *irq_pending)
+{
+    PCIConfigReadSlot *slot = pci_config_read_slot(dev);
+
+    if (slot && (!cfg_data || !PCI_FUNC(dev->devfn)) &&
+        lats_nobql_enabled() &&
+        !DEVICE(dev)->hotplugged &&
+        !dev->failover_pair_id && !dev->partially_hotplugged) {
+        assert(cfg_data + sizeof(uint32_t) <= PCI_CONFIG_SPACE_SIZE);
+        pci_config_slot_write_begin(slot);
+        slot->irq_lock = irq_lock;
+        slot->irq_pending = irq_pending;
+        if (msix_present(dev) && !xen_enabled() && xen_mode != XEN_EMULATE) {
+            qatomic_set(&dev->msix_table_mmio.subpage_dispatch_lockless, true);
+            qatomic_rcu_set(&dev->msix_config_slot, slot);
+        }
+        PCIDeviceClass *pc = PCI_DEVICE_GET_CLASS(dev);
+        uint16_t limit = (cfg_data ||
+                          (pc->plain_config_space && !msi_present(dev)))
+            ? PCI_CONFIG_SPACE_SIZE
+            : PCI_CONFIG_HEADER_SIZE;
+        qatomic_set(&slot->limit, limit);
+        qatomic_set(&slot->cfg_data, cfg_data);
+        qatomic_set(&slot->unused_bars, cfg_data ? 0 : pci_unused_header_bars(dev));
+        pci_config_read_slot_publish(dev, slot);
+    }
+}
+
+void pci_config_read_slot_remove(PCIDevice *dev)
+{
+    PCIConfigReadSlot *slot = pci_config_read_slot(dev);
+
+    if (slot && slot->limit) {
+        assert(!slot->writers);
+        pci_config_slot_write_begin(slot);
+        pci_msix_table_unregister(dev);
+        qatomic_set(&slot->limit, 0);
+        pci_config_read_slot_publish(dev, slot);
+    }
+}
+
+bool pci_config_read_slot_begin(PCIDevice *dev)
+{
+    PCIConfigReadSlot *slot = pci_config_read_slot(dev);
+
+    if (!slot || !slot->limit) {
+        return false;
+    }
+    qemu_memory_topology_lock();
+    if (!slot->writers++) {
+        pci_config_slot_write_begin(slot);
+    }
+    return true;
+}
+
+void pci_config_read_slot_end(PCIDevice *dev)
+{
+    PCIConfigReadSlot *slot = pci_config_read_slot(dev);
+
+    if (slot && slot->limit) {
+        assert(slot->writers);
+        if (!--slot->writers) {
+            pci_config_read_slot_publish(dev, slot);
+        }
+        qemu_memory_topology_unlock();
+    }
+}
+
+bool pci_config_read_slot_try(PCIBus *bus, uint8_t devfn, unsigned addr,
+                              unsigned size, uint64_t *value,
+                              const uint32_t *config_reg, uint32_t selector)
+{
+    PCIConfigReadSlot *slot;
+    unsigned seq, cfg_data;
+    uint32_t word;
+    g_autoptr(PCIStatusLock) line_lock = NULL;
+
+    if (!bus->config_read_slots ||
+        addr >= PCI_CONFIG_SPACE_SIZE ||
+        addr % sizeof(word) + size > sizeof(word) ||
+        trace_event_get_state_backends(TRACE_PCI_CFG_READ)) {
+        return false;
+    }
+
+    slot = &bus->config_read_slots[devfn];
+    seq = seqlock_read_begin(&slot->seq);
+    cfg_data = qatomic_read(&slot->cfg_data);
+    if (!qatomic_read(&slot->valid) || addr + size > qatomic_read(&slot->limit) ||
+        (cfg_data && ranges_overlap(addr, size, cfg_data, sizeof(uint32_t)))) {
+        return false;
+    }
+    if (range_covers_byte(addr, size, PCI_INTERRUPT_LINE)) {
+        qemu_spin_lock(&slot->status_lock);
+        line_lock = &slot->status_lock;
+    }
+    word = qatomic_read(&slot->words[addr / sizeof(uint32_t)]);
+    /* For CFC, the sampled CF8 selector and slot must coexist. */
+    if (config_reg && qatomic_load_acquire(config_reg) != selector) {
+        return false;
+    }
+    if (seqlock_read_retry(&slot->seq, seq)) {
+        return false;
+    }
+
+    *value = (word >> ((addr & 3) * 8)) &
+             (UINT32_MAX >> ((sizeof(uint32_t) - size) * 8));
+    return true;
+}
+
+/* Checked with the slot lock held, paired with pci_config_trace_enabled. */
+static bool pci_config_write_traced(void)
+{
+    return trace_event_get_state_backends(TRACE_PCI_CFG_WRITE) ||
+           trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE);
+}
+
+bool pci_config_try_interrupt_line_write(PCIBus *bus, uint8_t devfn,
+                                         uint8_t value)
+{
+    PCIConfigReadSlot *slot;
+    uint32_t *word;
+    bool ready;
+
+    if (!bus->config_read_slots) {
+        return false;
+    }
+    slot = &bus->config_read_slots[devfn];
+    QEMU_LOCK_GUARD(&slot->status_lock);
+    if (!slot->interrupt_line ||
+        (slot->irq_lock && qemu_rec_mutex_trylock(slot->irq_lock))) {
+        return false;
+    }
+    /* A normal config write must deliver deferred VirtIO serial IRQs. */
+    ready = (!slot->irq_pending || !*slot->irq_pending) &&
+            !pci_config_write_traced();
+    if (ready) {
+        word = &slot->words[PCI_INTERRUPT_LINE / sizeof(*word)];
+        *slot->interrupt_line = value;
+        qatomic_set(word, deposit32(qatomic_read(word), 0, 8, value));
+    }
+    if (slot->irq_lock) {
+        qemu_rec_mutex_unlock(slot->irq_lock);
+    }
+    return ready;
+}
+
+bool pci_config_try_unused_bar_write(PCIBus *bus, uint8_t devfn, unsigned addr,
+                                     const uint32_t *config_reg, uint32_t selector)
+{
+    PCIConfigReadSlot *slot;
+    unsigned seq, bar;
+
+    if (!bus->config_read_slots || (addr & 3)) {
+        return false;
+    }
+    if (addr == PCI_ROM_ADDRESS) {
+        bar = PCI_ROM_SLOT;
+    } else if (addr >= PCI_BASE_ADDRESS_0 && addr <= PCI_BASE_ADDRESS_5) {
+        bar = (addr - PCI_BASE_ADDRESS_0) / 4;
+    } else {
+        return false;
+    }
+    slot = &bus->config_read_slots[devfn];
+    QEMU_LOCK_GUARD(&slot->status_lock);
+    seq = seqlock_read_begin(&slot->seq);
+    return !pci_config_write_traced() && qatomic_read(&slot->valid) &&
+           (qatomic_read(&slot->unused_bars) & (1U << bar)) &&
+           (!config_reg || qatomic_load_acquire(config_reg) == selector) &&
+           !seqlock_read_retry(&slot->seq, seq);
+}
+
+static bool pci_local_bar_write_safe(PCIDevice *dev, unsigned addr,
+                                     unsigned size, const uint8_t *new_bytes)
+{
+    uint16_t cmd = pci_get_word(dev->config + PCI_COMMAND);
+    unsigned reg;
+    PCIIORegion *r;
+
+    if (addr >= PCI_ROM_ADDRESS) {
+        uint8_t old_en;
+        uint8_t new_en;
+
+        r = &dev->io_regions[PCI_ROM_SLOT];
+        if (!r->size) {
+            return true;
+        }
+        if (r->addr != PCI_BAR_UNMAPPED) {
+            return false;
+        }
+        if (!(cmd & PCI_COMMAND_MEMORY)) {
+            return true;
+        }
+        /* ROM remains unmapped when PCI_ROM_ADDRESS_ENABLE stays 0. */
+        old_en = dev->config[PCI_ROM_ADDRESS] & PCI_ROM_ADDRESS_ENABLE;
+        new_en = (addr == PCI_ROM_ADDRESS)
+                 ? (new_bytes[0] & PCI_ROM_ADDRESS_ENABLE)
+                 : old_en;
+        return !old_en && !new_en;
+    }
+
+    reg = (addr - PCI_BASE_ADDRESS_0) / 4;
+    if (reg > 0 && dev->io_regions[reg - 1].size &&
+        !(dev->io_regions[reg - 1].type & PCI_BASE_ADDRESS_SPACE_IO) &&
+        (dev->io_regions[reg - 1].type & PCI_BASE_ADDRESS_MEM_TYPE_64)) {
+        reg--;
+    }
+    r = &dev->io_regions[reg];
+    if (!r->size) {
+        return true;
+    }
+    if (r->addr != PCI_BAR_UNMAPPED) {
+        return false;
+    }
+    if (r->type & PCI_BASE_ADDRESS_SPACE_IO) {
+        return !(cmd & PCI_COMMAND_IO);
+    }
+    return !(cmd & PCI_COMMAND_MEMORY);
+}
+
+static void pci_update_mappings(PCIDevice *d);
+static inline int pci_irq_disabled(PCIDevice *d);
+static void pci_update_irq_disabled(PCIDevice *d, int was_irq_disabled);
+
+/*
+ * Handle PCI_COMMAND (IO/MEMORY/MASTER/INTX_DISABLE), BAR/ROM remapping,
+ * MSI-X control, and device-specific topology config writes under
+ * memory_topology_mutex without BQL. Acquires memory_topology_mutex before
+ * slot->status_lock / slot->irq_lock (strict lock hierarchy), and drops the
+ * spinlock before committing the FlatView transaction or device callbacks.
+ */
+static bool pci_config_try_topo_write(PCIBus *bus, uint8_t devfn,
+                                      unsigned addr, unsigned size,
+                                      uint64_t value)
+{
+    PCIConfigReadSlot *slot = &bus->config_read_slots[devfn];
+    PCIDevice *dev;
+    PCIDeviceClass *pc;
+    uint8_t new_bytes[4];
+    bool changed = false;
+    bool update_bus_master = false;
+    bool update_irq_disabled = false;
+    bool update_msix = false;
+    bool virtio_cmd_check = false;
+    int was_irq_disabled = 0;
+    uint16_t old_cmd = 0, new_cmd = 0;
+    uint32_t v = (uint32_t)value;
+
+    if (!qemu_memory_topology_nobql_enabled()) {
+        return false;
+    }
+
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
+    qemu_spin_lock(&slot->status_lock);
+    dev = slot->local_write_dev;
+    if (!dev || slot->writers ||
+        (slot->irq_lock && qemu_rec_mutex_trylock(slot->irq_lock))) {
+        qemu_spin_unlock(&slot->status_lock);
+        return false;
+    }
+    if ((slot->irq_pending && *slot->irq_pending) ||
+        pci_config_write_traced()) {
+        goto fail_unlock;
+    }
+
+    pc = PCI_DEVICE_GET_CLASS(dev);
+    if (dev->config_write != pci_default_write_config && !slot->cfg_data) {
+        bool ok;
+
+        if (!pc->try_topo_write_config || !memory_region_device_lock_enabled()) {
+            goto fail_unlock;
+        }
+        slot->writers++;
+        slot->interrupt_line = NULL;
+        slot->local_write_dev = NULL;
+        slot->msix_owner = NULL;
+        seqlock_write_begin(&slot->seq);
+        if (slot->irq_lock) {
+            qemu_rec_mutex_unlock(slot->irq_lock);
+        }
+        qemu_spin_unlock(&slot->status_lock);
+
+        ok = pc->try_topo_write_config(dev, addr, (uint32_t)value, size);
+
+        assert(slot->writers == 1);
+        --slot->writers;
+        pci_config_read_slot_publish(dev, slot);
+        return ok;
+    }
+
+    for (unsigned i = 0; i < size; i++, v >>= 8) {
+        uint8_t old_b = dev->config[addr + i];
+        uint8_t wmask = dev->wmask[addr + i];
+        uint8_t w1cmask = dev->w1cmask[addr + i];
+        uint8_t new_b = ((old_b & ~wmask) | (v & wmask)) & ~(v & w1cmask);
+
+        new_bytes[i] = new_b;
+        if (new_b != old_b) {
+            changed = true;
+        }
+    }
+
+    if (ranges_overlap(addr, size, PCI_COMMAND, 2)) {
+        uint16_t diff_cmd;
+
+        old_cmd = pci_get_word(dev->config + PCI_COMMAND);
+        new_cmd = old_cmd;
+        if (range_covers_byte(addr, size, PCI_COMMAND)) {
+            new_cmd = (new_cmd & 0xff00U) | new_bytes[PCI_COMMAND - addr];
+        }
+        if (range_covers_byte(addr, size, PCI_COMMAND + 1)) {
+            new_cmd = (new_cmd & 0x00ffU) |
+                      ((uint16_t)new_bytes[PCI_COMMAND + 1 - addr] << 8);
+        }
+        diff_cmd = old_cmd ^ new_cmd;
+        if (diff_cmd & PCI_COMMAND_INTX_DISABLE) {
+            if (!memory_region_device_lock_enabled()) {
+                goto fail_unlock;
+            }
+            was_irq_disabled = pci_irq_disabled(dev);
+            update_irq_disabled = true;
+        }
+        if (slot->cfg_data && range_covers_byte(addr, size, PCI_COMMAND)) {
+            if (!pc->try_topo_command_write) {
+                goto fail_unlock;
+            }
+            virtio_cmd_check = true;
+        }
+        update_bus_master = true;
+    } else if (msix_present(dev) &&
+               range_covers_byte(addr, size,
+                                 dev->msix_cap + PCI_MSIX_FLAGS + 1)) {
+        if (!memory_region_device_lock_enabled() ||
+            dev->msix_vector_use_notifier ||
+            dev->msix_vector_poll_notifier ||
+            dev->msix_vector_release_notifier ||
+            trace_event_get_state_backends(TRACE_MSIX_WRITE_CONFIG)) {
+            goto fail_unlock;
+        }
+        update_msix = true;
+    } else if (!changed ||
+               !(ranges_overlap(addr, size, PCI_BASE_ADDRESS_0, 24) ||
+                 ranges_overlap(addr, size, PCI_ROM_ADDRESS, 4))) {
+        goto fail_unlock;
+    }
+
+    /* Pause fast-path slot readers/writers while mappings/state update. */
+    slot->writers++;
+    slot->interrupt_line = NULL;
+    slot->local_write_dev = NULL;
+    slot->msix_owner = NULL;
+    seqlock_write_begin(&slot->seq);
+
+    if (slot->irq_lock) {
+        qemu_rec_mutex_unlock(slot->irq_lock);
+    }
+    qemu_spin_unlock(&slot->status_lock);
+
+    if (virtio_cmd_check &&
+        !pc->try_topo_command_write(dev, old_cmd, new_cmd)) {
+        assert(slot->writers == 1);
+        --slot->writers;
+        pci_config_read_slot_publish(dev, slot);
+        return false;
+    }
+
+    if (update_msix) {
+        pci_msi_route_change(dev, true);
+    }
+    if (changed) {
+        unsigned word_addr = addr & ~3U;
+
+        memcpy(dev->config + addr, new_bytes, size);
+        qatomic_set(&slot->words[word_addr / sizeof(uint32_t)],
+                    pci_get_long(dev->config + word_addr));
+    }
+
+    if (update_msix) {
+        msix_write_config(dev, addr, (uint32_t)value, size);
+        pci_msi_route_change(dev, false);
+    } else {
+        memory_region_transaction_begin();
+        pci_update_mappings(dev);
+        if (update_bus_master) {
+            if (update_irq_disabled) {
+                pci_update_irq_disabled(dev, was_irq_disabled);
+            }
+            memory_region_set_enabled(&dev->bus_master_enable_region,
+                                      (pci_get_word(dev->config + PCI_COMMAND) &
+                                       PCI_COMMAND_MASTER) && dev->has_power);
+        }
+        memory_region_transaction_commit();
+    }
+
+    assert(slot->writers == 1);
+    --slot->writers;
+    pci_config_read_slot_publish(dev, slot);
+    return true;
+
+fail_unlock:
+    if (slot->irq_lock) {
+        qemu_rec_mutex_unlock(slot->irq_lock);
+    }
+    qemu_spin_unlock(&slot->status_lock);
+    return false;
+}
+
+bool pci_config_try_local_write(PCIBus *bus, uint8_t devfn, unsigned addr,
+                                unsigned size, uint64_t value)
+{
+    PCIConfigReadSlot *slot;
+    PCIDevice *dev;
+    uint8_t new_bytes[4];
+    bool changed = false;
+    bool ready = false;
+    bool try_topo = false;
+    uint32_t v = (uint32_t)value;
+
+    if (!bus->config_read_slots ||
+        (size != 1 && size != 2 && size != 4) ||
+        addr + size > PCI_CONFIG_SPACE_SIZE ||
+        (addr & 3) + size > 4) {
+        return false;
+    }
+
+    slot = &bus->config_read_slots[devfn];
+    {
+        QEMU_LOCK_GUARD(&slot->status_lock);
+        dev = slot->local_write_dev;
+        if (!dev || addr + size > slot->limit ||
+            (slot->irq_lock && qemu_rec_mutex_trylock(slot->irq_lock))) {
+            return false;
+        }
+        if ((slot->irq_pending && *slot->irq_pending) ||
+            pci_config_write_traced()) {
+            goto out;
+        }
+
+        if (dev->config_write != pci_default_write_config && !slot->cfg_data) {
+            if (PCI_DEVICE_GET_CLASS(dev)->try_topo_write_config &&
+                memory_region_device_lock_enabled()) {
+                try_topo = true;
+            }
+            goto out;
+        }
+
+        for (unsigned i = 0; i < size; i++, v >>= 8) {
+            uint8_t old_b = dev->config[addr + i];
+            uint8_t wmask = dev->wmask[addr + i];
+            uint8_t w1cmask = dev->w1cmask[addr + i];
+            uint8_t new_b = ((old_b & ~wmask) | (v & wmask)) & ~(v & w1cmask);
+
+            new_bytes[i] = new_b;
+            if (new_b != old_b) {
+                changed = true;
+            }
+        }
+
+        if (ranges_overlap(addr, size, PCI_COMMAND, 2)) {
+            uint16_t old_cmd = pci_get_word(dev->config + PCI_COMMAND);
+            uint16_t new_cmd = old_cmd;
+            uint16_t diff_cmd;
+
+            if (range_covers_byte(addr, size, PCI_COMMAND)) {
+                new_cmd = (new_cmd & 0xff00U) | new_bytes[PCI_COMMAND - addr];
+            }
+            if (range_covers_byte(addr, size, PCI_COMMAND + 1)) {
+                new_cmd = (new_cmd & 0x00ffU) |
+                          ((uint16_t)new_bytes[PCI_COMMAND + 1 - addr] << 8);
+            }
+            diff_cmd = old_cmd ^ new_cmd;
+            if (diff_cmd & (PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+                            PCI_COMMAND_MASTER | PCI_COMMAND_INTX_DISABLE)) {
+                if (!(diff_cmd & PCI_COMMAND_INTX_DISABLE) ||
+                    memory_region_device_lock_enabled()) {
+                    try_topo = true;
+                }
+                goto out;
+            }
+            /*
+             * virtio_write_config disables the device and clears DRIVER_OK
+             * whenever PCI_COMMAND low byte is written with MASTER == 0.
+             */
+            if (slot->cfg_data && range_covers_byte(addr, size, PCI_COMMAND) &&
+                !(old_cmd & PCI_COMMAND_MASTER)) {
+                try_topo = true;
+                goto out;
+            }
+        } else if (changed &&
+                   (ranges_overlap(addr, size, PCI_BASE_ADDRESS_0, 24) ||
+                    ranges_overlap(addr, size, PCI_ROM_ADDRESS, 4))) {
+            if (!pci_local_bar_write_safe(dev, addr, size, new_bytes)) {
+                try_topo = true;
+                goto out;
+            }
+        } else if (addr >= PCI_CONFIG_HEADER_SIZE) {
+            if (slot->cfg_data &&
+                ranges_overlap(addr, size, slot->cfg_data - 12, 16)) {
+                goto out;
+            }
+            if (msi_present(dev) &&
+                ranges_overlap(addr, size, dev->msi_cap, 24)) {
+                goto out;
+            }
+            if (dev->exp.sriov_cap &&
+                ranges_overlap(addr, size, dev->exp.sriov_cap, 0x40)) {
+                goto out;
+            }
+            if (dev->exp.exp_cap &&
+                ranges_overlap(addr, size, dev->exp.exp_cap + PCI_EXP_DEVCTL,
+                               2)) {
+                /* Do not bypass PCIe Function Level Reset (FLR). */
+                uint16_t devctl = pci_get_word(dev->config + dev->exp.exp_cap +
+                                               PCI_EXP_DEVCTL);
+                unsigned dc_addr = dev->exp.exp_cap + PCI_EXP_DEVCTL;
+                if (range_covers_byte(addr, size, dc_addr + 1) &&
+                    ((new_bytes[dc_addr + 1 - addr] << 8) &
+                     PCI_EXP_DEVCTL_BCR_FLR)) {
+                    goto out;
+                }
+                if (devctl & PCI_EXP_DEVCTL_BCR_FLR) {
+                    goto out;
+                }
+            }
+            if (msix_present(dev) &&
+                range_covers_byte(addr, size,
+                                  dev->msix_cap + PCI_MSIX_FLAGS + 1)) {
+                if (memory_region_device_lock_enabled() &&
+                    !dev->msix_vector_use_notifier &&
+                    !dev->msix_vector_poll_notifier &&
+                    !dev->msix_vector_release_notifier &&
+                    !trace_event_get_state_backends(TRACE_MSIX_WRITE_CONFIG)) {
+                    try_topo = true;
+                }
+                goto out;
+            }
+        }
+
+        if (changed) {
+            unsigned word_addr = addr & ~3U;
+
+            seqlock_write_begin(&slot->seq);
+            memcpy(dev->config + addr, new_bytes, size);
+            qatomic_set(&slot->words[word_addr / sizeof(uint32_t)],
+                        pci_get_long(dev->config + word_addr));
+            seqlock_write_end(&slot->seq);
+        }
+        ready = true;
+
+    out:
+        if (slot->irq_lock) {
+            qemu_rec_mutex_unlock(slot->irq_lock);
+        }
+    }
+    if (!ready && try_topo) {
+        return pci_config_try_topo_write(bus, devfn, addr, size, value);
+    }
+    return ready;
+}
+
+bool pci_msix_table_pause(PCIDevice *dev)
+{
+    PCIConfigReadSlot *slot = dev->msix_config_slot;
+
+    if (!slot) {
+        return false;
+    }
+    if (!slot->msix_pauses++) {
+        QEMU_LOCK_GUARD(&slot->status_lock);
+        slot->msix_owner = NULL;
+    }
+    return true;
+}
+
+void pci_msix_table_resume(PCIDevice *dev)
+{
+    PCIConfigReadSlot *slot = dev->msix_config_slot;
+
+    if (slot && !--slot->msix_pauses) {
+        QEMU_LOCK_GUARD(&slot->status_lock);
+        pci_msix_table_publish(dev, slot);
+    }
+}
+
+void pci_msix_table_unregister(PCIDevice *dev)
+{
+    PCIConfigReadSlot *slot = dev->msix_config_slot;
+
+    if (slot) {
+        QEMU_LOCK_GUARD(&slot->status_lock);
+        slot->msix_owner = NULL;
+        slot->msix_pauses = 0;
+        qatomic_rcu_set(&dev->msix_config_slot, NULL);
+    }
+}
+
+bool pci_msix_table_try_access(PCIDevice *dev, hwaddr addr, unsigned size,
+                               uint64_t *value, bool write)
+{
+    PCIConfigReadSlot *slot = qatomic_rcu_read(&dev->msix_config_slot);
+    bool ready;
+
+    if (!slot || size != sizeof(uint32_t) || (addr & 3)) {
+        return false;
+    }
+    QEMU_LOCK_GUARD(&slot->status_lock);
+    if (slot->msix_owner != dev ||
+        addr >= dev->msix_entries_nr * PCI_MSIX_ENTRY_SIZE) {
+        return false;
+    }
+    if (!write) {
+        if (trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_READ)) {
+            return false;
+        }
+        *value = pci_get_long(dev->msix_table + addr);
+        return true;
+    }
+    if (!slot->msix_writable ||
+        trace_event_get_state_backends(TRACE_MEMORY_REGION_OPS_WRITE) ||
+        (slot->irq_lock && qemu_rec_mutex_trylock(slot->irq_lock))) {
+        return false;
+    }
+    /* Disabled MSI-X cannot deliver a vector or publish a direct route. */
+    ready = !slot->irq_pending || !*slot->irq_pending;
+    if (ready) {
+        pci_set_long(dev->msix_table + addr, *value);
+    }
+    if (slot->irq_lock) {
+        qemu_rec_mutex_unlock(slot->irq_lock);
+    }
+    return ready;
+}
+
+static void pci_free_config_slots(PCIConfigReadSlots *slots)
+{
+    for (unsigned i = 0; i < PCI_DEVFN_MAX; i++) {
+        qemu_spin_destroy(&slots->slot[i].status_lock);
+    }
+    g_free(slots);
+}
+
+static void pci_bus_finalize(Object *obj)
+{
+    PCIConfigReadSlot *slots = PCI_BUS(obj)->config_read_slots;
+
+    if (slots) {
+        trace_remove_enable_notifier(&PCI_BUS(obj)->config_trace_enabled);
+        qemu_spin_destroy(&PCI_BUS(obj)->config_selector_lock);
+        call_rcu_nobql(container_of(slots, PCIConfigReadSlots, slot[0]),
+                       pci_free_config_slots, rcu);
+    }
+}
+#endif
+
+static inline PCIStatusLock *pci_lock_status(PCIDevice *dev)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    PCIConfigReadSlot *slot = pci_config_read_slot(dev);
+
+    if (slot && qatomic_read(&slot->limit)) {
+        qemu_spin_lock(&slot->status_lock);
+        return &slot->status_lock;
+    }
+#endif
+    return NULL;
+}
+
 static int pcibus_num(PCIBus *bus)
 {
     if (pci_bus_is_root(bus)) {
@@ -220,6 +1065,9 @@ static const TypeInfo pci_bus_info = {
     .instance_size = sizeof(PCIBus),
     .class_size = sizeof(PCIBusClass),
     .class_init = pci_bus_class_init,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .instance_finalize = pci_bus_finalize,
+#endif
 };
 
 static const TypeInfo cxl_interface_info = {
@@ -282,21 +1130,23 @@ int pci_bar(PCIDevice *d, int reg)
 
 static inline int pci_irq_state(PCIDevice *d, int irq_num)
 {
-        return (d->irq_state >> irq_num) & 0x1;
+    return (qatomic_read(&d->irq_state) >> irq_num) & 1;
 }
 
 static inline void pci_set_irq_state(PCIDevice *d, int irq_num, int level)
 {
-        d->irq_state &= ~(0x1 << irq_num);
-        d->irq_state |= level << irq_num;
+    int state = qatomic_read(&d->irq_state);
+
+    qatomic_set(&d->irq_state, (state & ~(1 << irq_num)) | (level << irq_num));
 }
 
 static void pci_bus_change_irq_level(PCIBus *bus, int irq_num, int change)
 {
+    int count;
     assert(irq_num >= 0);
     assert(irq_num < bus->nirq);
-    bus->irq_count[irq_num] += change;
-    bus->set_irq(bus->irq_opaque, irq_num, bus->irq_count[irq_num] != 0);
+    count = qatomic_add_fetch(&bus->irq_count[irq_num], change);
+    bus->set_irq(bus->irq_opaque, irq_num, count != 0);
 }
 
 static void pci_change_irq_level(PCIDevice *pci_dev, int irq_num, int change)
@@ -321,18 +1171,43 @@ int pci_bus_get_irq_level(PCIBus *bus, int irq_num)
 {
     assert(irq_num >= 0);
     assert(irq_num < bus->nirq);
-    return !!bus->irq_count[irq_num];
+    return !!qatomic_read(&bus->irq_count[irq_num]);
 }
 
 /* Update interrupt status bit in config space on interrupt
  * state change. */
-static void pci_update_irq_status(PCIDevice *dev)
+static void pci_update_irq_status(PCIDevice *dev, PCIStatusLock *lock)
 {
-    if (dev->irq_state) {
+    bool asserted = qatomic_read(&dev->irq_state) != 0;
+
+    if (asserted) {
         dev->config[PCI_STATUS] |= PCI_STATUS_INTERRUPT;
     } else {
         dev->config[PCI_STATUS] &= ~PCI_STATUS_INTERRUPT;
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (lock) {
+        PCIConfigReadSlot *slot = container_of(lock, PCIConfigReadSlot, status_lock);
+        uint32_t *word = &slot->words[PCI_COMMAND / sizeof(uint32_t)];
+        uint32_t mask = PCI_STATUS_INTERRUPT << 16;
+        uint32_t old = qatomic_read(word);
+
+        /* A config writer may still be applying a new command to the device. */
+        qatomic_set(word, asserted ? old | mask : old & ~mask);
+    }
+#endif
+}
+
+static int pci_change_irq_state(PCIDevice *dev, int pin, int level)
+{
+    g_autoptr(PCIStatusLock) lock = pci_lock_status(dev);
+    int change = level - pci_irq_state(dev, pin);
+
+    if (change) {
+        pci_set_irq_state(dev, pin, level);
+        pci_update_irq_status(dev, lock);
+    }
+    return change;
 }
 
 void pci_device_deassert_intx(PCIDevice *dev)
@@ -387,16 +1262,22 @@ static void pci_reset_regions(PCIDevice *dev)
 
 static void pci_do_device_reset(PCIDevice *dev)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(dev);
+#endif
     pci_device_deassert_intx(dev);
-    assert(dev->irq_state == 0);
+    assert(qatomic_read(&dev->irq_state) == 0);
 
     /* Clear all writable bits */
     pci_word_test_and_clear_mask(dev->config + PCI_COMMAND,
                                  pci_get_word(dev->wmask + PCI_COMMAND) |
                                  pci_get_word(dev->w1cmask + PCI_COMMAND));
-    pci_word_test_and_clear_mask(dev->config + PCI_STATUS,
-                                 pci_get_word(dev->wmask + PCI_STATUS) |
-                                 pci_get_word(dev->w1cmask + PCI_STATUS));
+    {
+        g_autoptr(PCIStatusLock) lock = pci_lock_status(dev);
+        pci_word_test_and_clear_mask(dev->config + PCI_STATUS,
+                                     pci_get_word(dev->wmask + PCI_STATUS) |
+                                     pci_get_word(dev->w1cmask + PCI_STATUS));
+    }
     /* Some devices make bits of PCI_INTERRUPT_LINE read only */
     pci_byte_test_and_clear_mask(dev->config + PCI_INTERRUPT_LINE,
                               pci_get_word(dev->wmask + PCI_INTERRUPT_LINE) |
@@ -407,6 +1288,9 @@ static void pci_do_device_reset(PCIDevice *dev)
 
     msi_reset(dev);
     msix_reset(dev);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(dev);
+#endif
 }
 
 /*
@@ -415,8 +1299,14 @@ static void pci_do_device_reset(PCIDevice *dev)
  */
 void pci_device_reset(PCIDevice *dev)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(dev);
+#endif
     device_cold_reset(&dev->qdev);
     pci_do_device_reset(dev);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(dev);
+#endif
 }
 
 /*
@@ -520,6 +1410,20 @@ static void pci_root_bus_internal_init(PCIBus *bus, DeviceState *parent,
 static void pci_bus_uninit(PCIBus *bus)
 {
     pci_host_bus_unregister(BUS(bus)->parent);
+}
+
+void pci_bus_add_child(PCIBus *bus, PCIBus *child)
+{
+    seqlock_write_begin(&bus->config_topology);
+    QLIST_INSERT_HEAD_RCU(&bus->child, child, sibling);
+    seqlock_write_end(&bus->config_topology);
+}
+
+void pci_bus_remove_child(PCIBus *bus, PCIBus *child)
+{
+    seqlock_write_begin(&bus->config_topology);
+    QLIST_REMOVE_RCU(child, sibling);
+    seqlock_write_end(&bus->config_topology);
 }
 
 bool pci_bus_is_express(const PCIBus *bus)
@@ -643,18 +1547,27 @@ static int get_pci_config_device(QEMUFile *f, void *pv, size_t size,
     config = g_malloc(size);
 
     qemu_get_buffer(f, config, size);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(s);
+#endif
+    g_autoptr(PCIStatusLock) lock = pci_lock_status(s);
     for (i = 0; i < size; ++i) {
         if ((config[i] ^ s->config[i]) &
             s->cmask[i] & ~s->wmask[i] & ~s->w1cmask[i]) {
+            g_clear_pointer(&lock, qemu_spin_unlock);
             error_report("%s: Bad config data: i=0x%x read: %x device: %x "
                          "cmask: %x wmask: %x w1cmask:%x", __func__,
                          i, config[i], s->config[i],
                          s->cmask[i], s->wmask[i], s->w1cmask[i]);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            pci_config_read_slot_end(s);
+#endif
             g_free(config);
             return -EINVAL;
         }
     }
     memcpy(s->config, config, size);
+    g_clear_pointer(&lock, qemu_spin_unlock);
 
     pci_update_mappings(s);
     if (IS_PCI_BRIDGE(s)) {
@@ -665,6 +1578,9 @@ static int get_pci_config_device(QEMUFile *f, void *pv, size_t size,
                               pci_get_word(s->config + PCI_COMMAND)
                               & PCI_COMMAND_MASTER);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(s);
+#endif
     g_free(config);
     return 0;
 }
@@ -673,9 +1589,25 @@ static int get_pci_config_device(QEMUFile *f, void *pv, size_t size,
 static int put_pci_config_device(QEMUFile *f, void *pv, size_t size,
                                  const VMStateField *field, JSONWriter *vmdesc)
 {
-    const uint8_t **v = pv;
-    assert(size == pci_config_size(container_of(pv, PCIDevice, config)));
-    qemu_put_buffer(f, *v, size);
+    PCIDevice *dev = container_of(pv, PCIDevice, config);
+    uint8_t status, line;
+
+    assert(size == pci_config_size(dev));
+    {
+        g_autoptr(PCIStatusLock) lock = pci_lock_status(dev);
+        status = dev->config[PCI_STATUS];
+        line = dev->config[PCI_INTERRUPT_LINE];
+    }
+    if (dev->save_irq_separately) {
+        status &= ~PCI_STATUS_INTERRUPT;
+    }
+    qemu_put_buffer(f, dev->config, PCI_STATUS);
+    qemu_put_byte(f, status);
+    qemu_put_buffer(f, dev->config + PCI_STATUS + 1,
+                    PCI_INTERRUPT_LINE - PCI_STATUS - 1);
+    qemu_put_byte(f, line);
+    qemu_put_buffer(f, dev->config + PCI_INTERRUPT_LINE + 1,
+                    size - PCI_INTERRUPT_LINE - 1);
 
     return 0;
 }
@@ -701,6 +1633,7 @@ static int get_pci_irq_state(QEMUFile *f, void *pv, size_t size,
         }
     }
 
+    g_autoptr(PCIStatusLock) lock = pci_lock_status(s);
     for (i = 0; i < PCI_NUM_PINS; ++i) {
         pci_set_irq_state(s, i, irq_state[i]);
     }
@@ -761,22 +1694,28 @@ const VMStateDescription vmstate_pci_device = {
 
 void pci_device_save(PCIDevice *s, QEMUFile *f)
 {
-    /* Clear interrupt status bit: it is implicit
-     * in irq_state which we are saving.
-     * This makes us compatible with old devices
-     * which never set or clear this bit. */
-    s->config[PCI_STATUS] &= ~PCI_STATUS_INTERRUPT;
+    /* Older streams encode the interrupt status bit in irq_state alone. */
+    s->save_irq_separately = true;
     vmstate_save_state(f, &vmstate_pci_device, s, NULL);
-    /* Restore the interrupt status bit. */
-    pci_update_irq_status(s);
+    s->save_irq_separately = false;
 }
 
 int pci_device_load(PCIDevice *s, QEMUFile *f)
 {
     int ret;
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(s);
+#endif
     ret = vmstate_load_state(f, &vmstate_pci_device, s, s->version_id);
     /* Restore the interrupt status bit. */
-    pci_update_irq_status(s);
+    {
+        g_autoptr(PCIStatusLock) lock = pci_lock_status(s);
+        pci_update_irq_status(s, lock);
+    }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(s);
+#endif
     return ret;
 }
 
@@ -1026,7 +1965,14 @@ static void pci_config_free(PCIDevice *pci_dev)
 
 static void do_pci_unregister_device(PCIDevice *pci_dev)
 {
-    pci_get_bus(pci_dev)->devices[pci_dev->devfn] = NULL;
+    PCIBus *bus = pci_get_bus(pci_dev);
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_remove(pci_dev);
+#endif
+    seqlock_write_begin(&bus->config_topology);
+    qatomic_set(&bus->devices[pci_dev->devfn], NULL);
+    seqlock_write_end(&bus->config_topology);
     pci_config_free(pci_dev);
 
     if (xen_mode == XEN_EMULATE) {
@@ -1253,7 +2199,9 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev,
         config_write = pci_default_write_config;
     pci_dev->config_read = config_read;
     pci_dev->config_write = config_write;
-    bus->devices[devfn] = pci_dev;
+    seqlock_write_begin(&bus->config_topology);
+    qatomic_set(&bus->devices[devfn], pci_dev);
+    seqlock_write_end(&bus->config_topology);
     pci_dev->version_id = 2; /* Current pci device vmstate version */
     return pci_dev;
 }
@@ -1278,6 +2226,9 @@ static void pci_qdev_unrealize(DeviceState *dev)
     PCIDevice *pci_dev = PCI_DEVICE(dev);
     PCIDeviceClass *pc = PCI_DEVICE_GET_CLASS(pci_dev);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_remove(pci_dev);
+#endif
     pci_unregister_io_regions(pci_dev);
     pci_del_option_rom(pci_dev);
 
@@ -1589,16 +2540,19 @@ uint32_t pci_default_read_config(PCIDevice *d,
         ranges_overlap(address, len, d->exp.exp_cap + PCI_EXP_LNKSTA, 2)) {
         pcie_sync_bridge_lnk(d);
     }
+    g_autoptr(PCIStatusLock) lock =
+        (address < PCI_CONFIG_HEADER_SIZE) ?
+        pci_lock_status(d) : NULL;
     memcpy(&val, d->config + address, len);
     return le32_to_cpu(val);
 }
 
-void pci_default_write_config(PCIDevice *d, uint32_t addr, uint32_t val_in, int l)
+static void pci_write_config_bytes(PCIDevice *d, uint32_t addr, uint32_t val,
+                                   int l)
 {
-    int i, was_irq_disabled = pci_irq_disabled(d);
-    uint32_t val = val_in;
-
-    assert(addr + l <= pci_config_size(d));
+    g_autoptr(PCIStatusLock) lock = range_covers_byte(addr, l, PCI_STATUS) ?
+                                    pci_lock_status(d) : NULL;
+    int i;
 
     for (i = 0; i < l; val >>= 8, ++i) {
         uint8_t wmask = d->wmask[addr + i];
@@ -1607,6 +2561,19 @@ void pci_default_write_config(PCIDevice *d, uint32_t addr, uint32_t val_in, int 
         d->config[addr + i] = (d->config[addr + i] & ~wmask) | (val & wmask);
         d->config[addr + i] &= ~(val & w1cmask); /* W1C: Write 1 to Clear */
     }
+}
+
+void pci_default_write_config(PCIDevice *d, uint32_t addr, uint32_t val_in, int l)
+{
+    int was_irq_disabled = pci_irq_disabled(d);
+
+    assert(addr + l <= pci_config_size(d));
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(d);
+#endif
+    pci_msi_route_change(d, true);
+
+    pci_write_config_bytes(d, addr, val_in, l);
     if (ranges_overlap(addr, l, PCI_BASE_ADDRESS_0, 24) ||
         ranges_overlap(addr, l, PCI_ROM_ADDRESS, 4) ||
         ranges_overlap(addr, l, PCI_ROM_ADDRESS1, 4) ||
@@ -1623,6 +2590,10 @@ void pci_default_write_config(PCIDevice *d, uint32_t addr, uint32_t val_in, int 
     msi_write_config(d, addr, val_in, l);
     msix_write_config(d, addr, val_in, l);
     pcie_sriov_config_write(d, addr, val_in, l);
+    pci_msi_route_change(d, false);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(d);
+#endif
 }
 
 /***********************************************************/
@@ -1636,12 +2607,10 @@ static void pci_irq_handler(void *opaque, int irq_num, int level)
 
     assert(0 <= irq_num && irq_num < PCI_NUM_PINS);
     assert(level == 0 || level == 1);
-    change = level - pci_irq_state(pci_dev, irq_num);
-    if (!change)
+    change = pci_change_irq_state(pci_dev, irq_num, level);
+    if (!change) {
         return;
-
-    pci_set_irq_state(pci_dev, irq_num, level);
-    pci_update_irq_status(pci_dev);
+    }
     if (pci_irq_disabled(pci_dev))
         return;
     pci_change_irq_level(pci_dev, irq_num, change);
@@ -2187,6 +3156,11 @@ static void pci_qdev_realize(DeviceState *qdev, Error **errp)
     }
 
     pci_set_power(pci_dev, true);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (pc->plain_config_header && pci_dev->config_read == pci_default_read_config) {
+        pci_config_read_slot_register(pci_dev, 0, NULL, NULL);
+    }
+#endif
 
     pci_dev->msi_trigger = pci_msi_trigger;
 }
@@ -2484,16 +3458,25 @@ int pci_add_capability(PCIDevice *pdev, uint8_t cap_id,
         }
     }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(pdev);
+#endif
     config = pdev->config + offset;
     config[PCI_CAP_LIST_ID] = cap_id;
     config[PCI_CAP_LIST_NEXT] = pdev->config[PCI_CAPABILITY_LIST];
     pdev->config[PCI_CAPABILITY_LIST] = offset;
-    pdev->config[PCI_STATUS] |= PCI_STATUS_CAP_LIST;
+    {
+        g_autoptr(PCIStatusLock) lock = pci_lock_status(pdev);
+        pdev->config[PCI_STATUS] |= PCI_STATUS_CAP_LIST;
+    }
     memset(pdev->used + offset, 0xFF, QEMU_ALIGN_UP(size, 4));
     /* Make capability read-only by default */
     memset(pdev->wmask + offset, 0, size);
     /* Check capability by default */
     memset(pdev->cmask + offset, 0xFF, size);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(pdev);
+#endif
     return offset;
 }
 
@@ -2503,6 +3486,9 @@ void pci_del_capability(PCIDevice *pdev, uint8_t cap_id, uint8_t size)
     uint8_t prev, offset = pci_find_capability_list(pdev, cap_id, &prev);
     if (!offset)
         return;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(pdev);
+#endif
     pdev->config[prev] = pdev->config[offset + PCI_CAP_LIST_NEXT];
     /* Make capability writable again */
     memset(pdev->wmask + offset, 0xff, size);
@@ -2511,8 +3497,13 @@ void pci_del_capability(PCIDevice *pdev, uint8_t cap_id, uint8_t size)
     memset(pdev->cmask + offset, 0, size);
     memset(pdev->used + offset, 0, QEMU_ALIGN_UP(size, 4));
 
-    if (!pdev->config[PCI_CAPABILITY_LIST])
+    if (!pdev->config[PCI_CAPABILITY_LIST]) {
+        g_autoptr(PCIStatusLock) lock = pci_lock_status(pdev);
         pdev->config[PCI_STATUS] &= ~PCI_STATUS_CAP_LIST;
+    }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(pdev);
+#endif
 }
 
 uint8_t pci_find_capability(PCIDevice *pdev, uint8_t cap_id)
@@ -2840,6 +3831,9 @@ void pci_set_power(PCIDevice *d, bool state)
         return;
     }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_begin(d);
+#endif
     d->has_power = state;
     pci_update_mappings(d);
     memory_region_set_enabled(&d->bus_master_enable_region,
@@ -2848,6 +3842,9 @@ void pci_set_power(PCIDevice *d, bool state)
     if (!d->has_power) {
         pci_device_reset(d);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    pci_config_read_slot_end(d);
+#endif
 }
 
 static const TypeInfo pci_device_type_info = {

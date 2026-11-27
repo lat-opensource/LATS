@@ -324,6 +324,8 @@ static void qtest_irq_handler(void *opaque, int n, int level)
     }
 }
 
+uint64_t qtest_apic_expiry(unsigned op, uint64_t val) __attribute__((weak));
+
 static int64_t qtest_clock_counter;
 
 int64_t qtest_get_virtual_clock(void)
@@ -722,6 +724,15 @@ static void qtest_process_command(CharBackend *chr, gchar **words)
         } else {
             qtest_sendf(chr, "OK little\n");
         }
+    } else if (qtest_apic_expiry && qtest_enabled() &&
+               !strcmp(words[0], "apic_expiry")) {
+        uint64_t op, val;
+
+        g_assert(words[1] && words[2]);
+        g_assert(!qemu_strtou64(words[1], NULL, 0, &op));
+        g_assert(!qemu_strtou64(words[2], NULL, 0, &val));
+        qtest_send_prefix(chr);
+        qtest_sendf(chr, "OK %" PRIu64 "\n", qtest_apic_expiry(op, val));
     } else if (qtest_enabled() && strcmp(words[0], "clock_step") == 0) {
         int64_t ns;
 

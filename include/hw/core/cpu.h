@@ -1124,4 +1124,8 @@ extern const VMStateDescription vmstate_cpu_common;
 #define UNASSIGNED_CPU_INDEX -1
 #define UNASSIGNED_CLUSTER_INDEX -1
 
+#define run_on_cpu_nobql run_on_cpu
+#define async_run_on_cpu_nobql async_run_on_cpu
+static inline bool qemu_vcpu_statelock_enabled(void) { return false; }
+
 #endif
