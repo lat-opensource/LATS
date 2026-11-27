@@ -2991,6 +2991,7 @@ qio_channel_rdma_source_prepare(GSource *source,
     QIOChannelRDMASource *rsource = (QIOChannelRDMASource *)source;
     RDMAContext *rdma;
     GIOCondition cond = 0;
+    qemu_poll_needs_prepare();
     *timeout = -1;
 
     RCU_READ_LOCK_GUARD();

@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "io/channel-tls.h"
@@ -415,6 +416,7 @@ qio_channel_tls_source_check(GSource *source)
 static gboolean
 qio_channel_tls_source_prepare(GSource *source, gint *timeout)
 {
+    qemu_poll_needs_prepare();
     *timeout = -1;
     return qio_channel_tls_source_check(source);
 }

@@ -654,3 +654,23 @@ void event_notifier_set_handler(EventNotifier *e,
     iohandler_init();
     aio_set_event_notifier(iohandler_ctx, e, handler, NULL, NULL);
 }
+
+void qemu_poll_needs_prepare(void)
+{
+}
+
+void qemu_notify_event_for_main_context(void)
+{
+    qemu_notify_event();
+}
+
+void main_loop_mod_virtual_timer_ns(QEMUTimer *ts, int64_t expire_time)
+{
+    timer_mod_ns(ts, expire_time);
+}
+
+void trial_report_polls(const char *phase);
+void trial_report_polls(const char *phase)
+{
+    (void)phase;
+}

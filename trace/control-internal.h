@@ -10,6 +10,8 @@
 #ifndef TRACE__CONTROL_INTERNAL_H
 #define TRACE__CONTROL_INTERNAL_H
 
+#include "qemu/atomic.h"
+
 extern int trace_events_enabled_count;
 
 
@@ -39,11 +41,13 @@ static inline bool trace_event_get_state_static(TraceEvent *ev)
 
 /* it's on fast path, avoid consistency checks (asserts) */
 #define trace_event_get_state_dynamic_by_id(id) \
-    (unlikely(trace_events_enabled_count) && _ ## id ## _DSTATE)
+    (unlikely(qatomic_read(&trace_events_enabled_count)) && \
+     qatomic_read(&_ ## id ## _DSTATE))
 
 static inline bool trace_event_get_state_dynamic(TraceEvent *ev)
 {
-    return unlikely(trace_events_enabled_count) && *ev->dstate;
+    return unlikely(qatomic_read(&trace_events_enabled_count)) &&
+           qatomic_read(ev->dstate);
 }
 
 void trace_event_register_group(TraceEvent **events);

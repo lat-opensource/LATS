@@ -23,7 +23,9 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qemu/host-utils.h"
+#include "qemu/main-loop.h"
 #include <math.h>
 
 #ifdef __FreeBSD__
@@ -1198,4 +1200,17 @@ char *get_relocated_path(const char *dir)
     }
 
     return g_string_free(result, false);
+}
+
+bool lats_nobql_enabled(void)
+{
+    static int enabled = -1;
+    int val = qatomic_read(&enabled);
+
+    if (unlikely(val < 0)) {
+        const char *env = g_getenv("LATS_NOBQL");
+        val = (env && strcmp(env, "0") == 0) ? 0 : 1;
+        qatomic_set(&enabled, val);
+    }
+    return val != 0;
 }

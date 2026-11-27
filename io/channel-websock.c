@@ -19,6 +19,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "qemu/bswap.h"
 #include "io/channel-websock.h"
@@ -1254,6 +1255,7 @@ static gboolean
 qio_channel_websock_source_prepare(GSource *source,
                                    gint *timeout)
 {
+    qemu_poll_needs_prepare();
     *timeout = -1;
     return qio_channel_websock_source_check(source);
 }

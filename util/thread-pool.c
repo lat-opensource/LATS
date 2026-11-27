@@ -170,6 +170,8 @@ static void spawn_thread(ThreadPool *pool)
     }
 }
 
+void trial_main_callback(unsigned kind, uintptr_t pc) __attribute__((weak));
+
 static void thread_pool_completion_bh(void *opaque)
 {
     ThreadPool *pool = opaque;
@@ -194,6 +196,9 @@ restart:
              */
             qemu_bh_schedule(pool->completion_bh);
 
+            if (trial_main_callback) {
+                trial_main_callback(3, (uintptr_t)elem->common.cb);
+            }
             elem->common.cb(elem->common.opaque, elem->ret);
 
             /* We can safely cancel the completion_bh here regardless of someone

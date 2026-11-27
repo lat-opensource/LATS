@@ -155,6 +155,11 @@ static bool trace_event_get_state_dynamic(TraceEvent *ev);
  */
 void trace_event_set_state_dynamic(TraceEvent *ev, bool state);
 
+struct Notifier;
+/* Runtime enables wait for each registered device to drain in-flight writes. */
+void trace_add_enable_notifier(struct Notifier *notifier);
+void trace_remove_enable_notifier(struct Notifier *notifier);
+
 /**
  * trace_init_backends:
  *

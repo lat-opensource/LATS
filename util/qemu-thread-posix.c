@@ -11,6 +11,7 @@
  *
  */
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
 #include "qemu/thread.h"
 #include "qemu/atomic.h"
 #include "qemu/notify.h"
@@ -170,6 +171,7 @@ int qemu_rec_mutex_trylock_impl(QemuRecMutex *mutex, const char *file, int line)
 void qemu_rec_mutex_unlock_impl(QemuRecMutex *mutex, const char *file, int line)
 {
     qemu_mutex_unlock_impl(&mutex->m, file, line);
+    lats_lockdep_release(mutex);
 }
 
 void qemu_cond_init(QemuCond *cond)
@@ -705,8 +707,10 @@ void *qemu_thread_join(QemuThread *thread)
 /* Busy-wait tickets and futex wake generations are independent. */
 void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex)
 {
+    unsigned long ticket = qemu_cond_wait_prepare_1(cond);
+
+    /* A notifier taking this lock must see our ticket before we unlock. */
     pthread_spin_unlock(&mutex->spin);
-    unsigned long ticket = qatomic_fetch_inc(&cond->wait_seq);
 
     while (qatomic_read(&cond->release_seq) < ticket) {
         smp_mb();
@@ -715,30 +719,38 @@ void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex)
 }
 
 /*
- * return true : cond is waked up
- * return false: count reaches max
+ * The caller prepares a ticket while holding its predicate lock, then drops
+ * the lock and polls. A timeout does not cancel or replace that ticket.
  */
-bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, QemuMutex *mutex, int n, bool inc)
+bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n)
 {
-    bool res = false;
-//    pthread_spin_unlock(&mutex->spin);
-    unsigned long ticket = inc ? qatomic_fetch_inc(&cond->wait_seq) :
-                                 qatomic_read(&cond->wait_seq);
     int count = 0;
+
     while (qatomic_read(&cond->release_seq) < ticket && count < n) {
         smp_mb();
         count += 1;
     }
-    if (!(qatomic_read(&cond->release_seq) < ticket)) {
-        res = true;
-    }
-//    pthread_spin_lock(&mutex->spin);
-    return res;
+    return qatomic_read(&cond->release_seq) >= ticket;
 }
 
 void qemu_cond_broadcast_1(QemuCond *cond)
 {
-    qatomic_set(&cond->release_seq, qatomic_read(&cond->wait_seq));
+    unsigned long last = qatomic_read(&cond->wait_seq);
+    unsigned long released = qatomic_read(&cond->release_seq);
+
+    /*
+     * Keep the existing inclusive release rule: a vCPU kick need not hold
+     * the predicate lock. Concurrent broadcasts must not overwrite a newer
+     * release with an older wait_seq snapshot.
+     */
+    while (released < last) {
+        unsigned long old = qatomic_cmpxchg(&cond->release_seq, released, last);
+
+        if (old == released) {
+            break;
+        }
+        released = old;
+    }
     smp_mb();
 }
 
@@ -780,12 +792,49 @@ void qemu_cond_signal_2(QemuCond *cond)
     qemu_futex_wake(&cond->futex_seq, 1);
 }
 
-void qemu_cond_wait_3(QemuCond *cond, QemuMutex *mutex, int n)
+/* The caller snapshots seq before checking its predicate and deadline. */
+void qemu_cond_wait_2_deadline_unlocked(QemuCond *cond, unsigned seq,
+                                      const struct timespec *deadline, int spin_count)
+{
+    int ret = 0, err = 0;
+
+    for (int i = 0; i < spin_count &&
+         qatomic_read(&cond->futex_seq) == seq; ++i) {
+        if (deadline && !(i & 255)) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            if (now.tv_sec > deadline->tv_sec ||
+                (now.tv_sec == deadline->tv_sec &&
+                 now.tv_nsec >= deadline->tv_nsec)) {
+                break;
+            }
+        }
+        smp_mb();
+    }
+    if (qatomic_read(&cond->futex_seq) == seq) {
+        ret = qemu_futex(&cond->futex_seq, FUTEX_WAIT_BITSET, (int)seq,
+                         deadline, NULL, FUTEX_BITSET_MATCH_ANY);
+        err = errno;
+    }
+    if (ret && err != EAGAIN && err != EINTR && err != ETIMEDOUT) {
+        error_exit(err, __func__);
+    }
+}
+
+void qemu_cond_wait_2_deadline(QemuCond *cond, QemuMutex *mutex, unsigned seq,
+                             const struct timespec *deadline, int spin_count)
 {
     pthread_spin_unlock(&mutex->spin);
-    unsigned long ticket = qatomic_fetch_inc(&cond->wait_seq);
+    qemu_cond_wait_2_deadline_unlocked(cond, seq, deadline, spin_count);
+    pthread_spin_lock(&mutex->spin);
+}
+
+void qemu_cond_wait_3(QemuCond *cond, QemuMutex *mutex, int n)
+{
+    unsigned long ticket = qemu_cond_wait_prepare_1(cond);
     int count = 0;
 
+    pthread_spin_unlock(&mutex->spin);
     while (qatomic_read(&cond->release_seq) < ticket && count < n) {
         smp_mb();
         count += 1;
@@ -811,7 +860,8 @@ void qemu_cond_broadcast_3(QemuCond *cond)
 void qemu_cond_signal_3(QemuCond *cond)
 {
     qemu_cond_signal_1(cond);
-    qemu_cond_signal_2(cond);
+    /* Ticket order need not match futex queue order. Wake the eligible one. */
+    qemu_cond_broadcast_2(cond);
 }
 
 #endif

@@ -91,6 +91,9 @@ int qemu_init_main_loop(Error **errp);
  */
 void main_loop_wait(int nonblocking);
 
+/* Reschedule a main-loop virtual timer, retaining a sufficient wait. */
+void main_loop_mod_virtual_timer_ns(QEMUTimer *ts, int64_t expire_time);
+
 /**
  * qemu_get_aio_context: Return the main loop's AioContext
  */
@@ -109,6 +112,12 @@ AioContext *qemu_get_aio_context(void);
  * services (bottom halves and timers) call it themselves.
  */
 void qemu_notify_event(void);
+
+/* Notify a source whose readiness is rechecked by default-context prepare. */
+void qemu_notify_event_for_main_context(void);
+
+/* A source whose readiness can change without a wake needs another prepare. */
+void qemu_poll_needs_prepare(void);
 
 #ifdef _WIN32
 /* return TRUE if no sleep should be done afterwards */
@@ -330,6 +339,15 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line);
 void qemu_mutex_lock_iothread_mmio_impl(const void *mr, const char *name,
                                         uint64_t offset, bool is_write,
                                         const char *file, int line);
+#ifdef CONFIG_LATX_PROFILER
+/* Account for BQL acquired by a device during the timed dispatch. */
+uint64_t qemu_mmio_bql_profile_ticks(void);
+void qemu_mutex_lock_iothread_mmio_profile_impl(const void *mr, const char *name,
+                                                uint64_t offset, bool is_write,
+                                                const char *file, int line);
+#else
+#define qemu_mutex_lock_iothread_mmio_profile_impl qemu_mutex_lock_iothread_mmio_impl
+#endif
 
 /**
  * qemu_mutex_unlock_iothread: Unlock the main loop mutex.
@@ -413,5 +431,11 @@ typedef struct MainLoopPoll {
 
 void main_loop_poll_add_notifier(Notifier *notify);
 void main_loop_poll_remove_notifier(Notifier *notify);
+
+/*
+ * Unified BQL-free architecture master switch.
+ * Enabled by default; set LATS_NOBQL=0 to restore legacy BQL mode.
+ */
+bool lats_nobql_enabled(void);
 
 #endif

@@ -408,8 +408,22 @@ unsigned qemu_lockcnt_count(QemuLockCnt *lockcnt);
 void qemu_spin_lock_impl(QemuMutex *mutex, const char *file, const int line);
 
 #ifdef CONFIG_LATX_OPT_BQL
+/*
+ * All waiters use the same predicate lock, which serializes ticket allocation
+ * and publishes it before unlocking. Atomic loads/stores let notifiers sample
+ * wait_seq without locking. Atomic read-modify-write is unnecessary here.
+ */
+static inline unsigned long qemu_cond_wait_prepare_1(QemuCond *cond)
+{
+    unsigned long ticket = qatomic_read(&cond->wait_seq);
+
+    qatomic_set(&cond->wait_seq, ticket + 1);
+    return ticket;
+}
+
 void qemu_cond_wait_1(QemuCond *cond, QemuMutex *mutex);
-bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, QemuMutex *mutex, int n, bool inc);
+/* Reuse the same prepared ticket for every bounded-poll retry. */
+bool qemu_cond_wait_1_n_unlocked(QemuCond *cond, unsigned long ticket, int n);
 void qemu_cond_broadcast_1(QemuCond *cond);
 void qemu_cond_signal_1(QemuCond *cond);
 void qemu_mutex_lock_1(QemuMutex *mutex);
@@ -417,6 +431,10 @@ void qemu_mutex_unlock_1(QemuMutex *mutex);
 void qemu_cond_wait_2(QemuCond *cond, QemuMutex *mutex);
 void qemu_cond_broadcast_2(QemuCond *cond);
 void qemu_cond_signal_2(QemuCond *cond);
+void qemu_cond_wait_2_deadline_unlocked(QemuCond *cond, unsigned seq,
+                                      const struct timespec *deadline, int spin_count);
+void qemu_cond_wait_2_deadline(QemuCond *cond, QemuMutex *mutex, unsigned seq,
+                             const struct timespec *deadline, int spin_count);
 void qemu_cond_wait_3(QemuCond *cond, QemuMutex *mutex, int n);
 void qemu_cond_broadcast_3(QemuCond *cond);
 void qemu_cond_signal_3(QemuCond *cond);
