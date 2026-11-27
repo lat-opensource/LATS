@@ -260,10 +260,22 @@ static void pit_common_class_init(ObjectClass *klass, void *data)
     device_class_set_props(dc, pit_common_properties);
 }
 
+static void pit_common_instance_init(Object *obj)
+{
+    qemu_rec_mutex_init(&PIT_COMMON(obj)->local_lock);
+}
+
+static void pit_common_instance_finalize(Object *obj)
+{
+    qemu_rec_mutex_destroy(&PIT_COMMON(obj)->local_lock);
+}
+
 static const TypeInfo pit_common_type = {
     .name          = TYPE_PIT_COMMON,
     .parent        = TYPE_ISA_DEVICE,
     .instance_size = sizeof(PITCommonState),
+    .instance_init = pit_common_instance_init,
+    .instance_finalize = pit_common_instance_finalize,
     .class_size    = sizeof(PITCommonClass),
     .class_init    = pit_common_class_init,
     .abstract      = true,

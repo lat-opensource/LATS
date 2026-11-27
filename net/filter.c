@@ -7,6 +7,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "net/slirp.h"
 #include "qapi/error.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/error-report.h"
@@ -290,6 +291,9 @@ static void netfilter_complete(UserCreatable *uc, Error **errp)
         }
     }
 
+#ifdef CONFIG_SLIRP
+    net_slirp_detach_receiver(ncs[0]);
+#endif
     if (position) {
         if (nf->insert_before_flag) {
             QTAILQ_INSERT_BEFORE(position, nf, next);

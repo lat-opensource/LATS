@@ -23,9 +23,14 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "hw/irq.h"
+#include "qemu/lockable.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
 #include "hw/timer/i8254.h"
 #include "hw/timer/i8254_internal.h"
 #include "qom/object.h"
@@ -78,6 +83,7 @@ static int pit_get_count(PITChannelState *s)
 static void pit_set_channel_gate(PITCommonState *s, PITChannelState *sc,
                                  int val)
 {
+    QEMU_LOCK_GUARD(&s->local_lock);
     switch (sc->mode) {
     default:
     case 0:
@@ -130,6 +136,7 @@ static void pit_ioport_write(void *opaque, hwaddr addr,
     int channel, access;
     PITChannelState *s;
 
+    QEMU_LOCK_GUARD(&pit->local_lock);
     addr &= 3;
     if (addr == 3) {
         channel = val >> 6;
@@ -198,6 +205,7 @@ static uint64_t pit_ioport_read(void *opaque, hwaddr addr,
     int ret, count;
     PITChannelState *s;
 
+    QEMU_LOCK_GUARD(&pit->local_lock);
     addr &= 3;
 
     if (addr == 3) {
@@ -277,8 +285,17 @@ static void pit_irq_timer_update(PITChannelState *s, int64_t current_time)
 static void pit_irq_timer(void *opaque)
 {
     PITChannelState *s = opaque;
+    PITCommonState *pit = container_of(s, PITCommonState, channels[0]);
 
+    /*
+     * When nobql_timer is enabled, the timer dispatcher already acquired
+     * pit->local_lock via dispatch_lock before dequeueing irq_timer.
+     */
+    if (!pit->nobql_timer) {
+        qemu_rec_mutex_lock(&pit->local_lock);
+    }
     pit_irq_timer_update(s, s->next_transition_time);
+    qemu_rec_mutex_unlock(&pit->local_lock);
 }
 
 static void pit_reset(DeviceState *dev)
@@ -286,6 +303,7 @@ static void pit_reset(DeviceState *dev)
     PITCommonState *pit = PIT_COMMON(dev);
     PITChannelState *s;
 
+    QEMU_LOCK_GUARD(&pit->local_lock);
     pit_reset_common(pit);
 
     s = &pit->channels[0];
@@ -301,6 +319,7 @@ static void pit_irq_control(void *opaque, int n, int enable)
     PITCommonState *pit = opaque;
     PITChannelState *s = &pit->channels[0];
 
+    QEMU_LOCK_GUARD(&pit->local_lock);
     if (enable) {
         s->irq_disabled = 0;
         pit_irq_timer_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -320,10 +339,18 @@ static const MemoryRegionOps pit_ioport_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static void pit_get_channel_info_locked(PITCommonState *s, PITChannelState *sc,
+                                        PITChannelInfo *info)
+{
+    QEMU_LOCK_GUARD(&s->local_lock);
+    pit_get_channel_info_common(s, sc, info);
+}
+
 static void pit_post_load(PITCommonState *s)
 {
     PITChannelState *sc = &s->channels[0];
 
+    QEMU_LOCK_GUARD(&s->local_lock);
     if (sc->next_transition_time != -1 && !sc->irq_disabled) {
         timer_mod(sc->irq_timer, sc->next_transition_time);
     } else {
@@ -336,14 +363,28 @@ static void pit_realizefn(DeviceState *dev, Error **errp)
     PITCommonState *pit = PIT_COMMON(dev);
     PITClass *pc = PIT_GET_CLASS(dev);
     PITChannelState *s;
+    int timer_attrs = 0;
 
     s = &pit->channels[0];
+    if (tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        lats_nobql_enabled()) {
+        timer_attrs = QEMU_TIMER_ATTR_NO_BQL;
+        pit->nobql_timer = true;
+    }
     /* the timer 0 is connected to an IRQ */
-    s->irq_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, pit_irq_timer, s);
+    s->irq_timer = timer_new_full(NULL, QEMU_CLOCK_VIRTUAL, SCALE_NS,
+                                  timer_attrs, pit_irq_timer, s);
+    if (pit->nobql_timer) {
+        s->irq_timer->dispatch_lock = &pit->local_lock;
+    }
     qdev_init_gpio_out(dev, &s->irq, 1);
 
     memory_region_init_io(&pit->ioports, OBJECT(pit), &pit_ioport_ops,
                           pit, "pit", 4);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&pit->ioports, &pit->local_lock);
+#endif
 
     qdev_init_gpio_in(dev, pit_irq_control, 1);
 
@@ -358,7 +399,7 @@ static void pit_class_initfn(ObjectClass *klass, void *data)
 
     device_class_set_parent_realize(dc, pit_realizefn, &pc->parent_realize);
     k->set_channel_gate = pit_set_channel_gate;
-    k->get_channel_info = pit_get_channel_info_common;
+    k->get_channel_info = pit_get_channel_info_locked;
     k->post_load = pit_post_load;
     dc->reset = pit_reset;
 }

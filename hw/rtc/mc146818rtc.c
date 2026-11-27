@@ -23,9 +23,13 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/atomic.h"
 #include "qemu/cutils.h"
 #include "qemu/module.h"
 #include "qemu/bcd.h"
+#include "qemu/lockable.h"
+#include "qemu/main-loop.h"
+#include "block/aio.h"
 #include "hw/acpi/acpi_aml_interface.h"
 #include "hw/intc/kvm_irqcount.h"
 #include "hw/irq.h"
@@ -37,6 +41,9 @@
 #include "sysemu/reset.h"
 #include "sysemu/runstate.h"
 #include "sysemu/rtc.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/cpus.h"
+#include "sysemu/tcg.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "hw/rtc/mc146818rtc_regs.h"
 #include "migration/vmstate.h"
@@ -70,6 +77,15 @@
 #define UIP_HOLD_LENGTH           (8 * NANOSECONDS_PER_SECOND / 32768)
 
 #define RTC_ISA_BASE 0x70
+
+/*
+ * Calendar reads update all eight CMOS date bytes. Serialize them with
+ * the BQL-side port, timer and management callbacks. Only the BQL side
+ * may change timers or signal IRQs, which may call back into the device.
+ */
+#define RTC_CMOS_GUARD(s) \
+    g_autoptr(QemuLockable) guard G_GNUC_UNUSED = (s)->use_cmos_lock ? \
+        qemu_lockable_auto_lock(QEMU_MAKE_LOCKABLE(&(s)->cmos_lock)) : NULL
 
 static void rtc_set_time(MC146818RtcState *s);
 static void rtc_update_time(MC146818RtcState *s);
@@ -127,6 +143,7 @@ static void rtc_coalesced_timer(void *opaque)
 {
     MC146818RtcState *s = opaque;
 
+    RTC_CMOS_GUARD(s);
     if (s->irq_coalesced != 0) {
         s->cmos_data[RTC_REG_C] |= 0xc0;
         DPRINTF_C("cmos: injecting from timer\n");
@@ -236,6 +253,7 @@ static void rtc_periodic_timer(void *opaque)
 {
     MC146818RtcState *s = opaque;
 
+    RTC_CMOS_GUARD(s);
     periodic_timer_update(s, s->next_periodic_time, s->period, false);
     s->cmos_data[RTC_REG_C] |= REG_C_PF;
     if (s->cmos_data[RTC_REG_B] & REG_B_PIE) {
@@ -408,12 +426,18 @@ static uint64_t get_next_alarm(MC146818RtcState *s)
     return sec <= 0 ? sec + SEC_PER_DAY : sec;
 }
 
+static void rtc_wakeup_bh(void *opaque)
+{
+    qemu_system_wakeup_request(QEMU_WAKEUP_REASON_RTC, NULL);
+}
+
 static void rtc_update_timer(void *opaque)
 {
     MC146818RtcState *s = opaque;
     int32_t irqs = REG_C_UF;
     int32_t new_irqs;
 
+    /* The dispatcher already holds cmos_lock when use_cmos_lock is enabled. */
     assert((s->cmos_data[RTC_REG_A] & 0x60) != 0x60);
 
     /* UIP might have been latched, update time and clear it.  */
@@ -423,7 +447,12 @@ static void rtc_update_timer(void *opaque)
     if (qemu_clock_get_ns(rtc_clock) >= s->next_alarm_time) {
         irqs |= REG_C_AF;
         if (s->cmos_data[RTC_REG_B] & REG_B_AIE) {
-            qemu_system_wakeup_request(QEMU_WAKEUP_REASON_RTC, NULL);
+            if (qemu_mutex_iothread_locked()) {
+                qemu_system_wakeup_request(QEMU_WAKEUP_REASON_RTC, NULL);
+            } else if (runstate_check(RUN_STATE_SUSPENDED)) {
+                aio_bh_schedule_oneshot(qemu_get_aio_context(),
+                                        rtc_wakeup_bh, NULL);
+            }
         }
     }
 
@@ -434,30 +463,40 @@ static void rtc_update_timer(void *opaque)
         qemu_irq_raise(s->irq);
     }
     check_update_timer(s);
+    if (s->use_cmos_lock) {
+        qemu_rec_mutex_unlock(&s->cmos_lock);
+    }
 }
 
-static void cmos_ioport_write(void *opaque, hwaddr addr,
-                              uint64_t data, unsigned size)
+/* Each data port access uses one selection, including the century alias. */
+static uint8_t rtc_decode_index(uint8_t index)
 {
-    MC146818RtcState *s = opaque;
+    return index == RTC_IBM_PS2_CENTURY_BYTE ? RTC_CENTURY : index;
+}
+
+static uint8_t rtc_cmos_index(MC146818RtcState *s)
+{
+    return rtc_decode_index(qatomic_load_acquire(&s->cmos_index));
+}
+
+static void cmos_write_with_index(MC146818RtcState *s, hwaddr addr,
+                                  uint64_t data, uint8_t index)
+{
     uint32_t old_period;
     bool update_periodic_timer;
 
     if ((addr & 1) == 0) {
-        s->cmos_index = data & 0x7f;
+        qatomic_store_release(&s->cmos_index, data & 0x7f);
     } else {
         CMOS_DPRINTF("cmos: write index=0x%02x val=0x%02" PRIx64 "\n",
-                     s->cmos_index, data);
-        switch(s->cmos_index) {
+                     index, data);
+        switch (index) {
         case RTC_SECONDS_ALARM:
         case RTC_MINUTES_ALARM:
         case RTC_HOURS_ALARM:
-            s->cmos_data[s->cmos_index] = data;
+            s->cmos_data[index] = data;
             check_update_timer(s);
             break;
-        case RTC_IBM_PS2_CENTURY_BYTE:
-            s->cmos_index = RTC_CENTURY;
-            /* fall through */
         case RTC_CENTURY:
         case RTC_SECONDS:
         case RTC_MINUTES:
@@ -466,7 +505,7 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
         case RTC_DAY_OF_MONTH:
         case RTC_MONTH:
         case RTC_YEAR:
-            s->cmos_data[s->cmos_index] = data;
+            s->cmos_data[index] = data;
             /* if in set mode, do not update the time */
             if (rtc_running(s)) {
                 rtc_set_time(s);
@@ -551,10 +590,19 @@ static void cmos_ioport_write(void *opaque, hwaddr addr,
             /* cannot write to them */
             break;
         default:
-            s->cmos_data[s->cmos_index] = data;
+            s->cmos_data[index] = data;
             break;
         }
     }
+}
+
+static void cmos_ioport_write(void *opaque, hwaddr addr,
+                            uint64_t data, unsigned size)
+{
+    MC146818RtcState *s = opaque;
+
+    RTC_CMOS_GUARD(s);
+    cmos_write_with_index(s, addr, data, rtc_cmos_index(s));
 }
 
 static inline int rtc_to_bcd(MC146818RtcState *s, int a)
@@ -606,6 +654,17 @@ static void rtc_set_time(MC146818RtcState *s)
     s->base_rtc = mktimegm(&tm);
     s->last_update = qemu_clock_get_ns(rtc_clock);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (!qemu_mutex_iothread_locked()) {
+        int64_t diff = qemu_timedate_diff(&tm);
+        qemu_rec_mutex_unlock(&s->cmos_lock);
+        qemu_mutex_lock_iothread();
+        qapi_event_send_rtc_change(diff, qom_path);
+        qemu_mutex_unlock_iothread();
+        qemu_rec_mutex_lock(&s->cmos_lock);
+        return;
+    }
+#endif
     qapi_event_send_rtc_change(qemu_timedate_diff(&tm), qom_path);
 }
 
@@ -675,18 +734,14 @@ static int update_in_progress(MC146818RtcState *s)
     return 0;
 }
 
-static uint64_t cmos_ioport_read(void *opaque, hwaddr addr,
-                                 unsigned size)
+static uint64_t cmos_read_with_index(MC146818RtcState *s, hwaddr addr,
+                                     uint8_t index)
 {
-    MC146818RtcState *s = opaque;
     int ret;
     if ((addr & 1) == 0) {
         return 0xff;
     } else {
-        switch(s->cmos_index) {
-        case RTC_IBM_PS2_CENTURY_BYTE:
-            s->cmos_index = RTC_CENTURY;
-            /* fall through */
+        switch (index) {
         case RTC_CENTURY:
         case RTC_SECONDS:
         case RTC_MINUTES:
@@ -700,16 +755,16 @@ static uint64_t cmos_ioport_read(void *opaque, hwaddr addr,
             if (rtc_running(s)) {
                 rtc_update_time(s);
             }
-            ret = s->cmos_data[s->cmos_index];
+            ret = s->cmos_data[index];
             break;
         case RTC_REG_A:
-            ret = s->cmos_data[s->cmos_index];
+            ret = s->cmos_data[index];
             if (update_in_progress(s)) {
                 ret |= REG_A_UIP;
             }
             break;
         case RTC_REG_C:
-            ret = s->cmos_data[s->cmos_index];
+            ret = s->cmos_data[index];
             qemu_irq_lower(s->irq);
             s->cmos_data[RTC_REG_C] = 0x00;
             if (ret & (REG_C_UF | REG_C_AF)) {
@@ -730,23 +785,88 @@ static uint64_t cmos_ioport_read(void *opaque, hwaddr addr,
             }
             break;
         default:
-            ret = s->cmos_data[s->cmos_index];
+            ret = s->cmos_data[index];
             break;
         }
         CMOS_DPRINTF("cmos: read index=0x%02x val=0x%02x\n",
-                     s->cmos_index, ret);
+                     index, ret);
         return ret;
     }
 }
 
+static uint64_t cmos_ioport_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MC146818RtcState *s = opaque;
+
+    RTC_CMOS_GUARD(s);
+    return cmos_read_with_index(s, addr, rtc_cmos_index(s));
+}
+
+/*
+ * A word or dword at the index port also accesses the data port. Keep the
+ * whole operation under the BQL, using the selection from the same write
+ * even if another vCPU writes a byte to the index port concurrently.
+ */
+static uint64_t cmos_index_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MC146818RtcState *s = opaque;
+    uint64_t data = 0xff;
+
+    if (size > 1) {
+        RTC_CMOS_GUARD(s);
+        uint8_t index = rtc_cmos_index(s);
+
+        data |= (uint64_t)cmos_read_with_index(s, 1, index) << 8;
+        if (size == 4) {
+            data |= 0xff0000;
+            data |= (uint64_t)cmos_read_with_index(s, 1, index) << 24;
+        }
+    }
+    return data;
+}
+
+static void cmos_index_write(void *opaque, hwaddr addr,
+                            uint64_t data, unsigned size)
+{
+    MC146818RtcState *s = opaque;
+    uint8_t index = data & 0x7f;
+    uint8_t final_index = size == 4 ? (data >> 16) & 0x7f : index;
+
+    if (size == 1) {
+        qatomic_store_release(&s->cmos_index, index);
+        return;
+    }
+    /* Publish the selection and both data bytes together for data readers.
+     * Another index-only write may still select a different register. */
+    RTC_CMOS_GUARD(s);
+    qatomic_store_release(&s->cmos_index, final_index);
+    cmos_write_with_index(s, 1, (data >> 8) & 0xff, rtc_decode_index(index));
+    if (size == 4) {
+        cmos_write_with_index(s, 1, (data >> 24) & 0xff,
+                              rtc_decode_index(final_index));
+    }
+}
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool cmos_index_access_lockless(void *opaque, hwaddr addr,
+                                       unsigned size, bool is_write,
+                                       MemTxAttrs attrs)
+{
+    /* KVM may need to flush coalesced PIO in this region. */
+    return addr == 0 && size == 1 && tcg_enabled();
+}
+#endif
+
 void mc146818rtc_set_cmos_data(MC146818RtcState *s, int addr, int val)
 {
+    RTC_CMOS_GUARD(s);
     if (addr >= 0 && addr <= 127)
         s->cmos_data[addr] = val;
 }
 
 int mc146818rtc_get_cmos_data(MC146818RtcState *s, int addr)
 {
+    RTC_CMOS_GUARD(s);
     assert(addr >= 0 && addr <= 127);
     return s->cmos_data[addr];
 }
@@ -770,6 +890,7 @@ static int rtc_pre_save(void *opaque)
 {
     MC146818RtcState *s = opaque;
 
+    RTC_CMOS_GUARD(s);
     rtc_update_time(s);
 
     return 0;
@@ -779,6 +900,7 @@ static int rtc_post_load(void *opaque, int version_id)
 {
     MC146818RtcState *s = opaque;
 
+    RTC_CMOS_GUARD(s);
     if (version_id <= 2 || rtc_clock == QEMU_CLOCK_REALTIME) {
         rtc_set_time(s);
         s->offset = 0;
@@ -870,10 +992,24 @@ static const MemoryRegionOps cmos_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static const MemoryRegionOps cmos_index_ops = {
+    .read = cmos_index_read,
+    .write = cmos_index_write,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 4,
+    },
+    .endianness = DEVICE_LITTLE_ENDIAN,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .access_lockless = cmos_index_access_lockless,
+#endif
+};
+
 static void rtc_get_date(Object *obj, struct tm *current_tm, Error **errp)
 {
     MC146818RtcState *s = MC146818_RTC(obj);
 
+    RTC_CMOS_GUARD(s);
     rtc_update_time(s);
     rtc_get_time(s, current_tm);
 }
@@ -905,6 +1041,13 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
         return;
     }
 
+    s->nobql_timers = tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        lats_nobql_enabled();
+    s->use_cmos_lock = s->nobql_timers;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    s->use_cmos_lock |= memory_region_device_lock_enabled();
+#endif
     rtc_set_date_from_host(isadev);
 
     switch (s->lost_tick_policy) {
@@ -919,19 +1062,34 @@ static void rtc_realizefn(DeviceState *dev, Error **errp)
         return;
     }
 
-    s->periodic_timer = timer_new_ns(rtc_clock, rtc_periodic_timer, s);
-    s->update_timer = timer_new_ns(rtc_clock, rtc_update_timer, s);
+    int update_attrs = s->nobql_timers ? QEMU_TIMER_ATTR_NO_BQL : 0;
+    int periodic_attrs = (s->nobql_timers &&
+                          s->lost_tick_policy == LOST_TICK_POLICY_DISCARD) ?
+                         QEMU_TIMER_ATTR_NO_BQL : 0;
+
+    s->periodic_timer = timer_new_full(NULL, rtc_clock, SCALE_NS,
+                                       periodic_attrs, rtc_periodic_timer, s);
+    s->update_timer = timer_new_full(NULL, rtc_clock, SCALE_NS,
+                                     update_attrs, rtc_update_timer, s);
+    /* Register A observes the deadline and latches UIP. Hold the same
+     * device lock from dequeue through clearing UIP in rtc_update_timer. */
+    if (s->use_cmos_lock) {
+        s->update_timer->dispatch_lock = &s->cmos_lock;
+    }
     check_update_timer(s);
 
     s->suspend_notifier.notify = rtc_notify_suspend;
     qemu_register_suspend_notifier(&s->suspend_notifier);
 
     memory_region_init_io(&s->io, OBJECT(s), &cmos_ops, s, "rtc", 2);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    memory_region_set_device_lock(&s->io, &s->cmos_lock);
+#endif
     isa_register_ioport(isadev, &s->io, s->io_base);
 
     /* register rtc 0x70 port for coalesced_pio */
     memory_region_set_flush_coalesced(&s->io);
-    memory_region_init_io(&s->coalesced_io, OBJECT(s), &cmos_ops,
+    memory_region_init_io(&s->coalesced_io, OBJECT(s), &cmos_index_ops,
                           s, "rtc-index", 1);
     memory_region_add_subregion(&s->io, 0, &s->coalesced_io);
     memory_region_add_coalescing(&s->coalesced_io, 0, 1);
@@ -981,6 +1139,7 @@ static void rtc_reset_enter(Object *obj, ResetType type)
 {
     MC146818RtcState *s = MC146818_RTC(obj);
 
+    RTC_CMOS_GUARD(s);
     /* Reason: VM do suspend self will set 0xfe
      * Reset any values other than 0xfe(Guest suspend case) */
     if (s->cmos_data[0x0f] != 0xfe) {
@@ -1042,10 +1201,22 @@ static void rtc_class_initfn(ObjectClass *klass, void *data)
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
+static void rtc_instance_init(Object *obj)
+{
+    qemu_rec_mutex_init(&MC146818_RTC(obj)->cmos_lock);
+}
+
+static void rtc_instance_finalize(Object *obj)
+{
+    qemu_rec_mutex_destroy(&MC146818_RTC(obj)->cmos_lock);
+}
+
 static const TypeInfo mc146818rtc_info = {
     .name          = TYPE_MC146818_RTC,
     .parent        = TYPE_ISA_DEVICE,
     .instance_size = sizeof(MC146818RtcState),
+    .instance_init = rtc_instance_init,
+    .instance_finalize = rtc_instance_finalize,
     .class_init    = rtc_class_initfn,
     .interfaces = (InterfaceInfo[]) {
         { TYPE_ACPI_DEV_AML_IF },

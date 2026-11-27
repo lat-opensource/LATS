@@ -27,6 +27,13 @@
 #include "migration/vmstate.h"
 #include "hw/qdev-properties.h"
 #include "trace.h"
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#include "qemu/main-loop.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
+#include "trace/trace-softmmu.h"
+#endif
 #include "qapi/error.h"
 
 #include "hcd-xhci.h"
@@ -458,9 +465,18 @@ static void xhci_mfwrap_timer(void *opaque)
 {
     XHCIState *xhci = opaque;
     XHCIEvent wrap = { ER_MFINDEX_WRAP, CC_SUCCESS };
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool has_dispatch_lock = xhci->mfwrap_timer &&
+        xhci->mfwrap_timer->dispatch_lock != NULL;
+#endif
 
     xhci_event(xhci, &wrap, 0);
     xhci_mfwrap_update(xhci);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (has_dispatch_lock) {
+        qemu_rec_mutex_unlock(&xhci->local_lock);
+    }
+#endif
 }
 
 static void xhci_die(XHCIState *xhci)
@@ -562,6 +578,9 @@ static XHCIPort *xhci_lookup_port(XHCIState *xhci, struct USBPort *uport)
 
 static void xhci_intr_update(XHCIState *xhci, int v)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     int level = 0;
 
     if (v == 0) {
@@ -584,6 +603,9 @@ static void xhci_intr_update(XHCIState *xhci, int v)
 
 static void xhci_intr_raise(XHCIState *xhci, int v)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     bool pending = (xhci->intr[v].erdp_low & ERDP_EHB);
 
     xhci->intr[v].erdp_low |= ERDP_EHB;
@@ -648,6 +670,9 @@ static void xhci_write_event(XHCIState *xhci, XHCIEvent *event, int v)
 
 static void xhci_event(XHCIState *xhci, XHCIEvent *event, int v)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCIInterrupter *intr;
     dma_addr_t erdp;
     unsigned int dp_idx;
@@ -804,6 +829,9 @@ static int xhci_ring_chain_length(XHCIState *xhci, const XHCIRing *ring)
 
 static void xhci_er_reset(XHCIState *xhci, int v)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCIInterrupter *intr = &xhci->intr[v];
     XHCIEvRingSeg seg;
     dma_addr_t erstba = xhci_addr64(intr->erstba_low, intr->erstba_high);
@@ -1083,7 +1111,17 @@ static void xhci_set_ep_state(XHCIState *xhci, XHCIEPContext *epctx,
 static void xhci_ep_kick_timer(void *opaque)
 {
     XHCIEPContext *epctx = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    XHCIState *xhci = epctx->xhci;
+    bool has_dispatch_lock = epctx->kick_timer &&
+        epctx->kick_timer->dispatch_lock != NULL;
+#endif
     xhci_kick_epctx(epctx, 0);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (has_dispatch_lock) {
+        qemu_rec_mutex_unlock(&xhci->local_lock);
+    }
+#endif
 }
 
 static XHCIEPContext *xhci_alloc_epctx(XHCIState *xhci,
@@ -1091,6 +1129,7 @@ static XHCIEPContext *xhci_alloc_epctx(XHCIState *xhci,
                                        unsigned int epid)
 {
     XHCIEPContext *epctx;
+    int timer_attrs = 0;
 
     epctx = g_new0(XHCIEPContext, 1);
     epctx->xhci = xhci;
@@ -1098,7 +1137,18 @@ static XHCIEPContext *xhci_alloc_epctx(XHCIState *xhci,
     epctx->epid = epid;
 
     QTAILQ_INIT(&epctx->transfers);
-    epctx->kick_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xhci_ep_kick_timer, epctx);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (xhci->nobql_timers) {
+        timer_attrs = QEMU_TIMER_ATTR_NO_BQL;
+    }
+#endif
+    epctx->kick_timer = timer_new_full(NULL, QEMU_CLOCK_VIRTUAL, SCALE_NS,
+                                       timer_attrs, xhci_ep_kick_timer, epctx);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (xhci->nobql_timers) {
+        epctx->kick_timer->dispatch_lock = &xhci->local_lock;
+    }
+#endif
 
     return epctx;
 }
@@ -2618,6 +2668,9 @@ static bool xhci_port_have_device(XHCIPort *port)
 
 static void xhci_port_notify(XHCIPort *port, uint32_t bits)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(port->xhci);
+#endif
     XHCIEvent ev = { ER_PORT_STATUS_CHANGE, CC_SUCCESS,
                      port->portnr << 24 };
 
@@ -2634,6 +2687,9 @@ static void xhci_port_notify(XHCIPort *port, uint32_t bits)
 
 static void xhci_port_update(XHCIPort *port, int is_detach)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(port->xhci);
+#endif
     uint32_t pls = PLS_RX_DETECT;
 
     assert(port);
@@ -2667,6 +2723,9 @@ static void xhci_port_update(XHCIPort *port, int is_detach)
 
 static void xhci_port_reset(XHCIPort *port, bool warm_reset)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(port->xhci);
+#endif
     trace_usb_xhci_port_reset(port->portnr, warm_reset);
 
     if (!xhci_port_have_device(port)) {
@@ -2697,6 +2756,9 @@ static void xhci_port_reset(XHCIPort *port, bool warm_reset)
 static void xhci_reset(DeviceState *dev)
 {
     XHCIState *xhci = XHCI(dev);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     int i;
 
     trace_usb_xhci_reset();
@@ -2740,77 +2802,72 @@ static void xhci_reset(DeviceState *dev)
     xhci_mfwrap_update(xhci);
 }
 
-static uint64_t xhci_cap_read(void *ptr, hwaddr reg, unsigned size)
+static uint32_t xhci_cap_read_u32(XHCIState *xhci, hwaddr reg,
+                                  bool *unimplemented)
 {
-    XHCIState *xhci = ptr;
-    uint32_t ret;
-
     switch (reg) {
     case 0x00: /* HCIVERSION, CAPLENGTH */
-        ret = 0x01000000 | LEN_CAP;
-        break;
+        return 0x01000000 | LEN_CAP;
     case 0x04: /* HCSPARAMS 1 */
-        ret = ((xhci->numports_2+xhci->numports_3)<<24)
-            | (xhci->numintrs<<8) | xhci->numslots;
-        break;
+        return ((xhci->numports_2 + xhci->numports_3) << 24)
+            | (xhci->numintrs << 8) | xhci->numslots;
     case 0x08: /* HCSPARAMS 2 */
-        ret = 0x0000000f;
-        break;
+        return 0x0000000f;
     case 0x0c: /* HCSPARAMS 3 */
-        ret = 0x00000000;
-        break;
+        return 0x00000000;
     case 0x10: /* HCCPARAMS */
         if (sizeof(dma_addr_t) == 4) {
-            ret = 0x00080000 | (xhci->max_pstreams_mask << 12);
+            return 0x00080000 | (xhci->max_pstreams_mask << 12);
         } else {
-            ret = 0x00080001 | (xhci->max_pstreams_mask << 12);
+            return 0x00080001 | (xhci->max_pstreams_mask << 12);
         }
-        break;
     case 0x14: /* DBOFF */
-        ret = OFF_DOORBELL;
-        break;
+        return OFF_DOORBELL;
     case 0x18: /* RTSOFF */
-        ret = OFF_RUNTIME;
-        break;
+        return OFF_RUNTIME;
 
     /* extended capabilities */
     case 0x20: /* Supported Protocol:00 */
-        ret = 0x02000402; /* USB 2.0 */
-        break;
+        return 0x02000402; /* USB 2.0 */
     case 0x24: /* Supported Protocol:04 */
-        ret = 0x20425355; /* "USB " */
-        break;
+        return 0x20425355; /* "USB " */
     case 0x28: /* Supported Protocol:08 */
         if (xhci_get_flag(xhci, XHCI_FLAG_SS_FIRST)) {
-            ret = (xhci->numports_2<<8) | (xhci->numports_3+1);
+            return (xhci->numports_2 << 8) | (xhci->numports_3 + 1);
         } else {
-            ret = (xhci->numports_2<<8) | 1;
+            return (xhci->numports_2 << 8) | 1;
         }
-        break;
     case 0x2c: /* Supported Protocol:0c */
-        ret = 0x00000000; /* reserved */
-        break;
+        return 0x00000000; /* reserved */
     case 0x30: /* Supported Protocol:00 */
-        ret = 0x03000002; /* USB 3.0 */
-        break;
+        return 0x03000002; /* USB 3.0 */
     case 0x34: /* Supported Protocol:04 */
-        ret = 0x20425355; /* "USB " */
-        break;
+        return 0x20425355; /* "USB " */
     case 0x38: /* Supported Protocol:08 */
         if (xhci_get_flag(xhci, XHCI_FLAG_SS_FIRST)) {
-            ret = (xhci->numports_3<<8) | 1;
+            return (xhci->numports_3 << 8) | 1;
         } else {
-            ret = (xhci->numports_3<<8) | (xhci->numports_2+1);
+            return (xhci->numports_3 << 8) | (xhci->numports_2 + 1);
         }
-        break;
     case 0x3c: /* Supported Protocol:0c */
-        ret = 0x00000000; /* reserved */
-        break;
+        return 0x00000000; /* reserved */
     default:
-        trace_usb_xhci_unimplemented("cap read", reg);
-        ret = 0;
+        if (unimplemented) {
+            *unimplemented = true;
+        }
+        return 0;
     }
+}
 
+static uint64_t xhci_cap_read(void *ptr, hwaddr reg, unsigned size)
+{
+    XHCIState *xhci = ptr;
+    bool unimplemented = false;
+    uint32_t ret = xhci_cap_read_u32(xhci, reg, &unimplemented);
+
+    if (unimplemented) {
+        trace_usb_xhci_unimplemented("cap read", reg);
+    }
     trace_usb_xhci_cap_read(reg, ret);
     return ret;
 }
@@ -2818,6 +2875,9 @@ static uint64_t xhci_cap_read(void *ptr, hwaddr reg, unsigned size)
 static uint64_t xhci_port_read(void *ptr, hwaddr reg, unsigned size)
 {
     XHCIPort *port = ptr;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(port->xhci);
+#endif
     uint32_t ret;
 
     switch (reg) {
@@ -2842,6 +2902,12 @@ static void xhci_port_write(void *ptr, hwaddr reg,
                             uint64_t val, unsigned size)
 {
     XHCIPort *port = ptr;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    XHCIState *xhci = port->xhci;
+    bool mr_dev_locked = qatomic_read(&port->mem.device_lock) != NULL;
+    g_autoptr(XHCILocalLock) lock =
+        mr_dev_locked ? NULL : xhci_local_lock_begin(xhci);
+#endif
     uint32_t portsc, notify;
 
     trace_usb_xhci_port_write(port->portnr, reg, val);
@@ -2850,11 +2916,35 @@ static void xhci_port_write(void *ptr, hwaddr reg,
     case 0x00: /* PORTSC */
         /* write-1-to-start bits */
         if (val & PORTSC_WPR) {
-            xhci_port_reset(port, true);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            if (mr_dev_locked && !qemu_mutex_iothread_locked() &&
+                !lats_nobql_enabled()) {
+                qemu_rec_mutex_unlock(&xhci->local_lock);
+                qemu_mutex_lock_iothread();
+                qemu_rec_mutex_lock(&xhci->local_lock);
+                xhci_port_reset(port, true);
+                qemu_mutex_unlock_iothread();
+            } else
+#endif
+            {
+                xhci_port_reset(port, true);
+            }
             break;
         }
         if (val & PORTSC_PR) {
-            xhci_port_reset(port, false);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            if (mr_dev_locked && !qemu_mutex_iothread_locked() &&
+                !lats_nobql_enabled()) {
+                qemu_rec_mutex_unlock(&xhci->local_lock);
+                qemu_mutex_lock_iothread();
+                qemu_rec_mutex_lock(&xhci->local_lock);
+                xhci_port_reset(port, false);
+                qemu_mutex_unlock_iothread();
+            } else
+#endif
+            {
+                xhci_port_reset(port, false);
+            }
             break;
         }
 
@@ -2908,6 +2998,9 @@ static void xhci_port_write(void *ptr, hwaddr reg,
 static uint64_t xhci_oper_read(void *ptr, hwaddr reg, unsigned size)
 {
     XHCIState *xhci = ptr;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     uint32_t ret;
 
     switch (reg) {
@@ -2951,6 +3044,11 @@ static void xhci_oper_write(void *ptr, hwaddr reg,
                             uint64_t val, unsigned size)
 {
     XHCIState *xhci = XHCI(ptr);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    bool mr_dev_locked = qatomic_read(&xhci->mem_oper.device_lock) != NULL;
+    g_autoptr(XHCILocalLock) lock =
+        mr_dev_locked ? NULL : xhci_local_lock_begin(xhci);
+#endif
 
     trace_usb_xhci_oper_write(reg, val);
 
@@ -2972,7 +3070,19 @@ static void xhci_oper_write(void *ptr, hwaddr reg,
         xhci->usbcmd = val & 0xc0f;
         xhci_mfwrap_update(xhci);
         if (val & USBCMD_HCRST) {
-            xhci_reset(DEVICE(xhci));
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+            if (mr_dev_locked && !qemu_mutex_iothread_locked() &&
+                !lats_nobql_enabled()) {
+                qemu_rec_mutex_unlock(&xhci->local_lock);
+                qemu_mutex_lock_iothread();
+                qemu_rec_mutex_lock(&xhci->local_lock);
+                xhci_reset(DEVICE(xhci));
+                qemu_mutex_unlock_iothread();
+            } else
+#endif
+            {
+                xhci_reset(DEVICE(xhci));
+            }
         }
         xhci_intr_update(xhci, 0);
         break;
@@ -3020,6 +3130,9 @@ static uint64_t xhci_runtime_read(void *ptr, hwaddr reg,
                                   unsigned size)
 {
     XHCIState *xhci = ptr;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     uint32_t ret = 0;
 
     if (reg < 0x20) {
@@ -3067,6 +3180,9 @@ static void xhci_runtime_write(void *ptr, hwaddr reg,
                                uint64_t val, unsigned size)
 {
     XHCIState *xhci = ptr;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCIInterrupter *intr;
     int v;
 
@@ -3141,6 +3257,9 @@ static void xhci_doorbell_write(void *ptr, hwaddr reg,
                                 uint64_t val, unsigned size)
 {
     XHCIState *xhci = ptr;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     unsigned int epid, streamid;
 
     trace_usb_xhci_doorbell_write(reg, val);
@@ -3224,6 +3343,9 @@ static const MemoryRegionOps xhci_doorbell_ops = {
 static void xhci_attach(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
 
     xhci_port_update(port, 0);
@@ -3232,6 +3354,9 @@ static void xhci_attach(USBPort *usbport)
 static void xhci_detach(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
 
     xhci_detach_slot(xhci, usbport);
@@ -3241,6 +3366,9 @@ static void xhci_detach(USBPort *usbport)
 static void xhci_wakeup(USBPort *usbport)
 {
     XHCIState *xhci = usbport->opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCIPort *port = xhci_lookup_port(xhci, usbport);
 
     assert(port);
@@ -3253,6 +3381,10 @@ static void xhci_wakeup(USBPort *usbport)
 
 static void xhci_complete(USBPort *port, USBPacket *packet)
 {
+    XHCIState *xhci = port->opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCITransfer *xfer = container_of(packet, XHCITransfer, packet);
 
     if (packet->status == USB_RET_REMOVE_FROM_QUEUE) {
@@ -3270,6 +3402,9 @@ static void xhci_child_detach(USBPort *uport, USBDevice *child)
 {
     USBBus *bus = usb_bus_from_device(child);
     XHCIState *xhci = container_of(bus, XHCIState, bus);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
 
     xhci_detach_slot(xhci, child->port);
 }
@@ -3314,6 +3449,9 @@ static void xhci_wakeup_endpoint(USBBus *bus, USBEndpoint *ep,
                                  unsigned int stream)
 {
     XHCIState *xhci = container_of(bus, XHCIState, bus);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     int slotid;
 
     DPRINTF("%s\n", __func__);
@@ -3414,7 +3552,27 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
     }
 
     usb_xhci_init(xhci);
-    xhci->mfwrap_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, xhci_mfwrap_timer, xhci);
+    int timer_attrs = 0;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_init(&xhci->local_lock);
+    xhci->lockless_mmio = tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        (memory_region_device_lock_enabled() ||
+         lats_nobql_enabled());
+    xhci->nobql_timers = xhci->lockless_mmio &&
+        memory_region_device_lock_enabled() &&
+        lats_nobql_enabled();
+    if (xhci->nobql_timers) {
+        timer_attrs = QEMU_TIMER_ATTR_NO_BQL;
+    }
+#endif
+    xhci->mfwrap_timer = timer_new_full(NULL, QEMU_CLOCK_VIRTUAL, SCALE_NS,
+                                        timer_attrs, xhci_mfwrap_timer, xhci);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (xhci->nobql_timers) {
+        xhci->mfwrap_timer->dispatch_lock = &xhci->local_lock;
+    }
+#endif
 
     memory_region_init(&xhci->mem, OBJECT(dev), "xhci", XHCI_LEN_REGS);
     memory_region_init_io(&xhci->mem_cap, OBJECT(dev), &xhci_cap_ops, xhci,
@@ -3425,6 +3583,18 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
                            xhci, "runtime", LEN_RUNTIME);
     memory_region_init_io(&xhci->mem_doorbell, OBJECT(dev), &xhci_doorbell_ops,
                            xhci, "doorbell", LEN_DOORBELL);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (xhci->lockless_mmio) {
+        qatomic_set(&xhci->mem_oper.subpage_dispatch_lockless, true);
+        qatomic_set(&xhci->mem_runtime.subpage_dispatch_lockless, true);
+        if (memory_region_device_lock_enabled()) {
+            memory_region_set_device_lock(&xhci->mem_cap, &xhci->local_lock);
+            memory_region_set_device_lock(&xhci->mem_oper, &xhci->local_lock);
+            memory_region_set_device_lock(&xhci->mem_runtime, &xhci->local_lock);
+            memory_region_set_device_lock(&xhci->mem_doorbell, &xhci->local_lock);
+        }
+    }
+#endif
 
     memory_region_add_subregion(&xhci->mem, 0,            &xhci->mem_cap);
     memory_region_add_subregion(&xhci->mem, OFF_OPER,     &xhci->mem_oper);
@@ -3437,6 +3607,14 @@ static void usb_xhci_realize(DeviceState *dev, Error **errp)
         port->xhci = xhci;
         memory_region_init_io(&port->mem, OBJECT(dev), &xhci_port_ops, port,
                               port->name, 0x10);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (xhci->lockless_mmio) {
+            qatomic_set(&port->mem.subpage_dispatch_lockless, true);
+            if (memory_region_device_lock_enabled()) {
+                memory_region_set_device_lock(&port->mem, &xhci->local_lock);
+            }
+        }
+#endif
         memory_region_add_subregion(&xhci->mem, offset, &port->mem);
     }
 }
@@ -3468,11 +3646,17 @@ static void usb_xhci_unrealize(DeviceState *dev)
     }
 
     usb_bus_release(&xhci->bus);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    qemu_rec_mutex_destroy(&xhci->local_lock);
+#endif
 }
 
 static int usb_xhci_post_load(void *opaque, int version_id)
 {
     XHCIState *xhci = opaque;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    g_autoptr(XHCILocalLock) lock = xhci_local_lock_begin(xhci);
+#endif
     XHCISlot *slot;
     XHCIEPContext *epctx;
     dma_addr_t dcbaap, pctx;

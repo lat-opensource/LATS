@@ -158,8 +158,9 @@ void qemu_clock_enable(QEMUClockType type, bool enabled)
 {
     QEMUClock *clock = qemu_clock_ptr(type);
     QEMUTimerList *tl;
-    bool old = clock->enabled;
-    clock->enabled = enabled;
+    bool old = qatomic_read(&clock->enabled);
+
+    qatomic_store_release(&clock->enabled, enabled);
     if (enabled && !old) {
         qemu_clock_notify(type);
     } else if (!enabled && old) {
@@ -209,8 +210,11 @@ bool qemu_clock_expired(QEMUClockType type)
  * as we know the result is always positive.
  */
 
-int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
+static int64_t timerlist_sample_deadline_ns(QEMUTimerList *timer_list,
+                                            int64_t *host_sample)
 {
+    QEMUClockType type = timer_list->clock->type;
+    int64_t now;
     int64_t delta;
     int64_t expire_time;
 
@@ -218,7 +222,7 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
         return -1;
     }
 
-    if (!timer_list->clock->enabled) {
+    if (!qatomic_load_acquire(&timer_list->clock->enabled)) {
         return -1;
     }
 
@@ -233,13 +237,24 @@ int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
         expire_time = timer_list->active_timers->expire_time;
     }
 
-    delta = expire_time - qemu_clock_get_ns(timer_list->clock->type);
+    if (host_sample) {
+        *host_sample = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        now = type == QEMU_CLOCK_REALTIME ? *host_sample : qemu_clock_get_ns(type);
+    } else {
+        now = qemu_clock_get_ns(type);
+    }
+    delta = expire_time - now;
 
     if (delta <= 0) {
         return 0;
     }
 
     return delta;
+}
+
+int64_t timerlist_deadline_ns(QEMUTimerList *timer_list)
+{
+    return timerlist_sample_deadline_ns(timer_list, NULL);
 }
 
 /* Calculate the soonest deadline across all timerlists attached
@@ -256,7 +271,7 @@ int64_t qemu_clock_deadline_ns_all(QEMUClockType type, int attr_mask)
     QEMUTimerList *timer_list;
     QEMUClock *clock = qemu_clock_ptr(type);
 
-    if (!clock->enabled) {
+    if (!qatomic_load_acquire(&clock->enabled)) {
         return -1;
     }
 
@@ -370,6 +385,8 @@ void timer_init_full(QEMUTimer *ts,
     ts->scale = scale;
     ts->attributes = attributes;
     ts->expire_time = -1;
+    ts->dispatch_lock = NULL;
+    ts->try_dispatch_unlocked = NULL;
 }
 
 void timer_deinit(QEMUTimer *ts)
@@ -455,6 +472,25 @@ void timer_mod_ns(QEMUTimer *ts, int64_t expire_time)
     }
 }
 
+bool timer_mod_ns_late_head(QEMUTimer *ts, int64_t expire_time)
+{
+    QEMUTimerList *timer_list = ts->timer_list;
+
+    expire_time = MAX(expire_time, 0);
+    QEMU_LOCK_GUARD(&timer_list->active_timers_lock);
+    if (timer_list->active_timers != ts || expire_time < ts->expire_time ||
+        (ts->next && expire_time >= ts->next->expire_time)) {
+        return false;
+    }
+
+    /*
+     * Keep even a sole head linked. Deadline sampling can check for an
+     * empty list before acquiring the list lock.
+     */
+    ts->expire_time = expire_time;
+    return true;
+}
+
 /* modify the current timer so that it will be fired when current_time
    >= expire_time or the current deadline, whichever comes earlier.
    The corresponding callback will be called. */
@@ -498,6 +534,191 @@ bool timer_expired(QEMUTimer *timer_head, int64_t current_time)
     return timer_expired_ns(timer_head, current_time * timer_head->scale);
 }
 
+void trial_timer_in_poll(uintptr_t pc) __attribute__((weak));
+
+bool qemu_clock_try_virtual_timer_unlocked(void)
+{
+    QEMUTimerList *virt = main_loop_tlg.tl[QEMU_CLOCK_VIRTUAL];
+
+    if (icount_enabled() || replay_mode != REPLAY_MODE_NONE) {
+        return false;
+    }
+
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        QEMUTimer *ts;
+        QemuRecMutex *device;
+        int n = 0;
+        int64_t now;
+        bool committed = false;
+        bool contended = false;
+
+        /* Take a stable view of the main timer lists without waiting. Normal
+         * dispatch must decide ordering if any other timer is already ready. */
+        for (; n < QEMU_CLOCK_MAX; ++n) {
+            if (qemu_mutex_trylock(&main_loop_tlg.tl[n]->active_timers_lock)) {
+                contended = true;
+                goto unlock;
+            }
+        }
+        ts = virt->active_timers;
+        if (!ts || !ts->try_dispatch_unlocked || !ts->dispatch_lock) {
+            goto unlock;
+        }
+
+        qemu_event_reset(&virt->timers_done_ev);
+        if (!qatomic_load_acquire(&virt->clock->enabled)) {
+            goto done;
+        }
+        now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        if (!timer_expired_ns(ts, now) || timer_expired_ns(ts->next, now)) {
+            goto done;
+        }
+        for (QEMUClockType type = 0; type < QEMU_CLOCK_MAX; ++type) {
+            QEMUTimerList *list = main_loop_tlg.tl[type];
+
+            if (type != QEMU_CLOCK_VIRTUAL && qemu_clock_use_for_deadline(type) &&
+                qatomic_load_acquire(&list->clock->enabled) &&
+                timer_expired_ns(list->active_timers, qemu_clock_get_ns(type))) {
+                goto done;
+            }
+        }
+
+        device = ts->dispatch_lock;
+        /* Device writers acquire the queue lock after the device lock. Never
+         * block in the opposite order. Release all queue locks before retrying. */
+        if (qemu_rec_mutex_trylock(device)) {
+            contended = true;
+            goto done;
+        }
+        if (ts->try_dispatch_unlocked(ts->opaque)) {
+            qatomic_set(&virt->active_timers, ts->next);
+            ts->next = NULL;
+            ts->expire_time = -1;
+            committed = true;
+        }
+        qemu_rec_mutex_unlock(device);
+done:
+        qemu_event_set(&virt->timers_done_ev);
+unlock:
+        while (n > 0) {
+            qemu_mutex_unlock(&main_loop_tlg.tl[--n]->active_timers_lock);
+        }
+        if (committed) {
+            return true;
+        }
+        if (!contended) {
+            return false;
+        }
+        g_thread_yield();
+    }
+    return false;
+}
+
+bool qemu_clock_try_nobql_timer_unlocked(void)
+{
+    if (icount_enabled() || replay_mode != REPLAY_MODE_NONE) {
+        return false;
+    }
+
+    for (unsigned attempt = 0; attempt < 8; ++attempt) {
+        QEMUTimerList *best_list = NULL;
+        QEMUTimer *best_ts = NULL;
+        QemuRecMutex *dispatch_lock = NULL;
+        QEMUTimerCB *cb = NULL;
+        void *opaque = NULL;
+        int n = 0;
+        bool contended = false;
+        bool bql_due = false;
+
+        /*
+         * Snapshot all main-loop timer lists in fixed clock order without
+         * blocking. Never skip an earlier BQL-required timer on any clock.
+         */
+        for (; n < QEMU_CLOCK_MAX; ++n) {
+            if (qemu_mutex_trylock(&main_loop_tlg.tl[n]->active_timers_lock)) {
+                contended = true;
+                goto unlock;
+            }
+        }
+
+        for (QEMUClockType type = 0; type < QEMU_CLOCK_MAX; ++type) {
+            QEMUTimerList *list = main_loop_tlg.tl[type];
+            QEMUTimer *ts;
+            int64_t now;
+
+            if (!qemu_clock_use_for_deadline(type) ||
+                !qatomic_load_acquire(&list->clock->enabled)) {
+                continue;
+            }
+            ts = list->active_timers;
+            if (!ts) {
+                continue;
+            }
+            now = qemu_clock_get_ns(type);
+            if (!timer_expired_ns(ts, now)) {
+                continue;
+            }
+            if (!(ts->attributes & QEMU_TIMER_ATTR_NO_BQL)) {
+                bql_due = true;
+                break;
+            }
+            if (!best_ts) {
+                best_list = list;
+                best_ts = ts;
+            }
+        }
+
+        if (bql_due || !best_ts) {
+            goto unlock;
+        }
+
+        /*
+         * Device writers acquire active_timers_lock after dispatch_lock.
+         * Never block in the reverse order; drop all queue locks and retry.
+         */
+        dispatch_lock = best_ts->dispatch_lock;
+        if (dispatch_lock && qemu_rec_mutex_trylock(dispatch_lock)) {
+            contended = true;
+            goto unlock;
+        }
+
+        qemu_event_reset(&best_list->timers_done_ev);
+        if (!qatomic_load_acquire(&best_list->clock->enabled)) {
+            qemu_event_set(&best_list->timers_done_ev);
+            if (dispatch_lock) {
+                qemu_rec_mutex_unlock(dispatch_lock);
+            }
+            goto unlock;
+        }
+
+        /* Pop the expired NO_BQL timer before releasing queue locks. */
+        qatomic_set(&best_list->active_timers, best_ts->next);
+        best_ts->next = NULL;
+        best_ts->expire_time = -1;
+        cb = best_ts->cb;
+        opaque = best_ts->opaque;
+
+        while (n > 0) {
+            qemu_mutex_unlock(&main_loop_tlg.tl[--n]->active_timers_lock);
+        }
+
+        /* Invoke callback without BQL and without active_timers_lock. */
+        cb(opaque);
+        qemu_event_set(&best_list->timers_done_ev);
+        return true;
+
+unlock:
+        while (n > 0) {
+            qemu_mutex_unlock(&main_loop_tlg.tl[--n]->active_timers_lock);
+        }
+        if (!contended) {
+            return false;
+        }
+        g_thread_yield();
+    }
+    return false;
+}
+
 bool timerlist_run_timers(QEMUTimerList *timer_list)
 {
     QEMUTimer *ts;
@@ -511,7 +732,7 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
     }
 
     qemu_event_reset(&timer_list->timers_done_ev);
-    if (!timer_list->clock->enabled) {
+    if (!qatomic_load_acquire(&timer_list->clock->enabled)) {
         goto out;
     }
 
@@ -552,6 +773,21 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
              */
             break;
         }
+        /*
+         * Serialize selection with device writes. Writers can hold their
+         * device mutex while changing the queue, so wait without the queue
+         * lock and restart at the current head once the writer has finished.
+         */
+        QemuRecMutex *dispatch_lock = ts->dispatch_lock;
+
+        if (dispatch_lock && qemu_rec_mutex_trylock(dispatch_lock)) {
+            qemu_mutex_unlock(&timer_list->active_timers_lock);
+            qemu_rec_mutex_lock(dispatch_lock);
+            qemu_rec_mutex_unlock(dispatch_lock);
+            qemu_mutex_lock(&timer_list->active_timers_lock);
+            continue;
+        }
+
         /* Checkpoint for virtual clock is redundant in cases where
          * it's being triggered with only non-EXTERNAL timers, because
          * these timers don't change guest state directly.
@@ -560,6 +796,9 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
             && timer_list->clock->type == QEMU_CLOCK_VIRTUAL
             && !(ts->attributes & QEMU_TIMER_ATTR_EXTERNAL)
             && !replay_checkpoint(CHECKPOINT_CLOCK_VIRTUAL)) {
+            if (dispatch_lock) {
+                qemu_rec_mutex_unlock(dispatch_lock);
+            }
             qemu_mutex_unlock(&timer_list->active_timers_lock);
             goto out;
         }
@@ -573,6 +812,9 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
 
         /* run the callback (the timer list can be modified) */
         qemu_mutex_unlock(&timer_list->active_timers_lock);
+        if (trial_timer_in_poll) {
+            trial_timer_in_poll((uintptr_t)cb);
+        }
         cb(opaque);
         qemu_mutex_lock(&timer_list->active_timers_lock);
 
@@ -628,6 +870,28 @@ int64_t timerlistgroup_deadline_ns(QEMUTimerListGroup *tlg)
         }
     }
     return deadline;
+}
+
+int64_t timerlistgroup_deadline_host_ns(QEMUTimerListGroup *tlg)
+{
+    int64_t earliest = -1;
+
+    for (QEMUClockType type = 0; type < QEMU_CLOCK_MAX; type++) {
+        int64_t host_sample;
+        int64_t remaining;
+        int64_t deadline;
+
+        if (!qemu_clock_use_for_deadline(type)) {
+            continue;
+        }
+        remaining = timerlist_sample_deadline_ns(tlg->tl[type], &host_sample);
+        if (remaining < 0) {
+            continue;
+        }
+        deadline = host_sample + MIN(remaining, INT64_MAX - host_sample);
+        earliest = qemu_soonest_timeout(earliest, deadline);
+    }
+    return earliest;
 }
 
 int64_t qemu_clock_get_ns(QEMUClockType type)

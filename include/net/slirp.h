@@ -25,7 +25,37 @@
 #define QEMU_NET_SLIRP_H
 
 
+#include "qemu/thread.h"
+#include "qemu/event_notifier.h"
+
 #ifdef CONFIG_SLIRP
+
+/*
+ * The receiver runs with the backend mutex held. A return of zero keeps
+ * the packet for the normal main-loop receive queue.
+ */
+typedef ssize_t SlirpDirectReceive(void *opaque, const uint8_t *data,
+                                   size_t size);
+
+bool net_slirp_attach_receiver(NetClientState *nc,
+                               SlirpDirectReceive *receive,
+                               void (*detach)(void *), void *opaque,
+                               QemuRecMutex **mutex);
+void net_slirp_detach_receiver(NetClientState *nc);
+void net_slirp_receiver_ready(NetClientState *nc);
+/* The caller holds the attached NIC/backend mutex. */
+void net_slirp_set_rx_notifier(NetClientState *nc, EventNotifier *notifier,
+                              void (*flush)(void *));
+typedef enum SlirpKickQueue {
+    SLIRP_KICK_TX,
+    SLIRP_KICK_CTRL,
+    SLIRP_KICK_COUNT,
+} SlirpKickQueue;
+
+void net_slirp_set_kick_notifier(NetClientState *nc, SlirpKickQueue queue,
+                                 EventNotifier *notifier, void (*kick)(void *));
+ssize_t net_slirp_transmit(NetClientState *nc, const struct iovec *iov,
+                           int iovcnt);
 
 void hmp_hostfwd_add(Monitor *mon, const QDict *qdict);
 void hmp_hostfwd_remove(Monitor *mon, const QDict *qdict);

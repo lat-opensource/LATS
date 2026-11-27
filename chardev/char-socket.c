@@ -24,6 +24,7 @@
 
 #include "qemu/osdep.h"
 #include "chardev/char.h"
+#include "chardev/char-fe.h"
 #include "io/channel-socket.h"
 #include "io/channel-websock.h"
 #include "qemu/error-report.h"
@@ -271,7 +272,7 @@ static int tcp_set_msgfds(Chardev *chr, int *fds, int num)
     return 0;
 }
 
-static ssize_t tcp_chr_recv(Chardev *chr, char *buf, size_t len)
+ssize_t qemu_chr_socket_recv(Chardev *chr, char *buf, size_t len)
 {
     SocketChardev *s = SOCKET_CHARDEV(chr);
     struct iovec iov = { .iov_base = buf, .iov_len = len };
@@ -454,7 +455,7 @@ static void update_disconnected_filename(SocketChardev *s)
  * so can *not* assume s->state == TCP_CHARDEV_STATE_CONNECTED
  * This must be called with chr->chr_write_lock held.
  */
-static void tcp_chr_disconnect_locked(Chardev *chr)
+static bool tcp_chr_disconnect_locked_no_event(Chardev *chr)
 {
     SocketChardev *s = SOCKET_CHARDEV(chr);
     bool emit_close = s->state == TCP_CHARDEV_STATE_CONNECTED;
@@ -466,19 +467,33 @@ static void tcp_chr_disconnect_locked(Chardev *chr)
                                               chr, NULL, chr->gcontext);
     }
     update_disconnected_filename(s);
-    if (emit_close) {
-        qemu_chr_be_event(chr, CHR_EVENT_CLOSED);
-    }
     if (s->reconnect_time && !s->reconnect_timer) {
         qemu_chr_socket_restart_timer(chr);
+    }
+    return emit_close;
+}
+
+static void tcp_chr_disconnect_locked(Chardev *chr)
+{
+    if (tcp_chr_disconnect_locked_no_event(chr)) {
+        qemu_chr_be_event(chr, CHR_EVENT_CLOSED);
     }
 }
 
 static void tcp_chr_disconnect(Chardev *chr)
 {
+    bool emit_close;
+
     qemu_mutex_lock(&chr->chr_write_lock);
-    tcp_chr_disconnect_locked(chr);
+    emit_close = tcp_chr_disconnect_locked_no_event(chr);
     qemu_mutex_unlock(&chr->chr_write_lock);
+    /*
+     * Deliver CHR_EVENT_CLOSED after dropping chr_write_lock so backends on
+     * a dedicated IOThread never invert device_lock -> chr_write_lock.
+     */
+    if (emit_close) {
+        qemu_chr_be_event(chr, CHR_EVENT_CLOSED);
+    }
 }
 
 static gboolean tcp_chr_read(QIOChannel *chan, GIOCondition cond, void *opaque)
@@ -488,6 +503,9 @@ static gboolean tcp_chr_read(QIOChannel *chan, GIOCondition cond, void *opaque)
     uint8_t buf[CHR_READ_BUF_LEN];
     int len, size;
 
+    if (s->max_size < 0) {
+        tcp_chr_read_poll(chr);
+    }
     if ((s->state != TCP_CHARDEV_STATE_CONNECTED) ||
         s->max_size <= 0) {
         return TRUE;
@@ -496,7 +514,7 @@ static gboolean tcp_chr_read(QIOChannel *chan, GIOCondition cond, void *opaque)
     if (len > s->max_size) {
         len = s->max_size;
     }
-    size = tcp_chr_recv(chr, (void *)buf, len);
+    size = qemu_chr_socket_recv(chr, (void *)buf, len);
     if (size == 0 || (size == -1 && errno != EAGAIN)) {
         /* connection closed */
         tcp_chr_disconnect(chr);
@@ -532,7 +550,7 @@ static int tcp_chr_sync_read(Chardev *chr, const uint8_t *buf, int len)
     }
 
     qio_channel_set_blocking(s->ioc, true, NULL);
-    size = tcp_chr_recv(chr, (void *) buf, len);
+    size = qemu_chr_socket_recv(chr, (void *) buf, len);
     saved_errno = errno;
     if (s->state != TCP_CHARDEV_STATE_DISCONNECTED) {
         qio_channel_set_blocking(s->ioc, false, NULL);
@@ -594,6 +612,13 @@ static void update_ioc_handlers(SocketChardev *s)
                                      tcp_chr_read_poll,
                                      tcp_chr_read, chr,
                                      chr->gcontext);
+    if (chr->be && chr->be->guard_socket_read &&
+        (!chr->gcontext || chr->gcontext == g_main_context_default()) &&
+        s->is_listen && s->addr && s->addr->type == SOCKET_ADDRESS_TYPE_UNIX &&
+        s->sioc && s->ioc == QIO_CHANNEL(s->sioc) &&
+        !s->is_telnet && !s->is_tn3270) {
+        g_source_set_can_recurse(chr->gsource, true);
+    }
 
     remove_hup_source(s);
     s->hup_source = qio_channel_create_watch(s->ioc, G_IO_HUP);
@@ -607,11 +632,13 @@ static void tcp_chr_connect(void *opaque)
     Chardev *chr = CHARDEV(opaque);
     SocketChardev *s = SOCKET_CHARDEV(opaque);
 
+    qemu_mutex_lock(&chr->chr_write_lock);
     g_free(chr->filename);
     chr->filename = qemu_chr_compute_filename(s);
 
     tcp_chr_change_state(s, TCP_CHARDEV_STATE_CONNECTED);
     update_ioc_handlers(s);
+    qemu_mutex_unlock(&chr->chr_write_lock);
     qemu_chr_be_event(chr, CHR_EVENT_OPENED);
 }
 
@@ -859,10 +886,12 @@ static int tcp_chr_new_client(Chardev *chr, QIOChannelSocket *sioc)
         return -1;
     }
 
+    qemu_mutex_lock(&chr->chr_write_lock);
     s->ioc = QIO_CHANNEL(sioc);
     object_ref(OBJECT(sioc));
     s->sioc = sioc;
     object_ref(OBJECT(sioc));
+    qemu_mutex_unlock(&chr->chr_write_lock);
 
     qio_channel_set_blocking(s->ioc, false, NULL);
 

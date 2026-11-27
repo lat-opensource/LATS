@@ -231,6 +231,8 @@ static void qemu_xhci_class_init(ObjectClass *klass, void *data)
 
     k->vendor_id    = PCI_VENDOR_ID_REDHAT;
     k->device_id    = PCI_DEVICE_ID_REDHAT_XHCI;
+    k->plain_config_header = true;
+    k->plain_config_space = true;
     k->revision     = 0x01;
 }
 

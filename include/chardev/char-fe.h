@@ -18,6 +18,8 @@ struct CharBackend {
     void *opaque;
     int tag;
     int fe_open;
+    /* Keep a plain socket watch armed until a read callback enters a nested wait. */
+    bool guard_socket_read;
 };
 
 /**

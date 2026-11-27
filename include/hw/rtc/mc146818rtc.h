@@ -12,6 +12,7 @@
 #include "qapi/qapi-types-machine.h"
 #include "qemu/queue.h"
 #include "qemu/timer.h"
+#include "qemu/thread.h"
 #include "hw/isa/isa.h"
 #include "qom/object.h"
 
@@ -23,6 +24,9 @@ struct MC146818RtcState {
 
     MemoryRegion io;
     MemoryRegion coalesced_io;
+    QemuRecMutex cmos_lock;
+    bool use_cmos_lock;
+    bool nobql_timers;
     uint8_t cmos_data[128];
     uint8_t cmos_index;
     uint8_t isairq;

@@ -22,6 +22,7 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "chardev/char-io.h"
 
 typedef struct IOWatchPoll {
@@ -31,7 +32,8 @@ typedef struct IOWatchPoll {
     GSource *src;
 
     IOCanReadHandler *fd_can_read;
-    GSourceFunc fd_read;
+    QIOChannelFunc fd_read;
+    bool in_read;
     void *opaque;
 } IOWatchPoll;
 
@@ -40,12 +42,36 @@ static IOWatchPoll *io_watch_poll_from_source(GSource *source)
     return container_of(source, IOWatchPoll, parent);
 }
 
+static gboolean io_watch_poll_read(QIOChannel *chan, GIOCondition cond,
+                                   void *opaque)
+{
+    IOWatchPoll *iwp = opaque;
+    gboolean keep;
+
+    if (iwp->in_read) {
+        return G_SOURCE_CONTINUE;
+    }
+    /* The read handler can disconnect and destroy its own watch. */
+    g_source_ref(&iwp->parent);
+    iwp->in_read = true;
+    keep = iwp->fd_read(chan, cond, iwp->opaque);
+    iwp->in_read = false;
+    g_source_unref(&iwp->parent);
+    return keep;
+}
+
 static gboolean io_watch_poll_prepare(GSource *source,
                                       gint *timeout)
 {
     IOWatchPoll *iwp = io_watch_poll_from_source(source);
-    bool now_active = iwp->fd_can_read(iwp->opaque) > 0;
+    /* During a nested wait, remove the active read callback's fd.
+     * The next prepare outside that callback restores normal readiness. */
+    bool now_active = !iwp->in_read && iwp->fd_can_read(iwp->opaque) > 0;
     bool was_active = iwp->src != NULL;
+    if (!now_active) {
+        /* A guest device may free space without notifying the backend. */
+        qemu_poll_needs_prepare();
+    }
     if (was_active == now_active) {
         return FALSE;
     }
@@ -53,7 +79,14 @@ static gboolean io_watch_poll_prepare(GSource *source,
     if (now_active) {
         iwp->src = qio_channel_create_watch(
             iwp->ioc, G_IO_IN | G_IO_ERR | G_IO_HUP | G_IO_NVAL);
-        g_source_set_callback(iwp->src, iwp->fd_read, iwp->opaque, NULL);
+        if (g_source_get_can_recurse(source)) {
+            g_source_set_can_recurse(iwp->src, true);
+            g_source_set_callback(iwp->src, (GSourceFunc)io_watch_poll_read,
+                                  iwp, NULL);
+        } else {
+            g_source_set_callback(iwp->src, (GSourceFunc)iwp->fd_read,
+                                  iwp->opaque, NULL);
+        }
         g_source_add_child_source(source, iwp->src);
         g_source_unref(iwp->src);
     } else {
@@ -89,7 +122,7 @@ GSource *io_add_watch_poll(Chardev *chr,
     iwp->fd_can_read = fd_can_read;
     iwp->opaque = user_data;
     iwp->ioc = ioc;
-    iwp->fd_read = (GSourceFunc) fd_read;
+    iwp->fd_read = fd_read;
     iwp->src = NULL;
 
     name = g_strdup_printf("chardev-iowatch-%s", chr->label);

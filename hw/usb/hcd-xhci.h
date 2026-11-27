@@ -220,7 +220,34 @@ typedef struct XHCIState {
     XHCIRing cmd_ring;
 
     bool nec_quirks;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex local_lock;
+    bool lockless_mmio;
+    bool nobql_timers;
+#endif
 } XHCIState;
+
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+typedef XHCIState XHCILocalLock;
+
+static inline XHCILocalLock *xhci_local_lock_begin(XHCIState *xhci)
+{
+    if (xhci && xhci->lockless_mmio) {
+        qemu_rec_mutex_lock(&xhci->local_lock);
+        return xhci;
+    }
+    return NULL;
+}
+
+static inline void xhci_local_lock_end(XHCILocalLock *xhci)
+{
+    if (xhci) {
+        qemu_rec_mutex_unlock(&xhci->local_lock);
+    }
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(XHCILocalLock, xhci_local_lock_end)
+#endif
 
 extern const VMStateDescription vmstate_xhci;
 bool xhci_get_flag(XHCIState *xhci, enum xhci_flags bit);

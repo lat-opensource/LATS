@@ -21,6 +21,15 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/iov.h"
+#include "qemu/rcu.h"
+#include "chardev/char-socket.h"
+#ifdef CONFIG_LINUX
+#include <sys/ioctl.h>
+#endif
+#include "exec/address-spaces.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "migration/qemu-file-types.h"
@@ -31,6 +40,7 @@
 #include "trace.h"
 #include "hw/virtio/virtio-serial.h"
 #include "hw/virtio/virtio-access.h"
+#include "hw/virtio/virtio-bus.h"
 
 static struct VirtIOSerialDevices {
     QLIST_HEAD(, VirtIOSerial) devices;
@@ -97,6 +107,28 @@ static bool use_multiport(VirtIOSerial *vser)
     return virtio_vdev_has_feature(vdev, VIRTIO_CONSOLE_F_MULTIPORT);
 }
 
+static void virtio_serial_notify_vq(VirtIOSerial *vser, VirtQueue *vq,
+                                    VirtIOSerialPort *port)
+{
+    VirtIODevice *vdev = VIRTIO_DEVICE(vser);
+
+    if (qemu_mutex_iothread_locked()) {
+        virtio_notify(vdev, vq);
+        return;
+    }
+    if (!virtio_queue_try_notify(vdev, vq)) {
+        if (vq == vser->c_ivq) {
+            vser->ctrl_irq_pending = true;
+        } else if (port && vq == port->ivq) {
+            port->rx_irq_pending = true;
+        } else if (port && vq == port->ovq) {
+            port->tx_irq_pending = true;
+        }
+        vdev->output_irqs_may_be_pending = true;
+        qemu_bh_schedule(vser->tx_irq_bh);
+    }
+}
+
 static size_t write_to_port(VirtIOSerialPort *port,
                             const uint8_t *buf, size_t size)
 {
@@ -110,51 +142,69 @@ static size_t write_to_port(VirtIOSerialPort *port,
     }
 
     offset = 0;
-    while (offset < size) {
-        size_t len;
+    WITH_RCU_READ_LOCK_GUARD() {
+        while (offset < size) {
+            size_t len;
 
-        elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
-        if (!elem) {
-            break;
+            elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
+            if (!elem) {
+                break;
+            }
+
+            len = iov_from_buf(elem->in_sg, elem->in_num, 0,
+                               buf + offset, size - offset);
+            offset += len;
+
+            virtqueue_push(vq, elem, len);
+            g_free(elem);
         }
-
-        len = iov_from_buf(elem->in_sg, elem->in_num, 0,
-                           buf + offset, size - offset);
-        offset += len;
-
-        virtqueue_push(vq, elem, len);
-        g_free(elem);
     }
 
-    virtio_notify(VIRTIO_DEVICE(port->vser), vq);
+    virtio_serial_notify_vq(port->vser, vq, port);
     return offset;
 }
 
 static void discard_vq_data(VirtQueue *vq, VirtIODevice *vdev)
 {
+    VirtIOSerial *vser = VIRTIO_SERIAL(vdev);
     VirtQueueElement *elem;
 
     if (!virtio_queue_ready(vq)) {
         return;
     }
-    for (;;) {
-        elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
-        if (!elem) {
-            break;
+    WITH_RCU_READ_LOCK_GUARD() {
+        for (;;) {
+            elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
+            if (!elem) {
+                break;
+            }
+            virtqueue_push(vq, elem, 0);
+            g_free(elem);
         }
-        virtqueue_push(vq, elem, 0);
-        g_free(elem);
     }
-    virtio_notify(vdev, vq);
+    virtio_serial_notify_vq(vser, vq, find_port_by_vq(vser, vq));
 }
 
 static void discard_throttle_data(VirtIOSerialPort *port)
 {
+    port->direct_partial = false;
     if (port->elem) {
         virtqueue_detach_element(port->ovq, port->elem, 0);
         g_free(port->elem);
         port->elem = NULL;
     }
+}
+
+static void discard_port_output(VirtIOSerialPort *port)
+{
+    if (port->direct_partial) {
+        /* The port closed before the ordinary output handler ran.
+         * It would have returned this chain along with the other posted ones. */
+        virtqueue_push(port->ovq, port->elem, 0);
+        g_clear_pointer(&port->elem, g_free);
+    }
+    discard_throttle_data(port);
+    discard_vq_data(port->ovq, VIRTIO_DEVICE(port->vser));
 }
 
 static void do_flush_queued_data(VirtIOSerialPort *port, VirtQueue *vq,
@@ -166,6 +216,7 @@ static void do_flush_queued_data(VirtIOSerialPort *port, VirtQueue *vq,
     assert(virtio_queue_ready(vq));
 
     vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+    port->direct_partial = false;
 
     while (!port->throttled) {
         unsigned int i;
@@ -223,6 +274,7 @@ static void flush_queued_data(VirtIOSerialPort *port)
 
 static size_t send_control_msg(VirtIOSerial *vser, void *buf, size_t len)
 {
+    g_autoptr(VirtioNetworkLock) guard = virtio_lock_network(VIRTIO_DEVICE(vser));
     VirtQueueElement *elem;
     VirtQueue *vq;
 
@@ -231,17 +283,19 @@ static size_t send_control_msg(VirtIOSerial *vser, void *buf, size_t len)
         return 0;
     }
 
-    elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
-    if (!elem) {
-        return 0;
+    WITH_RCU_READ_LOCK_GUARD() {
+        elem = virtqueue_pop(vq, sizeof(VirtQueueElement));
+        if (!elem) {
+            return 0;
+        }
+
+        /* TODO: detect a buffer that's too short, set NEEDS_RESET */
+        iov_from_buf(elem->in_sg, elem->in_num, 0, buf, len);
+
+        virtqueue_push(vq, elem, len);
+        g_free(elem);
     }
-
-    /* TODO: detect a buffer that's too short, set NEEDS_RESET */
-    iov_from_buf(elem->in_sg, elem->in_num, 0, buf, len);
-
-    virtqueue_push(vq, elem, len);
-    virtio_notify(VIRTIO_DEVICE(vser), vq);
-    g_free(elem);
+    virtio_serial_notify_vq(vser, vq, NULL);
 
     return len;
 }
@@ -263,6 +317,9 @@ static size_t send_control_event(VirtIOSerial *vser, uint32_t port_id,
 /* Functions for use inside qemu to open and read from/write to ports */
 int virtio_serial_open(VirtIOSerialPort *port)
 {
+    g_autoptr(VirtioNetworkLock) guard =
+        virtio_lock_network(VIRTIO_DEVICE(port->vser));
+
     /* Don't allow opening an already-open port */
     if (port->host_connected) {
         return 0;
@@ -276,14 +333,16 @@ int virtio_serial_open(VirtIOSerialPort *port)
 
 int virtio_serial_close(VirtIOSerialPort *port)
 {
+    g_autoptr(VirtioNetworkLock) guard =
+        virtio_lock_network(VIRTIO_DEVICE(port->vser));
+
     port->host_connected = false;
     /*
      * If there's any data the guest sent which the app didn't
      * consume, reset the throttling flag and discard the data.
      */
     port->throttled = false;
-    discard_throttle_data(port);
-    discard_vq_data(port->ovq, VIRTIO_DEVICE(port->vser));
+    discard_port_output(port);
 
     send_control_event(port->vser, port->id, VIRTIO_CONSOLE_PORT_OPEN, 0);
 
@@ -326,6 +385,8 @@ static void flush_queued_data_bh(void *opaque)
 {
     VirtIOSerialPort *port = opaque;
 
+    g_autoptr(VirtioNetworkLock) guard =
+        virtio_lock_network(VIRTIO_DEVICE(port->vser));
     flush_queued_data(port);
 }
 
@@ -335,6 +396,8 @@ void virtio_serial_throttle_port(VirtIOSerialPort *port, bool throttle)
         return;
     }
 
+    g_autoptr(VirtioNetworkLock) guard =
+        virtio_lock_network(VIRTIO_DEVICE(port->vser));
     trace_virtio_serial_throttle_port(port->id, throttle);
     port->throttled = throttle;
     if (throttle) {
@@ -441,7 +504,9 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
         }
         break;
 
-    case VIRTIO_CONSOLE_PORT_OPEN:
+    case VIRTIO_CONSOLE_PORT_OPEN: {
+        g_autoptr(VirtioNetworkLock) guard =
+            virtio_lock_network(VIRTIO_DEVICE(vser));
         port->guest_connected = cpkt.value;
         if (vsc->set_guest_connected) {
             /* Send the guest opened notification if an app is interested */
@@ -449,10 +514,322 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
         }
         break;
     }
+    }
 }
 
 static void control_in(VirtIODevice *vdev, VirtQueue *vq)
 {
+}
+
+static void virtio_serial_flush_tx_irqs(VirtIODevice *vdev)
+{
+    VirtIOSerial *vser = VIRTIO_SERIAL(vdev);
+    VirtIOSerialPort *port;
+    g_autoptr(VirtioNetworkLock) guard = virtio_lock_network(vdev);
+
+    if (vser->ctrl_irq_pending) {
+        vser->ctrl_irq_pending = false;
+        virtio_queue_deliver_irq(vser->c_ivq);
+    }
+    QTAILQ_FOREACH(port, &vser->ports, next) {
+        if (port->rx_irq_pending) {
+            port->rx_irq_pending = false;
+            virtio_queue_deliver_irq(port->ivq);
+        }
+        if (port->tx_irq_pending) {
+            port->tx_irq_pending = false;
+            virtio_queue_deliver_irq(port->ovq);
+        }
+    }
+    vdev->output_irqs_may_be_pending = false;
+}
+
+#if defined(CONFIG_LINUX) && defined(CONFIG_LATX_OPT_MMIO_LOCKLESS)
+typedef struct SerialPollRX {
+    DeviceState *transport;
+    VirtIOSerial *vser;
+    VirtIOSerialPort *port;
+    Chardev *chr;
+    QIOChannelSocket *socket;
+    int fd;
+    size_t limit;
+} SerialPollRX;
+
+void *virtio_serial_poll_rx_begin(void);
+bool virtio_serial_poll_rx_read(void *opaque, int fd);
+void virtio_serial_poll_rx_end(void *opaque);
+
+/* Snapshot eligible streams after GLib has prepared their ordinary watches. */
+void *virtio_serial_poll_rx_begin(void)
+{
+    GArray *ports = NULL;
+    VirtIOSerial *vser;
+
+    QLIST_FOREACH(vser, &vserdevices.devices, next) {
+        VirtIODevice *vdev = VIRTIO_DEVICE(vser);
+        VirtIOSerialPort *port;
+        if (!vdev->try_output) {
+            continue;
+        }
+        g_autoptr(VirtioNetworkLock) guard = virtio_lock_network(vdev);
+        QTAILQ_FOREACH(port, &vser->ports, next) {
+            Chardev *chr = port->direct_write_backend;
+            if (!chr || !port->host_connected || !port->guest_connected ||
+                (chr->gcontext && chr->gcontext != g_main_context_default()) ||
+                qemu_mutex_trylock(&chr->chr_write_lock)) {
+                continue;
+            }
+            SocketChardev *s = SOCKET_CHARDEV(chr);
+            if (s->state == TCP_CHARDEV_STATE_CONNECTED && s->sioc &&
+                s->ioc == QIO_CHANNEL(s->sioc) && s->max_size > 0 &&
+                chr->gsource && !g_source_is_destroyed(chr->gsource)) {
+                SerialPollRX entry = {
+                    .transport = qdev_get_parent_bus(DEVICE(vser))->parent,
+                    .vser = vser,
+                    .port = port,
+                    .chr = chr,
+                    .socket = s->sioc,
+                    .fd = s->sioc->fd,
+                    .limit = MIN(s->max_size, CHR_READ_BUF_LEN),
+                };
+                /* The PCI transport embeds its VirtIOSerial instance. */
+                object_ref(entry.transport);
+                object_ref(entry.vser);
+                object_ref(entry.port);
+                object_ref(entry.chr);
+                object_ref(entry.socket);
+                if (!ports) {
+                    ports = g_array_new(false, false, sizeof(entry));
+                }
+                g_array_append_val(ports, entry);
+            }
+            qemu_mutex_unlock(&chr->chr_write_lock);
+        }
+    }
+    return ports;
+}
+
+void virtio_serial_poll_rx_end(void *opaque)
+{
+    GArray *ports = opaque;
+    for (unsigned i = 0; i < ports->len; i++) {
+        SerialPollRX *p = &g_array_index(ports, SerialPollRX, i);
+        object_unref(p->socket);
+        object_unref(p->chr);
+        object_unref(p->port);
+        object_unref(p->vser);
+        object_unref(p->transport);
+    }
+    g_array_free(ports, true);
+}
+
+static bool virtio_serial_read_ready(SerialPollRX *p)
+{
+    VirtIOSerialPort *port = p->port;
+    VirtIODevice *vdev = VIRTIO_DEVICE(p->vser);
+    SocketChardev *s = SOCKET_CHARDEV(p->chr);
+    VirtQueue *vq;
+    g_autofree VirtQueueElement *elem = NULL;
+    uint8_t buf[CHR_READ_BUF_LEN];
+    int available;
+    ssize_t n;
+
+    QEMU_LOCK_GUARD(&p->vser->socket_io_mutex);
+    if (qemu_rec_mutex_trylock(&p->vser->tx_mutex)) {
+        return false;
+    }
+    g_autoptr(VirtioNetworkLock) guard = &p->vser->tx_mutex;
+    if (!vdev->try_output || port->direct_write_backend != p->chr ||
+        !port->host_connected || !port->guest_connected ||
+        vdev->queue_mapping_changing || !vdev->vm_running ||
+        vdev->start_on_kick || !(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) ||
+        virtio_device_disabled(vdev) || vdev->dma_as != &address_space_memory ||
+        !virtio_vdev_has_feature(vdev, VIRTIO_F_VERSION_1) ||
+        virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED)) {
+        return false;
+    }
+    RCU_READ_LOCK_GUARD();
+    vq = port->ivq;
+    if (!virtio_queue_ready(vq) || !virtio_queue_has_ram_rings(vq) ||
+        (!virtio_queue_irq_ready(vdev, vq) && !virtio_split_next_irq_suppressed(vdev, vq)) ||
+        qemu_mutex_trylock(&p->chr->chr_write_lock)) {
+        return false;
+    }
+    if (s->sioc != p->socket || s->ioc != QIO_CHANNEL(p->socket) ||
+        s->state != TCP_CHARDEV_STATE_CONNECTED || s->sioc->fd != p->fd ||
+        ioctl(p->fd, FIONREAD, &available) < 0 || available <= 0) {
+        goto out;
+    }
+    size_t size = MIN((size_t)available, p->limit);
+    elem = virtqueue_pop(vq, sizeof(*elem));
+    if (!elem) {
+        vdev->network_queue_retry = false;
+        goto out;
+    }
+    if (elem->out_num || !elem->in_num || iov_size(elem->in_sg, elem->in_num) < size) {
+        virtqueue_unpop(vq, elem, 0);
+        goto out;
+    }
+    n = qemu_chr_socket_recv(p->chr, (char *)buf, size);
+    if (n <= 0) {
+        virtqueue_unpop(vq, elem, 0);
+        goto out;
+    }
+    /* Recheck guest capacity if ordinary input and hangup dispatch together. */
+    s->max_size = -1;
+    qemu_mutex_unlock(&p->chr->chr_write_lock);
+    iov_from_buf(elem->in_sg, elem->in_num, 0, buf, n);
+    trace_virtio_console_chr_read(port->id, n);
+    virtqueue_push(vq, elem, n);
+    if (!virtio_queue_try_notify(vdev, vq)) {
+        port->rx_irq_pending = true;
+        vdev->output_irqs_may_be_pending = true;
+        qemu_bh_schedule(p->vser->tx_irq_bh);
+    }
+    return true;
+out:
+    qemu_mutex_unlock(&p->chr->chr_write_lock);
+    return false;
+}
+
+bool virtio_serial_poll_rx_read(void *opaque, int fd)
+{
+    GArray *ports = opaque;
+    for (unsigned i = 0; i < ports->len; i++) {
+        SerialPollRX *p = &g_array_index(ports, SerialPollRX, i);
+        if (fd == p->fd) {
+            return virtio_serial_read_ready(p);
+        }
+    }
+    return false;
+}
+
+static void virtio_serial_tx_irq_bh(void *opaque)
+{
+    virtio_serial_flush_tx_irqs(opaque);
+}
+
+static bool virtio_serial_try_output(VirtIODevice *vdev, VirtQueue *vq)
+{
+    VirtIOSerial *vser = VIRTIO_SERIAL(vdev);
+    unsigned int index = virtio_get_queue_index(vq);
+    g_autofree VirtQueueElement *elem = NULL;
+    VirtIOSerialPort *port;
+    VirtIOSerialPortClass *k;
+    ssize_t sent;
+
+    /*
+     * Even queues are guest RX queues (control_in at index 2, or port->ivq).
+     * control_in() is a no-op, and handle_input() is a no-op whenever the port
+     * is absent, disconnected on either side, or has no guest_writable callback
+     * (e.g. early-boot guest posting 128 RX buffers before QGA connects).
+     * Consume those no-op kicks here without waking the main loop.
+     */
+    if (!(index & 1)) {
+        if (vdev->start_on_kick ||
+            !virtio_vdev_has_feature(vdev, VIRTIO_F_VERSION_1)) {
+            return false;
+        }
+        if (index == 2) {
+            return true;
+        }
+        if (qemu_rec_mutex_trylock(&vser->tx_mutex)) {
+            return false;
+        }
+        g_autoptr(VirtioNetworkLock) guard = &vser->tx_mutex;
+        if (vdev->queue_mapping_changing || !vdev->vm_running ||
+            !(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) ||
+            virtio_device_disabled(vdev)) {
+            return false;
+        }
+        port = find_port_by_vq(vser, vq);
+        if (!port || !port->guest_connected || !port->host_connected ||
+            !VIRTIO_SERIAL_PORT_GET_CLASS(port)->guest_writable) {
+            return true;
+        }
+        return false;
+    }
+
+    if (index < 5) {
+        return false;
+    }
+    /* Direct readers and writers only wait for another socket operation.
+     * Never wait for a config writer while holding its doorbell reference. */
+    g_autoptr(QemuLockable) socket_guard = vser->direct_rx ?
+        qemu_lockable_auto_lock(QEMU_MAKE_LOCKABLE(&vser->socket_io_mutex)) :
+        NULL;
+    if (qemu_rec_mutex_trylock(&vser->tx_mutex)) {
+        return false;
+    }
+    g_autoptr(VirtioNetworkLock) guard = &vser->tx_mutex;
+    RCU_READ_LOCK_GUARD();
+    if (vdev->queue_mapping_changing || !vdev->vm_running || vdev->start_on_kick ||
+        !(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK) || virtio_device_disabled(vdev) ||
+        !virtio_vdev_has_feature(vdev, VIRTIO_F_VERSION_1) ||
+        virtio_vdev_has_feature(vdev, VIRTIO_F_RING_PACKED) ||
+        vdev->dma_as != &address_space_memory || !virtio_queue_ready(vq) ||
+        !virtio_queue_has_ram_rings(vq) ||
+        (!virtio_queue_irq_ready(vdev, vq) && !virtio_split_next_irq_suppressed(vdev, vq))) {
+        return false;
+    }
+    port = find_port_by_vq(vser, vq);
+    if (!port || !port->direct_write_backend || !port->host_connected ||
+        !port->guest_connected || port->elem || port->throttled) {
+        return false;
+    }
+    k = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+    elem = virtqueue_pop(vq, sizeof(*elem));
+    if (!elem) {
+        vdev->network_queue_retry = false;
+        return false;
+    }
+    if (!elem->out_num || elem->in_num) {
+        virtqueue_unpop(vq, elem, 0);
+        return false;
+    }
+
+    /* Limit the work performed by a guest MMIO write to one nonblocking
+     * syscall. The ordinary handler resumes the same chain on a short write. */
+    sent = k->try_write(port, elem->out_sg, elem->out_num);
+    if (sent <= 0) {
+        virtqueue_unpop(vq, elem, 0);
+        return false;
+    }
+    for (unsigned int i = 0; i < elem->out_num; i++) {
+        if (sent < elem->out_sg[i].iov_len) {
+            port->iov_idx = i;
+            port->iov_offset = sent;
+            port->elem = g_steal_pointer(&elem);
+            port->direct_partial = true;
+            return false;
+        }
+        sent -= elem->out_sg[i].iov_len;
+    }
+    virtqueue_push(vq, elem, 0);
+    if (!virtio_queue_try_notify(vdev, vq)) {
+        port->tx_irq_pending = true;
+        vdev->output_irqs_may_be_pending = true;
+        qemu_bh_schedule(vser->tx_irq_bh);
+    }
+    return virtio_queue_empty(vq);
+}
+#endif
+
+static int virtio_serial_start_ioeventfd(VirtIODevice *vdev)
+{
+    int ret = virtio_device_start_ioeventfd_impl(vdev);
+
+    /*
+     * Control messages consume guest buffers when the event occurs. A
+     * buffer kick has no work of its own. Legacy devices can still use
+     * their first kick to start the device.
+     */
+    if (ret == 0 && virtio_vdev_has_feature(vdev, VIRTIO_F_VERSION_1) &&
+        !vdev->start_on_kick &&
+        lats_nobql_enabled()) {
+        virtio_queue_set_ioeventfd_fd_handler(VIRTIO_SERIAL(vdev)->c_ivq, false);
+    }
+    return ret;
 }
 
 static void control_out(VirtIODevice *vdev, VirtQueue *vq)
@@ -608,9 +985,13 @@ static void guest_reset(VirtIOSerial *vser)
     VirtIOSerialPort *port;
     VirtIOSerialPortClass *vsc;
 
+    g_autoptr(VirtioNetworkLock) guard = virtio_lock_network(VIRTIO_DEVICE(vser));
+    vser->ctrl_irq_pending = false;
     QTAILQ_FOREACH(port, &vser->ports, next) {
         vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
 
+        port->rx_irq_pending = false;
+        port->tx_irq_pending = false;
         discard_throttle_data(port);
 
         if (port->guest_connected) {
@@ -628,6 +1009,9 @@ static void set_status(VirtIODevice *vdev, uint8_t status)
     VirtIOSerialPort *port;
 
     vser = VIRTIO_SERIAL(vdev);
+    if (!vdev->vm_running && vdev->flush_output_irqs) {
+        vdev->flush_output_irqs(vdev);
+    }
     port = find_port_by_id(vser, 0);
 
     if (port && !use_multiport(port->vser)
@@ -649,6 +1033,46 @@ static void set_status(VirtIODevice *vdev, uint8_t status)
         if (vsc->enable_backend) {
             vsc->enable_backend(port, vdev->vm_running);
         }
+    }
+}
+
+static void vser_restore_rx_notifications(VirtIOSerialPort *port)
+{
+    VirtIOSerialPortClass *vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+
+    if (vsc->restore_rx_notifications) {
+        vsc->restore_rx_notifications(port);
+    }
+}
+
+static void vser_queue_reset(VirtIODevice *vdev, uint32_t index)
+{
+    VirtQueue *vq = virtio_get_queue(vdev, index);
+    VirtIOSerialPort *port = find_port_by_vq(VIRTIO_SERIAL(vdev), vq);
+
+    if (port && port->ovq == vq) {
+        port->tx_irq_pending = false;
+        /* Detach a partially written buffer while its old ring is valid. */
+        discard_throttle_data(port);
+    } else if (port && port->ivq == vq) {
+        port->rx_irq_pending = false;
+        vser_restore_rx_notifications(port);
+    }
+}
+
+static void vser_memory_begin(MemoryListener *listener)
+{
+    VirtIODevice *vdev = container_of(listener, VirtIODevice, listener);
+    VirtIOSerialPort *port;
+
+    g_autoptr(VirtioNetworkLock) guard = virtio_lock_network(vdev);
+    if (vdev->try_output) {
+        vdev->queue_mapping_changing = true;
+        vdev->flush_output_irqs(vdev);
+    }
+    /* The old ring caches are still valid at the start of a memory update. */
+    QTAILQ_FOREACH(port, &VIRTIO_SERIAL(vdev)->ports, next) {
+        vser_restore_rx_notifications(port);
     }
 }
 
@@ -921,8 +1345,7 @@ static void remove_port(VirtIOSerial *vser, uint32_t port_id)
     assert(port);
 
     /* Flush out any unconsumed buffers first */
-    discard_throttle_data(port);
-    discard_vq_data(port->ovq, VIRTIO_DEVICE(port->vser));
+    discard_port_output(port);
 
     send_control_event(vser, port->id, VIRTIO_CONSOLE_PORT_REMOVE, 1);
 }
@@ -995,6 +1418,8 @@ static void virtser_port_device_plug(HotplugHandler *hotplug_dev,
 {
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
 
+    g_autoptr(VirtioNetworkLock) guard =
+        virtio_lock_network(VIRTIO_DEVICE(port->vser));
     QTAILQ_INSERT_TAIL(&port->vser->ports, port, next);
     port->ivq = port->vser->ivqs[port->id];
     port->ovq = port->vser->ovqs[port->id];
@@ -1011,6 +1436,10 @@ static void virtser_port_device_unrealize(DeviceState *dev)
     VirtIOSerialPortClass *vsc = VIRTIO_SERIAL_PORT_GET_CLASS(dev);
     VirtIOSerial *vser = port->vser;
 
+    g_autoptr(VirtioNetworkLock) guard = virtio_lock_network(VIRTIO_DEVICE(vser));
+    if (port->tx_irq_pending || port->rx_irq_pending) {
+        virtio_serial_flush_tx_irqs(VIRTIO_DEVICE(vser));
+    }
     qemu_bh_delete(port->bh);
     remove_port(port->vser, port->id);
 
@@ -1053,6 +1482,23 @@ static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
     qbus_set_hotplug_handler(BUS(&vser->bus), OBJECT(vser));
     vser->bus.vser = vser;
     QTAILQ_INIT(&vser->ports);
+#if defined(CONFIG_LINUX) && defined(CONFIG_LATX_OPT_MMIO_LOCKLESS)
+    if (lats_nobql_enabled() &&
+        VIRTIO_BUS_GET_CLASS(qdev_get_parent_bus(dev))->set_fast_notifiers &&
+        tcg_enabled() && !icount_enabled() && replay_mode == REPLAY_MODE_NONE) {
+        vser->direct_rx =
+            lats_nobql_enabled();
+        vdev->network_mutex = &vser->tx_mutex;
+        vdev->try_output = virtio_serial_try_output;
+        vdev->flush_output_irqs = virtio_serial_flush_tx_irqs;
+        vser->tx_irq_bh = qemu_bh_new_guarded(virtio_serial_tx_irq_bh, vdev,
+                                              &dev->mem_reentrancy_guard);
+    }
+#endif
+    if (vdev->try_output ||
+        lats_nobql_enabled()) {
+        vdev->listener.begin = vser_memory_begin;
+    }
 
     vser->bus.max_nr_ports = vser->serial.max_virtserial_ports;
     vser->ivqs = g_new(VirtQueue *, vser->serial.max_virtserial_ports);
@@ -1120,6 +1566,7 @@ static void virtio_serial_device_unrealize(DeviceState *dev)
     VirtIOSerial *vser = VIRTIO_SERIAL(dev);
     int i;
 
+    g_autoptr(VirtioNetworkLock) guard = virtio_lock_network(vdev);
     QLIST_REMOVE(vser, next);
 
     virtio_delete_queue(vser->c_ivq);
@@ -1141,6 +1588,12 @@ static void virtio_serial_device_unrealize(DeviceState *dev)
     qbus_set_hotplug_handler(BUS(&vser->bus), NULL);
 
     virtio_cleanup(vdev);
+    if (vdev->try_output) {
+        qemu_bh_delete(vser->tx_irq_bh);
+        vdev->flush_output_irqs = NULL;
+        vdev->try_output = NULL;
+        vdev->network_mutex = NULL;
+    }
 }
 
 /* Note: 'console' is used for backwards compatibility */
@@ -1177,19 +1630,35 @@ static void virtio_serial_class_init(ObjectClass *klass, void *data)
     vdc->unrealize = virtio_serial_device_unrealize;
     vdc->get_features = get_features;
     vdc->get_config = get_config;
+    vdc->start_ioeventfd = virtio_serial_start_ioeventfd;
     vdc->set_config = set_config;
     vdc->set_status = set_status;
     vdc->reset = vser_reset;
+    vdc->queue_reset = vser_queue_reset;
     vdc->save = virtio_serial_save_device;
     vdc->load = virtio_serial_load_device;
     hc->plug = virtser_port_device_plug;
     hc->unplug = qdev_simple_device_unplug_cb;
 }
 
+static void virtio_serial_instance_init(Object *obj)
+{
+    qemu_rec_mutex_init(&VIRTIO_SERIAL(obj)->tx_mutex);
+    qemu_mutex_init(&VIRTIO_SERIAL(obj)->socket_io_mutex);
+}
+
+static void virtio_serial_instance_finalize(Object *obj)
+{
+    qemu_mutex_destroy(&VIRTIO_SERIAL(obj)->socket_io_mutex);
+    qemu_rec_mutex_destroy(&VIRTIO_SERIAL(obj)->tx_mutex);
+}
+
 static const TypeInfo virtio_device_info = {
     .name = TYPE_VIRTIO_SERIAL,
     .parent = TYPE_VIRTIO_DEVICE,
     .instance_size = sizeof(VirtIOSerial),
+    .instance_init = virtio_serial_instance_init,
+    .instance_finalize = virtio_serial_instance_finalize,
     .class_init = virtio_serial_class_init,
     .interfaces = (InterfaceInfo[]) {
         { TYPE_HOTPLUG_HANDLER },

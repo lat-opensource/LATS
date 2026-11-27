@@ -27,6 +27,7 @@
 
 #include "hw/isa/isa.h"
 #include "hw/timer/i8254.h"
+#include "qemu/thread.h"
 #include "qemu/timer.h"
 
 typedef struct PITChannelState {
@@ -53,6 +54,8 @@ typedef struct PITChannelState {
 struct PITCommonState {
     ISADevice dev;
     MemoryRegion ioports;
+    QemuRecMutex local_lock;
+    bool nobql_timer;
     uint32_t iobase;
     PITChannelState channels[3];
 };

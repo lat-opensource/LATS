@@ -70,6 +70,7 @@ typedef enum {
  */
 
 #define QEMU_TIMER_ATTR_EXTERNAL ((int)BIT(0))
+#define QEMU_TIMER_ATTR_NO_BQL   ((int)BIT(1))
 #define QEMU_TIMER_ATTR_ALL      0xffffffff
 
 typedef struct QEMUTimerList QEMUTimerList;
@@ -79,6 +80,7 @@ struct QEMUTimerListGroup {
 };
 
 typedef void QEMUTimerCB(void *opaque);
+typedef bool QEMUTimerTryCB(void *opaque);
 typedef void QEMUTimerListNotifyCB(void *opaque, QEMUClockType type);
 
 struct QEMUTimer {
@@ -89,6 +91,16 @@ struct QEMUTimer {
     QEMUTimer *next;
     int attributes;
     int scale;
+    /*
+     * Optional device mutex, set before the timer is armed. The mutex must
+     * outlive any concurrent dispatcher. The callback enters with one lock
+     * acquisition and must release it, including on early exit.
+     */
+    struct QemuRecMutex *dispatch_lock;
+    /* Optional one-shot transaction. Called with the device and queue
+     * locks held, without BQL. A failure must have no effect; a success
+     * must not rearm the timer or call code that takes these locks. */
+    QEMUTimerTryCB *try_dispatch_unlocked;
 };
 
 extern QEMUTimerListGroup main_loop_tlg;
@@ -395,6 +407,21 @@ bool timerlistgroup_run_timers(QEMUTimerListGroup *tlg);
 int64_t timerlistgroup_deadline_ns(QEMUTimerListGroup *tlg);
 
 /*
+ * Return the earliest deadline as an absolute QEMU_CLOCK_REALTIME timestamp,
+ * or -1 if no active timer contributes. Sample each queue independently.
+ */
+int64_t timerlistgroup_deadline_host_ns(QEMUTimerListGroup *tlg);
+
+/* Try one isolated, already-due virtual timer without dequeuing on failure. */
+bool qemu_clock_try_virtual_timer_unlocked(void);
+
+/*
+ * Try one expired main-loop timer marked QEMU_TIMER_ATTR_NO_BQL without BQL.
+ * Returns false if any earlier BQL-required timer is already due.
+ */
+bool qemu_clock_try_nobql_timer_unlocked(void);
+
+/*
  * QEMUTimer
  */
 
@@ -646,6 +673,12 @@ static inline void timer_free(QEMUTimer *ts)
  * freed while this function is running.
  */
 void timer_mod_ns(QEMUTimer *ts, int64_t expire_time);
+
+/*
+ * Move an existing head in place, leaving the list and its order intact.
+ * The caller must ensure the old wait still covers the new deadline.
+ */
+bool timer_mod_ns_late_head(QEMUTimer *ts, int64_t expire_time);
 
 /**
  * timer_mod_anticipate_ns:

@@ -23,6 +23,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
+#include "qemu/iov.h"
 #include "qemu/log.h"
 #include "net/slirp.h"
 
@@ -37,6 +39,10 @@
 #include "hub.h"
 #include "monitor/monitor.h"
 #include "qemu/error-report.h"
+#include "qemu/event_notifier.h"
+#include "qemu/rcu.h"
+#include "qemu/thread.h"
+#include "sysemu/runstate.h"
 #include "qemu/sockets.h"
 #include <libslirp.h>
 #include "chardev/char-fe.h"
@@ -47,6 +53,8 @@
 #include "util.h"
 #include "migration/register.h"
 #include "migration/qemu-file-types.h"
+#include "sysemu/replay.h"
+#include "sysemu/cpu-timers.h"
 
 static int get_str_sep(char *buf, int buf_size, const char **pp, int sep)
 {
@@ -85,12 +93,64 @@ struct GuestFwd {
     Slirp *slirp;
 };
 
+/* Match the limit on the normal QEMU packet queue. */
+#define SLIRP_WORKER_QUEUE_SIZE 10000
+#define SLIRP_WORKER_BURST 64
+
+typedef struct SlirpWorker {
+    QemuRecMutex mutex;
+    QemuThread thread;
+    EventNotifier wake;
+    QEMUTimerListGroup timers;
+    VMChangeStateEntry *vmstate;
+    QEMUBH *deliver;
+    GQueue to_guest;
+    GQueue to_slirp;
+    uint64_t poll_generation;
+    uint64_t polls;
+    uint64_t rx;
+    uint64_t tx;
+    uint64_t bridge;
+    uint64_t dropped;
+    uint64_t direct;
+    uint64_t direct_tx;
+    uint64_t tx_full;
+    EventNotifier *rx_notifier;
+    void (*rx_flush)(void *);
+    uint64_t rx_kicks;
+    uint64_t rx_flushes;
+    bool rx_flush_pending;
+    struct {
+        EventNotifier *notifier;
+        void (*handle)(void *);
+    } kicks[SLIRP_KICK_COUNT];
+    SlirpDirectReceive *receive;
+    void (*detach)(void *);
+    void *receiver;
+    bool bridge_blocked;
+    bool dedicated;
+    bool started;
+    bool running;
+    bool stopping;
+    bool in_worker;
+    bool delivering;
+    bool tx_blocked;
+    bool link_down;
+} SlirpWorker;
+
+typedef struct SlirpFrame {
+    size_t size;
+    uint8_t data[];
+} SlirpFrame;
+
 typedef struct SlirpState {
     NetClientState nc;
     QTAILQ_ENTRY(SlirpState) entry;
     Slirp *slirp;
     Notifier poll_notifier;
+    bool poll_filled;
     Notifier exit_notifier;
+    SlirpWorker *worker;
 #if defined(CONFIG_SMBD_COMMAND)
     gchar *smb_dir;
 #endif
@@ -112,10 +172,43 @@ static void slirp_smb_cleanup(SlirpState *s);
 static inline void slirp_smb_cleanup(SlirpState *s) { }
 #endif
 
-static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
-                                     void *opaque)
+typedef QemuRecMutex SlirpWorkerLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(SlirpWorkerLock, qemu_rec_mutex_unlock)
+
+static SlirpWorkerLock *slirp_worker_lock(SlirpState *s)
 {
-    SlirpState *s = opaque;
+    if (!s || !s->worker) {
+        return NULL;
+    }
+    qemu_rec_mutex_lock(&s->worker->mutex);
+    return &s->worker->mutex;
+}
+
+/* Invalidate results built before a change to Slirp's sockets. */
+static void slirp_worker_repoll(SlirpState *s)
+{
+    if (s->worker) {
+        ++s->worker->poll_generation;
+        if (qatomic_read(&s->worker->dedicated)) {
+            event_notifier_set(&s->worker->wake);
+        } else {
+            qemu_notify_event();
+        }
+    }
+}
+
+static void slirp_queue_frame(GQueue *queue, const void *data, size_t size)
+{
+    SlirpFrame *frame = g_malloc(sizeof(*frame) + size);
+
+    frame->size = size;
+    memcpy(frame->data, data, size);
+    g_queue_push_tail(queue, frame);
+}
+
+static ssize_t net_slirp_send_to_nic(const void *pkt, size_t pkt_len,
+                                     SlirpState *s)
+{
     uint8_t min_pkt[ETH_ZLEN];
     size_t min_pktsz = sizeof(min_pkt);
 
@@ -129,12 +222,96 @@ static ssize_t net_slirp_send_packet(const void *pkt, size_t pkt_len,
     return qemu_send_packet(&s->nc, pkt, pkt_len);
 }
 
+static ssize_t net_slirp_send_packet(const void *pkt, size_t size,
+                                     void *opaque)
+{
+    SlirpState *s = opaque;
+    SlirpWorker *worker = s->worker;
+
+    if (!worker || !qatomic_read(&worker->dedicated)) {
+        return net_slirp_send_to_nic(pkt, size, s);
+    }
+    if (worker->stopping) {
+        return 0;
+    }
+    if (worker->in_worker) {
+        ++worker->rx;
+    }
+    if (worker->in_worker && worker->receive && !worker->bridge_blocked &&
+        g_queue_is_empty(&worker->to_guest)) {
+        ssize_t received = worker->receive(worker->receiver, pkt, size);
+
+        if (received > 0) {
+            ++worker->direct;
+            return received;
+        }
+    }
+    if (worker->to_guest.length == SLIRP_WORKER_QUEUE_SIZE) {
+        ++worker->dropped;
+        return 0;
+    }
+
+    slirp_queue_frame(&worker->to_guest, pkt, size);
+    qemu_bh_schedule(worker->deliver);
+    return size;
+}
+
+static void slirp_worker_deliver(void *opaque)
+{
+    SlirpState *s = opaque;
+    SlirpWorker *worker = s->worker;
+    g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+    unsigned int i;
+
+    assert(qemu_mutex_iothread_locked());
+    if (worker->delivering) {
+        return;
+    }
+    worker->delivering = true;
+    if (worker->rx_flush_pending) {
+        worker->rx_flush_pending = false;
+        worker->rx_flush(worker->receiver);
+    }
+    if (worker->tx_blocked &&
+        worker->to_slirp.length < SLIRP_WORKER_QUEUE_SIZE) {
+        worker->tx_blocked = false;
+        qemu_flush_queued_packets(&s->nc);
+    }
+
+    for (i = 0; i < SLIRP_WORKER_BURST; i++) {
+        g_autofree SlirpFrame *frame = g_queue_pop_head(&worker->to_guest);
+
+        if (!frame) {
+            break;
+        }
+        ++worker->bridge;
+        if (net_slirp_send_to_nic(frame->data, frame->size, s) == 0) {
+            worker->bridge_blocked = true;
+        }
+    }
+    if (!g_queue_is_empty(&worker->to_guest)) {
+        qemu_bh_schedule(worker->deliver);
+    }
+    worker->delivering = false;
+}
+
 static ssize_t net_slirp_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+    g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+    SlirpWorker *worker = s->worker;
 
-    slirp_input(s->slirp, buf, size);
-
+    if (worker && qatomic_read(&worker->dedicated) && worker->running) {
+        if (worker->to_slirp.length == SLIRP_WORKER_QUEUE_SIZE) {
+            worker->tx_blocked = true;
+            return 0;
+        }
+        slirp_queue_frame(&worker->to_slirp, buf, size);
+        event_notifier_set(&worker->wake);
+    } else {
+        slirp_input(s->slirp, buf, size);
+        slirp_worker_repoll(s);
+    }
     return size;
 }
 
@@ -152,14 +329,66 @@ static void slirp_free_fwd(gpointer data)
     g_free(data);
 }
 
+static void slirp_clear_frames(GQueue *queue)
+{
+    SlirpFrame *frame;
+
+    while ((frame = g_queue_pop_head(queue))) {
+        g_free(frame);
+    }
+}
+
+static void slirp_worker_stop(SlirpState *s)
+{
+    SlirpWorker *worker = s->worker;
+
+    if (!worker) {
+        return;
+    }
+    {
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+        worker->stopping = true;
+        event_notifier_set(&worker->wake);
+    }
+    if (worker->started) {
+        qemu_thread_join(&worker->thread);
+    }
+    net_slirp_detach_receiver(&s->nc);
+    qemu_del_vm_change_state_handler(worker->vmstate);
+    qemu_bh_delete(worker->deliver);
+    slirp_clear_frames(&worker->to_guest);
+    slirp_clear_frames(&worker->to_slirp);
+    if (worker->rx_kicks) {
+        fprintf(stderr, "SLIRP_WORKER rx-kicks=%" PRIu64 " flushes=%" PRIu64 "\n",
+                worker->rx_kicks, worker->rx_flushes);
+    }
+    fprintf(stderr, "SLIRP_WORKER exit polls=%" PRIu64 " rx=%" PRIu64
+            " tx=%" PRIu64 " bridge=%" PRIu64 " dropped=%" PRIu64
+            " direct=%" PRIu64 " direct_tx=%" PRIu64 " tx_full=%" PRIu64 "\n",
+            worker->polls, worker->rx, worker->tx, worker->bridge,
+            worker->dropped, worker->direct, worker->direct_tx, worker->tx_full);
+}
+
 static void net_slirp_cleanup(NetClientState *nc)
 {
     SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
 
     g_slist_free_full(s->fwd, slirp_free_fwd);
-    main_loop_poll_remove_notifier(&s->poll_notifier);
-    unregister_savevm(NULL, "slirp", s->slirp);
+    if (s->worker) {
+        slirp_worker_stop(s);
+    }
+    if (s->poll_notifier.notify) {
+        main_loop_poll_remove_notifier(&s->poll_notifier);
+    }
+    unregister_savevm(NULL, "slirp", s);
     slirp_cleanup(s->slirp);
+    if (s->worker) {
+        timerlistgroup_deinit(&s->worker->timers);
+        event_notifier_cleanup(&s->worker->wake);
+        qemu_rec_mutex_destroy(&s->worker->mutex);
+        g_clear_pointer(&s->worker, g_free);
+    }
     if (s->exit_notifier.notify) {
         qemu_remove_exit_notifier(&s->exit_notifier);
     }
@@ -167,12 +396,136 @@ static void net_slirp_cleanup(NetClientState *nc)
     QTAILQ_REMOVE(&slirp_stacks, s, entry);
 }
 
+static void net_slirp_link_status_changed(NetClientState *nc)
+{
+    SlirpState *s = DO_UPCAST(SlirpState, nc, nc);
+    g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+    if (lock) {
+        s->worker->link_down = nc->link_down;
+    }
+}
+
 static NetClientInfo net_slirp_info = {
     .type = NET_CLIENT_DRIVER_USER,
     .size = sizeof(SlirpState),
     .receive = net_slirp_receive,
     .cleanup = net_slirp_cleanup,
+    .link_status_changed = net_slirp_link_status_changed,
 };
+
+static SlirpState *net_slirp_from_client(NetClientState *nc)
+{
+    return nc && nc->info == &net_slirp_info ?
+           DO_UPCAST(SlirpState, nc, nc) : NULL;
+}
+
+bool net_slirp_attach_receiver(NetClientState *nc,
+                               SlirpDirectReceive *receive,
+                               void (*detach)(void *), void *opaque,
+                               QemuRecMutex **mutex)
+{
+    SlirpState *s = net_slirp_from_client(nc);
+
+    assert(qemu_mutex_iothread_locked());
+    if (s && s->worker && qatomic_read(&s->worker->dedicated) &&
+        QTAILQ_EMPTY(&nc->filters)) {
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+        assert(!s->worker->receive);
+        *mutex = &s->worker->mutex;
+        s->worker->receiver = opaque;
+        s->worker->detach = detach;
+        s->worker->receive = receive;
+        return true;
+    }
+    return false;
+}
+
+void net_slirp_detach_receiver(NetClientState *nc)
+{
+    SlirpState *s = net_slirp_from_client(nc);
+
+    assert(qemu_mutex_iothread_locked());
+    if (s && s->worker) {
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+        SlirpWorker *worker = s->worker;
+
+        if (worker->receive) {
+            worker->receive = NULL;
+            worker->detach(worker->receiver);
+            worker->receiver = NULL;
+            worker->detach = NULL;
+        }
+    }
+}
+
+void net_slirp_receiver_ready(NetClientState *nc)
+{
+    SlirpState *s = net_slirp_from_client(nc);
+
+    assert(qemu_mutex_iothread_locked());
+    if (s && s->worker) {
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+        s->worker->bridge_blocked = false;
+    }
+}
+
+void net_slirp_set_rx_notifier(NetClientState *nc, EventNotifier *notifier,
+                              void (*flush)(void *))
+{
+    SlirpState *s = net_slirp_from_client(nc);
+    SlirpWorker *worker = s->worker;
+
+    assert(qemu_mutex_iothread_locked());
+    if (!notifier && worker->rx_flush_pending) {
+        /* Return a notification already consumed by the worker. */
+        event_notifier_set(worker->rx_notifier);
+        worker->rx_flush_pending = false;
+    }
+    worker->rx_notifier = notifier;
+    worker->rx_flush = flush;
+    slirp_worker_repoll(s);
+}
+
+void net_slirp_set_kick_notifier(NetClientState *nc, SlirpKickQueue queue,
+                                 EventNotifier *notifier, void (*kick)(void *))
+{
+    SlirpState *s = net_slirp_from_client(nc);
+    SlirpWorker *worker = s->worker;
+
+    assert(qemu_mutex_iothread_locked());
+    worker->kicks[queue].notifier = notifier;
+    worker->kicks[queue].handle = kick;
+    slirp_worker_repoll(s);
+}
+
+ssize_t net_slirp_transmit(NetClientState *nc, const struct iovec *iov, int iovcnt)
+{
+    SlirpState *s = net_slirp_from_client(nc);
+    SlirpWorker *worker = s->worker;
+    size_t size = iov_size(iov, iovcnt);
+    SlirpFrame *frame;
+
+    assert(worker->in_worker && !qemu_mutex_iothread_locked());
+    if (!size) {
+        return -EOPNOTSUPP;
+    }
+    if (size > NET_BUFSIZE || worker->link_down) {
+        return size;
+    }
+    if (worker->to_slirp.length == SLIRP_WORKER_QUEUE_SIZE) {
+        ++worker->tx_full;
+        return -EAGAIN;
+    }
+    frame = g_malloc(sizeof(*frame) + size);
+    frame->size = size;
+    iov_to_buf(iov, iovcnt, 0, frame->data, size);
+    g_queue_push_tail(&worker->to_slirp, frame);
+    ++worker->direct_tx;
+    return size;
+}
 
 static void net_slirp_guest_error(const char *msg, void *opaque)
 {
@@ -215,8 +568,8 @@ static void *net_slirp_timer_new_opaque(SlirpTimerId id,
     t->slirp = s->slirp;
     t->id = id;
     t->cb_opaque = cb_opaque;
-    timer_init_full(&t->timer, NULL, QEMU_CLOCK_VIRTUAL,
-                    SCALE_MS, QEMU_TIMER_ATTR_EXTERNAL,
+    timer_init_full(&t->timer, s->worker ? &s->worker->timers : NULL,
+                    QEMU_CLOCK_VIRTUAL, SCALE_MS, QEMU_TIMER_ATTR_EXTERNAL,
                     net_slirp_timer_cb, t);
     return t;
 }
@@ -224,9 +577,11 @@ static void *net_slirp_timer_new_opaque(SlirpTimerId id,
 static void *net_slirp_timer_new(SlirpTimerCb cb,
                                  void *cb_opaque, void *opaque)
 {
+    SlirpState *s = opaque;
     SlirpTimer *t = g_new(SlirpTimer, 1);
-    timer_init_full(&t->timer, NULL, QEMU_CLOCK_VIRTUAL,
-                    SCALE_MS, QEMU_TIMER_ATTR_EXTERNAL,
+
+    timer_init_full(&t->timer, s->worker ? &s->worker->timers : NULL,
+                    QEMU_CLOCK_VIRTUAL, SCALE_MS, QEMU_TIMER_ATTR_EXTERNAL,
                     cb, cb_opaque);
     return t;
 }
@@ -270,7 +625,13 @@ static void net_slirp_unregister_poll_fd(int fd, void *opaque)
 
 static void net_slirp_notify(void *opaque)
 {
-    qemu_notify_event();
+    SlirpState *s = opaque;
+
+    if (s->worker && qatomic_read(&s->worker->dedicated)) {
+        event_notifier_set(&s->worker->wake);
+    } else {
+        qemu_notify_event();
+    }
 }
 
 static const SlirpCb slirp_cb = {
@@ -362,17 +723,269 @@ static void net_slirp_poll_notify(Notifier *notifier, void *data)
 
     switch (poll->state) {
     case MAIN_LOOP_POLL_FILL:
+        s->poll_filled = true;
         slirp_pollfds_fill(s->slirp, &poll->timeout,
                            net_slirp_add_poll, poll->pollfds);
+        if (s->worker) {
+            int64_t ns = timerlistgroup_deadline_ns(&s->worker->timers);
+
+            if (ns >= 0) {
+                uint64_t ms = DIV_ROUND_UP(ns, SCALE_MS);
+                poll->timeout = MIN(ms, poll->timeout);
+            }
+        }
         break;
     case MAIN_LOOP_POLL_OK:
     case MAIN_LOOP_POLL_ERR:
+        if (!s->poll_filled) {
+            break;
+        }
+        s->poll_filled = false;
         slirp_pollfds_poll(s->slirp, poll->state == MAIN_LOOP_POLL_ERR,
                            net_slirp_get_revents, poll->pollfds);
+        if (s->worker) {
+            timerlistgroup_run_timers(&s->worker->timers);
+        }
         break;
     default:
         g_assert_not_reached();
     }
+}
+
+#ifndef WIN32
+static void slirp_worker_flush_input(SlirpState *s, unsigned int limit)
+{
+    SlirpWorker *worker = s->worker;
+
+    while (limit--) {
+        g_autofree SlirpFrame *frame = g_queue_pop_head(&worker->to_slirp);
+
+        if (!frame) {
+            break;
+        }
+        if (worker->in_worker) {
+            ++worker->tx;
+        }
+        slirp_input(s->slirp, frame->data, frame->size);
+    }
+}
+
+static void *slirp_worker_run(void *opaque)
+{
+    SlirpState *s = opaque;
+    SlirpWorker *worker = s->worker;
+    GPollFD wake = { .fd = event_notifier_get_fd(&worker->wake),
+                     .events = G_IO_IN };
+    g_autoptr(GArray) fds = g_array_new(false, false, sizeof(GPollFD));
+
+    rcu_register_thread();
+    assert(!qemu_mutex_iothread_locked());
+    for (;;) {
+        int64_t timeout = -1;
+        uint64_t generation;
+        int rx_index = -1;
+        int kick_index[SLIRP_KICK_COUNT];
+        int result;
+
+        for (int i = 0; i < SLIRP_KICK_COUNT; i++) {
+            kick_index[i] = -1;
+        }
+        g_array_set_size(fds, 0);
+        g_array_append_val(fds, wake);
+        {
+            g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+            if (worker->stopping) {
+                break;
+            }
+            event_notifier_test_and_clear(&worker->wake);
+            if (qatomic_read(&worker->dedicated) && worker->running) {
+                uint32_t ms = UINT32_MAX;
+
+                worker->in_worker = true;
+                slirp_worker_flush_input(s, SLIRP_WORKER_BURST);
+                timerlistgroup_run_timers(&worker->timers);
+                if (worker->rx_notifier) {
+                    GPollFD rx = {
+                        .fd = event_notifier_get_fd(worker->rx_notifier),
+                        .events = G_IO_IN,
+                    };
+
+                    rx_index = fds->len;
+                    g_array_append_val(fds, rx);
+                }
+                for (int i = 0; i < SLIRP_KICK_COUNT; i++) {
+                    EventNotifier *notifier = worker->kicks[i].notifier;
+
+                    if (notifier) {
+                        GPollFD fd = { .fd = event_notifier_get_fd(notifier),
+                                       .events = G_IO_IN };
+
+                        kick_index[i] = fds->len;
+                        g_array_append_val(fds, fd);
+                    }
+                }
+                slirp_pollfds_fill(s->slirp, &ms, net_slirp_add_poll, fds);
+                worker->in_worker = false;
+                timeout = qemu_soonest_timeout(
+                    ms == UINT32_MAX ? -1 : (int64_t)ms * SCALE_MS,
+                    timerlistgroup_deadline_ns(&worker->timers));
+                if (!g_queue_is_empty(&worker->to_slirp)) {
+                    timeout = 0;
+                }
+                if (worker->tx_blocked) {
+                    qemu_bh_schedule(worker->deliver);
+                }
+            }
+            generation = worker->poll_generation;
+        }
+
+        result = qemu_poll_ns((GPollFD *)fds->data, fds->len, timeout);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        {
+            g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+            if (!worker->stopping && qatomic_read(&worker->dedicated) &&
+                worker->running && generation == worker->poll_generation) {
+                worker->in_worker = true;
+                ++worker->polls;
+                slirp_pollfds_poll(s->slirp, result < 0,
+                                   net_slirp_get_revents, fds);
+                if (result > 0 && rx_index >= 0 &&
+                    (g_array_index(fds, GPollFD, rx_index).revents & G_IO_IN) &&
+                    event_notifier_test_and_clear(worker->rx_notifier)) {
+                    ++worker->rx_kicks;
+                    if (worker->bridge_blocked && !worker->rx_flush_pending) {
+                        worker->rx_flush_pending = true;
+                        ++worker->rx_flushes;
+                        qemu_bh_schedule(worker->deliver);
+                    }
+                }
+                for (int i = 0; i < SLIRP_KICK_COUNT; i++) {
+                    int index = kick_index[i];
+                    if (result > 0 && index >= 0 &&
+                        (g_array_index(fds, GPollFD, index).revents & G_IO_IN) &&
+                        event_notifier_test_and_clear(worker->kicks[i].notifier)) {
+                        worker->kicks[i].handle(worker->receiver);
+                    }
+                }
+                worker->in_worker = false;
+            }
+        }
+    }
+    rcu_unregister_thread();
+    return NULL;
+}
+
+static void slirp_worker_vm_state(void *opaque, bool running, RunState state)
+{
+    SlirpState *s = opaque;
+    SlirpWorker *worker = s->worker;
+    g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+    if (!qatomic_read(&worker->dedicated)) {
+        return;
+    }
+    worker->running = running;
+    slirp_worker_repoll(s);
+    if (!running) {
+        slirp_worker_flush_input(s, worker->to_slirp.length);
+        while (!worker->delivering &&
+               (worker->rx_flush_pending || worker->tx_blocked ||
+                !g_queue_is_empty(&worker->to_guest))) {
+            slirp_worker_deliver(s);
+        }
+        qemu_bh_cancel(worker->deliver);
+        if (state == RUN_STATE_PAUSED) {
+            fprintf(stderr, "SLIRP_WORKER pause polls=%" PRIu64 " rx=%" PRIu64
+                    " tx=%" PRIu64 " bridge=%" PRIu64 " dropped=%" PRIu64
+                    " direct=%" PRIu64 " direct_tx=%" PRIu64
+                    " tx_full=%" PRIu64 "\n",
+                    worker->polls, worker->rx, worker->tx, worker->bridge,
+                    worker->dropped, worker->direct, worker->direct_tx,
+                    worker->tx_full);
+        }
+    }
+}
+
+static void slirp_worker_timer_notify(void *opaque, QEMUClockType type)
+{
+    SlirpWorker *worker = opaque;
+
+    if (qatomic_read(&worker->dedicated)) {
+        event_notifier_set(&worker->wake);
+    } else {
+        qemu_notify_event();
+    }
+}
+
+/* This libslirp build shares its clock and DNS cache between instances. */
+static void slirp_worker_use_main_loop(SlirpState *s)
+{
+    SlirpWorker *worker = s->worker;
+
+    if (!worker || !qatomic_read(&worker->dedicated)) {
+        return;
+    }
+    {
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+        slirp_worker_vm_state(s, false, RUN_STATE_PRELAUNCH);
+        net_slirp_detach_receiver(&s->nc);
+        qatomic_set(&worker->dedicated, false);
+        slirp_worker_repoll(s);
+        s->poll_notifier.notify = net_slirp_poll_notify;
+        main_loop_poll_add_notifier(&s->poll_notifier);
+    }
+    event_notifier_set(&worker->wake);
+}
+#endif
+
+static SlirpWorker *slirp_worker_new(SlirpState *s, const char *smb_export)
+{
+#ifndef WIN32
+    struct slirp_config_str *config;
+    SlirpWorker *worker;
+
+    if (smb_export || icount_enabled() || replay_mode != REPLAY_MODE_NONE ||
+        !QTAILQ_EMPTY(&slirp_stacks) ||
+        !lats_nobql_enabled()) {
+        return NULL;
+    }
+    for (config = slirp_configs; config; config = config->next) {
+        if (!(config->flags & SLIRP_CFG_HOSTFWD)) {
+            return NULL;
+        }
+    }
+    worker = g_new0(SlirpWorker, 1);
+    if (event_notifier_init(&worker->wake, 0) < 0) {
+        g_free(worker);
+        return NULL;
+    }
+    qemu_rec_mutex_init(&worker->mutex);
+    qatomic_set(&worker->dedicated, true);
+    timerlistgroup_init(&worker->timers, slirp_worker_timer_notify, worker);
+    worker->deliver = qemu_bh_new(slirp_worker_deliver, s);
+    worker->vmstate = qemu_add_vm_change_state_handler_prio(
+        slirp_worker_vm_state, s, 1);
+    worker->running = runstate_is_running();
+    return worker;
+#else
+    return NULL;
+#endif
+}
+
+static void slirp_worker_start(SlirpState *s)
+{
+#ifndef WIN32
+    if (s->worker) {
+        s->worker->started = true;
+        qemu_thread_create(&s->worker->thread, "slirp-worker",
+                           slirp_worker_run, s, QEMU_THREAD_JOINABLE);
+    }
+#endif
 }
 
 static ssize_t
@@ -398,16 +1011,20 @@ net_slirp_stream_write(const void *buf, size_t size, void *opaque)
 
 static int net_slirp_state_load(QEMUFile *f, void *opaque, int version_id)
 {
-    Slirp *slirp = opaque;
+    SlirpState *s = opaque;
+    g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+    int err = slirp_state_load(s->slirp, version_id, net_slirp_stream_read, f);
 
-    return slirp_state_load(slirp, version_id, net_slirp_stream_read, f);
+    slirp_worker_repoll(s);
+    return err;
 }
 
 static void net_slirp_state_save(QEMUFile *f, void *opaque)
 {
-    Slirp *slirp = opaque;
+    SlirpState *s = opaque;
+    g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
 
-    slirp_state_save(slirp, net_slirp_stream_write, f);
+    slirp_state_save(s->slirp, net_slirp_stream_write, f);
 }
 
 static SaveVMHandlers savevm_slirp_state = {
@@ -647,6 +1264,14 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     cfg.vnameserver6 = ip6_dns;
     cfg.vdnssearch = dnssearch;
     cfg.vdomainname = vdomainname;
+    /*
+     * Serialize initialization with the first backend until we know whether
+     * both instances must share the main loop.
+     */
+    SlirpState *existing = QTAILQ_FIRST(&slirp_stacks);
+    g_autoptr(SlirpWorkerLock) existing_lock = slirp_worker_lock(existing);
+
+    s->worker = slirp_worker_new(s, smb_export);
     s->slirp = slirp_new(&cfg, &slirp_cb, s);
     QTAILQ_INSERT_TAIL(&slirp_stacks, s, entry);
 
@@ -660,10 +1285,12 @@ static int net_slirp_init(NetClientState *peer, const char *model,
      */
     g_assert(slirp_state_version() == 4);
     register_savevm_live("slirp", 0, slirp_state_version(),
-                         &savevm_slirp_state, s->slirp);
+                         &savevm_slirp_state, s);
 
-    s->poll_notifier.notify = net_slirp_poll_notify;
-    main_loop_poll_add_notifier(&s->poll_notifier);
+    if (!s->worker) {
+        s->poll_notifier.notify = net_slirp_poll_notify;
+        main_loop_poll_add_notifier(&s->poll_notifier);
+    }
 
     for (config = slirp_configs; config; config = config->next) {
         if (config->flags & SLIRP_CFG_HOSTFWD) {
@@ -684,8 +1311,14 @@ static int net_slirp_init(NetClientState *peer, const char *model,
     }
 #endif
 
+#ifndef WIN32
+    if (existing) {
+        slirp_worker_use_main_loop(existing);
+    }
+#endif
     s->exit_notifier.notify = slirp_smb_exit;
     qemu_add_exit_notifier(&s->exit_notifier);
+    slirp_worker_start(s);
     return 0;
 
 error:
@@ -762,7 +1395,12 @@ void hmp_hostfwd_remove(Monitor *mon, const QDict *qdict)
         goto fail_syntax;
     }
 
-    err = slirp_remove_hostfwd(s->slirp, is_udp, host_addr, host_port);
+    {
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+
+        err = slirp_remove_hostfwd(s->slirp, is_udp, host_addr, host_port);
+        slirp_worker_repoll(s);
+    }
 
     monitor_printf(mon, "host forwarding rule for %s %s\n", src_str,
                    err ? "not found" : "removed");
@@ -831,11 +1469,17 @@ static int slirp_hostfwd(SlirpState *s, const char *redir_str, Error **errp)
         goto fail_syntax;
     }
 
-    if (slirp_add_hostfwd(s->slirp, is_udp, host_addr, host_port, guest_addr,
-                          guest_port) < 0) {
-        error_setg(errp, "Could not set up host forwarding rule '%s'",
-                   redir_str);
-        return -1;
+    {
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
+        int err = slirp_add_hostfwd(s->slirp, is_udp, host_addr, host_port,
+                                    guest_addr, guest_port);
+
+        slirp_worker_repoll(s);
+        if (err < 0) {
+            error_setg(errp, "Could not set up host forwarding rule '%s'",
+                       redir_str);
+            return -1;
+        }
     }
     return 0;
 
@@ -1094,6 +1738,7 @@ void hmp_info_usernet(Monitor *mon, const QDict *qdict)
     QTAILQ_FOREACH(s, &slirp_stacks, entry) {
         int id;
         bool got_hub_id = net_hub_id_for_client(&s->nc, &id) == 0;
+        g_autoptr(SlirpWorkerLock) lock = slirp_worker_lock(s);
         char *info = slirp_connection_info(s->slirp);
         monitor_printf(mon, "Hub %d (%s):\n%s",
                        got_hub_id ? id : -1,

@@ -167,6 +167,9 @@ int virtio_scsi_dataplane_start(VirtIODevice *vdev)
         }
         aio_context_release(s->ctx);
     }
+    if (k->set_fast_notifiers) {
+        k->set_fast_notifiers(qbus->parent, vdev, vq_init_count);
+    }
     return 0;
 
 fail_host_notifiers:
@@ -209,6 +212,9 @@ void virtio_scsi_dataplane_stop(VirtIODevice *vdev)
         s->dataplane_fenced = false;
         s->dataplane_started = false;
         return;
+    }
+    if (k->set_fast_notifiers) {
+        k->set_fast_notifiers(qbus->parent, NULL, 0);
     }
     s->dataplane_stopping = true;
 

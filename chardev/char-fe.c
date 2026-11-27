@@ -211,6 +211,7 @@ bool qemu_chr_fe_init(CharBackend *b, Chardev *s, Error **errp)
         }
     }
 
+    b->guard_socket_read = false;
     b->fe_open = false;
     b->tag = tag;
     b->chr = s;

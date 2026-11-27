@@ -84,4 +84,6 @@ typedef struct SocketChardev SocketChardev;
 DECLARE_INSTANCE_CHECKER(SocketChardev, SOCKET_CHARDEV,
                          TYPE_CHARDEV_SOCKET)
 
+ssize_t qemu_chr_socket_recv(Chardev *chr, char *buf, size_t len);
+
 #endif /* CHAR_SOCKET_H */

@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "trace.h"
 #include "ui/qemu-spice.h"
 #include "chardev/char.h"
@@ -128,6 +129,7 @@ static gboolean spice_char_source_prepare(GSource *source, gint *timeout)
     SpiceCharSource *src = (SpiceCharSource *)source;
     Chardev *chr = CHARDEV(src->scd);
 
+    qemu_poll_needs_prepare();
     *timeout = -1;
 
     if (!chr->be_open) {
