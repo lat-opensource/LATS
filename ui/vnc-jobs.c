@@ -79,12 +79,13 @@ static void vnc_unlock_queue(VncJobQueue *queue)
     qemu_mutex_unlock(&queue->mutex);
 }
 
-VncJob *vnc_job_new(VncState *vs)
+VncJob *vnc_job_new(VncState *vs, bool worker_write)
 {
     VncJob *job = g_new0(VncJob, 1);
 
     assert(vs->magic == VNC_MAGIC);
     job->vs = vs;
+    job->worker_write = worker_write;
     vnc_lock_queue(queue);
     QLIST_INIT(&job->rectangles);
     vnc_unlock_queue(queue);
@@ -145,31 +146,33 @@ void vnc_jobs_join(VncState *vs)
 void vnc_jobs_consume_buffer(VncState *vs)
 {
     bool flush;
+    bool write_attempted = false;
 
     vnc_lock_output(vs);
-    if (vs->jobs_buffer.offset) {
-        if (vs->ioc != NULL && buffer_empty(&vs->output)) {
-            if (vs->ioc_tag) {
-                g_source_remove(vs->ioc_tag);
-            }
-            if (vs->disconnecting == FALSE) {
-                vs->ioc_tag = qio_channel_add_watch(
-                    vs->ioc, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_OUT,
-                    vnc_client_io, vs, NULL);
-            }
+    if (vs->worker_write_pending) {
+        vs->worker_write_pending = false;
+        if (vs->output.offset && !vs->disconnecting) {
+            write_attempted = vnc_job_output_ready_locked(vs);
         }
-        buffer_move(&vs->output, &vs->jobs_buffer);
+    }
 
+    if (vs->jobs_buffer.offset) {
+        bool start_output = vs->ioc && buffer_empty(&vs->output);
+
+        buffer_move(&vs->output, &vs->jobs_buffer);
         if (vs->job_update == VNC_STATE_UPDATE_FORCE) {
             vs->force_update_offset = vs->output.offset;
         }
         vs->job_update = VNC_STATE_UPDATE_NONE;
+        if (start_output) {
+            write_attempted = vnc_job_output_ready_locked(vs);
+        }
     }
-    flush = vs->ioc != NULL && vs->abort != true;
+    flush = !write_attempted && vs->ioc != NULL && vs->abort != true;
     vnc_unlock_output(vs);
 
     if (flush) {
-      vnc_flush(vs);
+        vnc_flush(vs);
     }
 }
 
@@ -204,7 +207,6 @@ static void vnc_async_encoding_end(VncState *orig, VncState *local)
     orig->zlib = local->zlib;
     orig->hextile = local->hextile;
     orig->zrle = local->zrle;
-    orig->lossy_rect = local->lossy_rect;
 }
 
 static bool vnc_worker_clamp_rect(VncState *vs, VncJob *job, VncRect *rect)
@@ -317,7 +319,10 @@ static int vnc_worker_thread_loop(VncJobQueue *queue)
         /* Copy persistent encoding data */
         vnc_async_encoding_end(job->vs, &vs);
 
-        qemu_bh_schedule(job->vs->bh);
+        if (!job->worker_write || vs.vnc_encoding != VNC_ENCODING_RAW ||
+            !vnc_job_write_from_worker_locked(job->vs)) {
+            qemu_bh_schedule(job->vs->bh);
+        }
     }  else {
         buffer_reset(&vs.output);
         /* Copy persistent encoding data */

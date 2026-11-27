@@ -37,6 +37,7 @@
 #include "qapi/qapi-commands-misc.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/lockdep-lite.h"
 #include "qemu/main-loop.h"
 
 #include "ui/console.h"
@@ -691,6 +692,17 @@ static void gd_mouse_mode_change(Notifier *notify, void *data)
 
 /** GTK Events **/
 
+static void gd_lifecycle_call(void (*fn)(Error **))
+{
+    if (lats_nobql_enabled() && !qemu_mutex_iothread_locked()) {
+        qemu_vm_lifecycle_lock();
+        fn(NULL);
+        qemu_vm_lifecycle_unlock();
+    } else {
+        fn(NULL);
+    }
+}
+
 static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
                                 void *opaque)
 {
@@ -702,7 +714,7 @@ static gboolean gd_window_close(GtkWidget *widget, GdkEvent *event,
     }
 
     if (allow_close) {
-        qmp_quit(NULL);
+        gd_lifecycle_call(qmp_quit);
     }
 
     return TRUE;
@@ -1266,25 +1278,25 @@ static void gd_menu_pause(GtkMenuItem *item, void *opaque)
         return;
     }
     if (runstate_is_running()) {
-        qmp_stop(NULL);
+        gd_lifecycle_call(qmp_stop);
     } else {
-        qmp_cont(NULL);
+        gd_lifecycle_call(qmp_cont);
     }
 }
 
 static void gd_menu_reset(GtkMenuItem *item, void *opaque)
 {
-    qmp_system_reset(NULL);
+    gd_lifecycle_call(qmp_system_reset);
 }
 
 static void gd_menu_powerdown(GtkMenuItem *item, void *opaque)
 {
-    qmp_system_powerdown(NULL);
+    gd_lifecycle_call(qmp_system_powerdown);
 }
 
 static void gd_menu_quit(GtkMenuItem *item, void *opaque)
 {
-    qmp_quit(NULL);
+    gd_lifecycle_call(qmp_quit);
 }
 
 static void gd_menu_switch_vc(GtkMenuItem *item, void *opaque)

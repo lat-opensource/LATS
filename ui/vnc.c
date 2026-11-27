@@ -25,11 +25,15 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
 #include "vnc.h"
+#include "block/thread-pool.h"
+#include "exec/memory.h"
 #include "vnc-jobs.h"
 #include "trace.h"
 #include "hw/qdev-core.h"
 #include "sysemu/sysemu.h"
+#include "sysemu/iothread.h"
 #include "sysemu/runstate.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
@@ -70,6 +74,7 @@ static QTAILQ_HEAD(, VncDisplay) vnc_displays =
 
 static int vnc_cursor_define(VncState *vs);
 static void vnc_update_throttle_offset(VncState *vs);
+void trial_main_callback(unsigned kind, uintptr_t pc) __attribute__((weak));
 
 static void vnc_set_share_mode(VncState *vs, VncShareMode mode)
 {
@@ -621,6 +626,12 @@ static void framebuffer_update_request(VncState *vs, int incremental,
                                        int w, int h);
 static void vnc_refresh(DisplayChangeListener *dcl);
 static int vnc_refresh_server_surface(VncDisplay *vd);
+static void vnc_compare_cancel(VncDisplay *vd);
+static void vnc_maybe_pause_idle_refresh(VncDisplay *vd);
+static void vnc_scanout_resume(VncDisplay *vd);
+static bool vnc_scanout_direct_running(VncDisplay *vd);
+static void vnc_scanout_quiesce(VncDisplay *vd);
+static void vnc_scanout_changed(DisplayChangeListener *dcl, bool discard_frame);
 
 static int vnc_width(VncDisplay *vd)
 {
@@ -790,6 +801,7 @@ static void vnc_update_server_surface(VncDisplay *vd)
 {
     int width, height;
 
+    vnc_compare_cancel(vd);
     qemu_pixman_image_unref(vd->server);
     vd->server = NULL;
 
@@ -827,7 +839,12 @@ static void vnc_dpy_switch(DisplayChangeListener *dcl,
     bool pageflip = vnc_check_pageflip(vd->ds, surface);
     VncState *vs;
 
+    vnc_scanout_quiesce(vd);
     vnc_abort_display_jobs(vd);
+    if (dcl->refresh_paused || (vd->ds && vd->ds->scanout_can_poll)) {
+        vnc_scanout_changed(dcl, true);
+    }
+    vnc_compare_cancel(vd);
     vd->ds = surface;
 
     /* guest surface */
@@ -1066,6 +1083,7 @@ static int find_and_clear_dirty_height(VncState *vs,
  */
 static void vnc_update_throttle_offset(VncState *vs)
 {
+    size_t previous = qatomic_read(&vs->throttle_output_offset);
     size_t offset =
         vs->client_width * vs->client_height * vs->client_pf.bytes_per_pixel;
 
@@ -1095,26 +1113,34 @@ static void vnc_update_throttle_offset(VncState *vs)
      */
     offset = MAX(offset, 1024 * 1024);
 
-    if (vs->throttle_output_offset != offset) {
+    if (previous != offset) {
         trace_vnc_client_throttle_threshold(
-            vs, vs->ioc, vs->throttle_output_offset, offset, vs->client_width,
+            vs, vs->ioc, previous, offset, vs->client_width,
             vs->client_height, vs->client_pf.bytes_per_pixel, vs->audio_cap);
+        qatomic_set(&vs->throttle_output_offset, offset);
     }
-
-    vs->throttle_output_offset = offset;
 }
 
-static bool vnc_should_update(VncState *vs)
+static bool vnc_should_update(VncState *vs, bool wake_on_completion)
 {
+    if (vs->update == VNC_STATE_UPDATE_NONE) {
+        return false;
+    }
+
+    QEMU_LOCK_GUARD(&vs->output_mutex);
+
+    if (wake_on_completion && vs->job_update != VNC_STATE_UPDATE_NONE &&
+        (vs->has_dirty || vs->update == VNC_STATE_UPDATE_FORCE)) {
+        vs->job_needs_refresh = true;
+    }
+
     switch (vs->update) {
-    case VNC_STATE_UPDATE_NONE:
-        break;
     case VNC_STATE_UPDATE_INCREMENTAL:
         /* Only allow incremental updates if the pending send queue
          * is less than the permitted threshold, and the job worker
          * is completely idle.
          */
-        if (vs->output.offset < vs->throttle_output_offset &&
+        if (vs->output.offset < qatomic_read(&vs->throttle_output_offset) &&
             vs->job_update == VNC_STATE_UPDATE_NONE) {
             return true;
         }
@@ -1137,11 +1163,44 @@ static bool vnc_should_update(VncState *vs)
         trace_vnc_client_throttle_forced(
             vs, vs->ioc, vs->job_update, vs->force_update_offset);
         break;
+    default:
+        break;
     }
     return false;
 }
 
-static int vnc_update_client(VncState *vs, int has_dirty)
+static void vnc_scanout_maybe_resume(VncState *vs)
+{
+    if (vs->vd->dcl.refresh_paused && !vnc_scanout_direct_running(vs->vd) &&
+        (vs->has_dirty || vs->update == VNC_STATE_UPDATE_FORCE) &&
+        vnc_should_update(vs, true)) {
+        vnc_scanout_resume(vs->vd);
+    }
+}
+
+static bool vnc_worker_write;
+static bool vnc_io_drain_enabled;
+static IOThread *vnc_compare_thread;
+static unsigned vnc_io_drain_armed, vnc_io_drain_ready;
+static unsigned vnc_io_drain_done, vnc_io_drain_fallback;
+static bool vnc_scanout_direct_publish;
+static bool vnc_request_poll_enabled;
+static unsigned vnc_request_poll_reads;
+static unsigned vnc_worker_write_full, vnc_worker_write_partial;
+static unsigned vnc_worker_write_blocked, vnc_worker_write_skipped;
+
+static bool vnc_worker_can_write(VncState *vs)
+{
+    return vnc_worker_write && !vs->websocket && !vs->audio_cap &&
+        !vs->vd->lossy && vs->vnc_encoding == VNC_ENCODING_RAW &&
+        vs->auth == VNC_AUTH_NONE && vs->sioc &&
+        vs->ioc == QIO_CHANNEL(vs->sioc) &&
+        vs->sioc->localAddr.ss_family == AF_UNIX &&
+        (vs->share_mode == VNC_SHARE_MODE_SHARED ||
+         vs->share_mode == VNC_SHARE_MODE_EXCLUSIVE);
+}
+
+static int vnc_queue_client_update(VncState *vs, bool has_dirty, bool scanout)
 {
     VncDisplay *vd = vs->vd;
     VncJob *job;
@@ -1149,13 +1208,8 @@ static int vnc_update_client(VncState *vs, int has_dirty)
     int height, width;
     int n = 0;
 
-    if (vs->disconnecting) {
-        vnc_disconnect_finish(vs);
-        return 0;
-    }
-
-    vs->has_dirty += has_dirty;
-    if (!vnc_should_update(vs)) {
+    vs->has_dirty = vs->has_dirty || has_dirty;
+    if (!vnc_should_update(vs, !scanout)) {
         return 0;
     }
 
@@ -1169,7 +1223,7 @@ static int vnc_update_client(VncState *vs, int has_dirty)
      * happening in parallel don't disturb us, the next pass will
      * send them to the client.
      */
-    job = vnc_job_new(vs);
+    job = vnc_job_new(vs, scanout || vnc_worker_can_write(vs));
 
     height = pixman_image_get_height(vd->server);
     width = pixman_image_get_width(vd->server);
@@ -1204,11 +1258,23 @@ static int vnc_update_client(VncState *vs, int has_dirty)
         }
     }
 
+    vnc_lock_output(vs);
     vs->job_update = vs->update;
+    vs->job_needs_refresh = false;
+    vnc_unlock_output(vs);
     vs->update = VNC_STATE_UPDATE_NONE;
     vnc_job_push(job);
     vs->has_dirty = 0;
     return n;
+}
+
+static int vnc_update_client(VncState *vs, int has_dirty)
+{
+    if (vs->disconnecting) {
+        vnc_disconnect_finish(vs);
+        return 0;
+    }
+    return vnc_queue_client_update(vs, has_dirty, false);
 }
 
 /* audio */
@@ -1273,6 +1339,8 @@ static void audio_add(VncState *vs)
         return;
     }
 
+    vnc_scanout_resume(vs->vd);
+    vnc_scanout_quiesce(vs->vd);
     ops.notify = audio_capture_notify;
     ops.destroy = audio_capture_destroy;
     ops.capture = audio_capture;
@@ -1291,19 +1359,60 @@ static void audio_del(VncState *vs)
     }
 }
 
+/* Caller holds socket_mutex and removes the handler before close. */
+static void vnc_io_drain_disarm(VncState *vs)
+{
+    if (qatomic_read(&vs->drain_fd) >= 0) {
+        qatomic_set(&vs->drain_fd, -1);
+        qio_channel_set_aio_fd_handler(QIO_CHANNEL(vs->sioc),
+                                       vs->drain_context, NULL, NULL, NULL);
+    }
+}
+
+static void vnc_io_drain_signal(void *opaque)
+{
+    qemu_sem_post(opaque);
+}
+
+static void vnc_io_drain_join(VncState *vs)
+{
+    AioContext *context;
+    QemuSemaphore done;
+
+    WITH_QEMU_LOCK_GUARD(&vs->socket_mutex) {
+        context = vs->drain_used ? vs->drain_context : NULL;
+    }
+    if (!context) {
+        return;
+    }
+
+    /*
+     * A callback that already passed AIO's deleted check may still run.
+     * Wait on the owning thread with neither the socket nor output lock.
+     */
+    qemu_sem_init(&done, 0);
+    aio_bh_schedule_oneshot(context, vnc_io_drain_signal, &done);
+    qemu_sem_wait(&done);
+    qemu_sem_destroy(&done);
+}
+
 static void vnc_disconnect_start(VncState *vs)
 {
     if (vs->disconnecting) {
         return;
     }
+    vnc_scanout_resume(vs->vd);
     trace_vnc_client_disconnect_start(vs, vs->ioc);
     vnc_set_share_mode(vs, VNC_SHARE_MODE_DISCONNECTED);
     if (vs->ioc_tag) {
         g_source_remove(vs->ioc_tag);
         vs->ioc_tag = 0;
     }
+    qemu_mutex_lock(&vs->socket_mutex);
+    vnc_io_drain_disarm(vs);
     qio_channel_close(vs->ioc, NULL);
     vs->disconnecting = TRUE;
+    qemu_mutex_unlock(&vs->socket_mutex);
 }
 
 void vnc_disconnect_finish(VncState *vs)
@@ -1312,7 +1421,9 @@ void vnc_disconnect_finish(VncState *vs)
 
     trace_vnc_client_disconnect_finish(vs, vs->ioc);
 
+    vnc_scanout_quiesce(vs->vd);
     vnc_jobs_join(vs); /* Wait encoding jobs */
+    vnc_io_drain_join(vs);
 
     vnc_lock_output(vs);
     vnc_qmp_event(vs, QAPI_EVENT_VNC_DISCONNECTED);
@@ -1339,6 +1450,7 @@ void vnc_disconnect_finish(VncState *vs)
     if (QTAILQ_EMPTY(&vs->vd->clients)) {
         /* last client gone */
         vnc_update_server_surface(vs->vd);
+        vnc_maybe_pause_idle_refresh(vs->vd);
     }
     vnc_unlock_output(vs);
 
@@ -1346,6 +1458,7 @@ void vnc_disconnect_finish(VncState *vs)
         qemu_clipboard_peer_unregister(&vs->cbpeer);
     }
 
+    qemu_mutex_destroy(&vs->socket_mutex);
     qemu_mutex_destroy(&vs->output_mutex);
     if (vs->bh != NULL) {
         qemu_bh_delete(vs->bh);
@@ -1428,9 +1541,31 @@ size_t vnc_client_write_buf(VncState *vs, const uint8_t *data, size_t datalen)
  * the buffered output data if the socket would block.  Returns
  * 0 on I/O error, and disconnects the client socket.
  */
-static size_t vnc_client_write_plain(VncState *vs)
+static bool vnc_job_keep_read_watch;
+static unsigned long long vnc_job_direct, vnc_job_drained, vnc_job_partial;
+
+static void vnc_output_advance(VncState *vs, size_t written)
 {
-    size_t offset;
+    size_t offset = vs->output.offset;
+    size_t threshold = qatomic_read(&vs->throttle_output_offset);
+
+    if (written >= vs->force_update_offset) {
+        if (vs->force_update_offset != 0) {
+            trace_vnc_client_unthrottle_forced(vs, vs->ioc);
+        }
+        vs->force_update_offset = 0;
+    } else {
+        vs->force_update_offset -= written;
+    }
+
+    buffer_advance(&vs->output, written);
+    if (offset >= threshold && vs->output.offset < threshold) {
+        trace_vnc_client_unthrottle_incremental(vs, vs->ioc, vs->output.offset);
+    }
+}
+
+static size_t vnc_client_write_plain(VncState *vs, bool reset_watch)
+{
     size_t ret;
 
 #ifdef CONFIG_VNC_SASL
@@ -1450,22 +1585,9 @@ static size_t vnc_client_write_plain(VncState *vs)
     if (!ret)
         return 0;
 
-    if (ret >= vs->force_update_offset) {
-        if (vs->force_update_offset != 0) {
-            trace_vnc_client_unthrottle_forced(vs, vs->ioc);
-        }
-        vs->force_update_offset = 0;
-    } else {
-        vs->force_update_offset -= ret;
-    }
-    offset = vs->output.offset;
-    buffer_advance(&vs->output, ret);
-    if (offset >= vs->throttle_output_offset &&
-        vs->output.offset < vs->throttle_output_offset) {
-        trace_vnc_client_unthrottle_incremental(vs, vs->ioc, vs->output.offset);
-    }
+    vnc_output_advance(vs, ret);
 
-    if (vs->output.offset == 0) {
+    if (reset_watch && vs->output.offset == 0) {
         if (vs->ioc_tag) {
             g_source_remove(vs->ioc_tag);
         }
@@ -1473,7 +1595,6 @@ static size_t vnc_client_write_plain(VncState *vs)
             vs->ioc, G_IO_IN | G_IO_HUP | G_IO_ERR,
             vnc_client_io, vs, NULL);
     }
-
     return ret;
 }
 
@@ -1485,6 +1606,10 @@ static size_t vnc_client_write_plain(VncState *vs)
  */
 static void vnc_client_write_locked(VncState *vs)
 {
+    if (qatomic_read(&vs->drain_fd) >= 0) {
+        return;
+    }
+
 #ifdef CONFIG_VNC_SASL
     if (vs->sasl.conn &&
         vs->sasl.runSSF &&
@@ -1493,8 +1618,147 @@ static void vnc_client_write_locked(VncState *vs)
     } else
 #endif /* CONFIG_VNC_SASL */
     {
-        vnc_client_write_plain(vs);
+        vnc_client_write_plain(vs, true);
     }
+}
+
+/*
+ * Called after an encoding job has filled a previously empty output buffer.
+ * A direct socket can try writing without removing its current read watch.
+ * Returns true if this function already attempted the write.
+ */
+bool vnc_job_output_ready_locked(VncState *vs)
+{
+    bool direct = vnc_job_keep_read_watch && vs->ioc_tag && vs->sioc &&
+        vs->ioc == QIO_CHANNEL(vs->sioc) && !vs->websocket &&
+        !vs->abort && !vs->disconnecting;
+
+#ifdef CONFIG_VNC_SASL
+    direct = direct && !(vs->sasl.conn && vs->sasl.runSSF);
+#endif
+    if (direct) {
+        ++vnc_job_direct;
+        vnc_client_write_plain(vs, false);
+        if (!vs->output.offset) {
+            ++vnc_job_drained;
+            return true;
+        }
+        if (vs->disconnecting) {
+            return true;
+        }
+        ++vnc_job_partial;
+    }
+
+    if (vs->ioc_tag) {
+        g_source_remove(vs->ioc_tag);
+    }
+    if (!vs->disconnecting) {
+        vs->ioc_tag = qio_channel_add_watch(
+            vs->ioc, G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_OUT,
+            vnc_client_io, vs, NULL);
+    }
+    return direct;
+}
+
+static void vnc_io_drain_write(void *opaque)
+{
+    VncState *vs = opaque;
+    ssize_t written;
+
+    QEMU_LOCK_GUARD(&vs->output_mutex);
+    QEMU_LOCK_GUARD(&vs->socket_mutex);
+    if (qatomic_read(&vs->drain_fd) < 0) {
+        return;
+    }
+    if (!vs->output.offset) {
+        vnc_io_drain_disarm(vs);
+        return;
+    }
+
+    qatomic_inc(&vnc_io_drain_ready);
+    written = qio_channel_write(vs->ioc, (const char *)vs->output.buffer,
+                                vs->output.offset, NULL);
+    if (written == QIO_CHANNEL_ERR_BLOCK) {
+        return;
+    }
+    if (written > 0) {
+        vnc_output_advance(vs, written);
+        if (!vs->output.offset) {
+            vnc_io_drain_disarm(vs);
+            qatomic_inc(&vnc_io_drain_done);
+        }
+    } else {
+        vnc_io_drain_disarm(vs);
+        vs->worker_write_pending = true;
+        qatomic_inc(&vnc_io_drain_fallback);
+        qemu_bh_schedule(vs->bh);
+    }
+}
+
+/*
+ * The queued job pins the established direct socket's VncState. The output
+ * lock serializes against other messages, and the socket lock against close.
+ * Regular errors and display refresh requests still use the main thread.
+ */
+bool vnc_job_write_from_worker_locked(VncState *vs)
+{
+    ssize_t written = 0;
+    bool draining;
+
+    if (vs->abort || !vs->jobs_buffer.offset || vs->worker_write_pending) {
+        return false;
+    }
+
+    QEMU_LOCK_GUARD(&vs->socket_mutex);
+    if (vs->disconnecting) {
+        return false;
+    }
+    draining = qatomic_read(&vs->drain_fd) >= 0;
+    if (vs->output.offset && !draining) {
+        return false;
+    }
+    if (!draining) {
+        written = qio_channel_write(vs->ioc,
+                                    (const char *)vs->jobs_buffer.buffer,
+                                    vs->jobs_buffer.offset, NULL);
+        if (written > 0) {
+            buffer_advance(&vs->jobs_buffer, written);
+        } else {
+            qatomic_inc(&vnc_worker_write_blocked);
+            if (written != QIO_CHANNEL_ERR_BLOCK || !vs->drain_context) {
+                return false;
+            }
+        }
+    }
+    if (vs->jobs_buffer.offset) {
+        /* Other producers must append after the partially sent frame. */
+        buffer_move(&vs->output, &vs->jobs_buffer);
+        if (vs->job_update == VNC_STATE_UPDATE_FORCE) {
+            vs->force_update_offset = vs->output.offset;
+        }
+        if (written > 0) {
+            qatomic_inc(&vnc_worker_write_partial);
+        }
+        if (!draining && vs->drain_context) {
+            qatomic_set(&vs->drain_fd, vs->sioc->fd);
+            vs->drain_used = true;
+            qio_channel_set_aio_fd_handler(vs->ioc, vs->drain_context, NULL,
+                                           vnc_io_drain_write, vs);
+            qatomic_inc(&vnc_io_drain_armed);
+        } else if (!draining) {
+            vs->worker_write_pending = true;
+        }
+    } else {
+        /* Make the drained buffer available to the next encoding job. */
+        buffer_move_empty(&vs->output, &vs->jobs_buffer);
+        qatomic_inc(&vnc_worker_write_full);
+    }
+    vs->job_update = VNC_STATE_UPDATE_NONE;
+    if (vs->worker_write_pending || vs->job_needs_refresh) {
+        return false;
+    }
+    qatomic_inc(&vnc_worker_write_skipped);
+    return true;
 }
 
 static void vnc_client_write(VncState *vs)
@@ -1574,6 +1838,7 @@ static void vnc_jobs_bh(void *opaque)
 
     assert(vs->magic == VNC_MAGIC);
     vnc_jobs_consume_buffer(vs);
+    vnc_scanout_maybe_resume(vs);
 }
 
 /*
@@ -1638,7 +1903,11 @@ gboolean vnc_client_io(QIOChannel *ioc G_GNUC_UNUSED,
         }
     }
     if (condition & G_IO_OUT) {
+        if (trial_main_callback) {
+            trial_main_callback(5, (uintptr_t)vnc_client_write);
+        }
         vnc_client_write(vs);
+        vnc_scanout_maybe_resume(vs);
     }
 
     if (vs->disconnecting) {
@@ -2069,16 +2338,37 @@ static void ext_key_event(VncState *vs, int down,
 static void framebuffer_update_request(VncState *vs, int incremental,
                                        int x, int y, int w, int h)
 {
+    VncDisplay *vd = vs->vd;
+    bool direct = vnc_scanout_direct_running(vd);
+    bool refresh;
+
+    if (trial_main_callback) {
+        trial_main_callback(4, (uintptr_t)framebuffer_update_request);
+    }
+
+    /* Send resize notification before queuing an answer to this request. */
+    if (direct && !incremental && vnc_has_feature(vs, VNC_FEATURE_RESIZE_EXT)) {
+        vnc_desktop_resize_ext(vs, 0);
+    }
+    if (direct) {
+        qemu_mutex_lock(&vd->scanout_lock);
+    }
     if (incremental) {
         if (vs->update != VNC_STATE_UPDATE_FORCE) {
             vs->update = VNC_STATE_UPDATE_INCREMENTAL;
         }
     } else {
         vs->update = VNC_STATE_UPDATE_FORCE;
-        vnc_set_area_dirty(vs->dirty, vs->vd, x, y, w, h);
-        if (vnc_has_feature(vs, VNC_FEATURE_RESIZE_EXT)) {
+        vnc_set_area_dirty(vs->dirty, vd, x, y, w, h);
+        if (!direct && vnc_has_feature(vs, VNC_FEATURE_RESIZE_EXT)) {
             vnc_desktop_resize_ext(vs, 0);
         }
+    }
+    refresh = !incremental || vs->has_dirty;
+    if (direct) {
+        qemu_mutex_unlock(&vd->scanout_lock);
+    } else if (refresh) {
+        vnc_scanout_resume(vd);
     }
 }
 
@@ -2380,6 +2670,10 @@ static int protocol_client_msg(VncState *vs, uint8_t *data, size_t len)
         if (len == 1)
             return 20;
 
+        if (vnc_scanout_direct_running(vd)) {
+            vnc_scanout_quiesce(vd);
+            vnc_jobs_join(vs);
+        }
         set_pixel_format(vs, read_u8(data, 4),
                          read_u8(data, 6), read_u8(data, 7),
                          read_u16(data, 8), read_u16(data, 10),
@@ -2402,7 +2696,12 @@ static int protocol_client_msg(VncState *vs, uint8_t *data, size_t len)
             memcpy(data + 4 + (i * 4), &val, sizeof(val));
         }
 
+        if (vnc_scanout_direct_running(vd)) {
+            vnc_scanout_quiesce(vd);
+            vnc_jobs_join(vs);
+        }
         set_encodings(vs, (int32_t *)(data + 4), limit);
+        vnc_scanout_resume(vd);
         break;
     case VNC_MSG_CLIENT_FRAMEBUFFER_UPDATE_REQUEST:
         if (len == 1)
@@ -2963,13 +3262,17 @@ static int vnc_refresh_lossy_rect(VncDisplay *vd, int x, int y)
 
     QTAILQ_FOREACH(vs, &vd->clients, next) {
         int j;
+        bool pending;
 
-        /* kernel send buffers are full -> refresh later */
-        if (vs->output.offset) {
+        if (!vs->lossy_rect[sty][stx]) {
             continue;
         }
 
-        if (!vs->lossy_rect[sty][stx]) {
+        /* kernel send buffers are full -> refresh later */
+        vnc_lock_output(vs);
+        pending = vs->output.offset;
+        vnc_unlock_output(vs);
+        if (pending) {
             continue;
         }
 
@@ -3078,7 +3381,7 @@ static void vnc_rect_updated(VncDisplay *vd, int x, int y, struct timeval * tv)
     rect->updated = true;
 }
 
-static int vnc_refresh_server_surface(VncDisplay *vd)
+static int vnc_refresh_shadow(VncDisplay *vd)
 {
     int width = MIN(pixman_image_get_width(vd->guest.fb),
                     pixman_image_get_width(vd->server));
@@ -3095,6 +3398,7 @@ static int vnc_refresh_server_surface(VncDisplay *vd)
 
     struct timeval tv = { 0, 0 };
 
+    vd->scanout_refresh_pending = false;
     if (!vd->non_adaptive) {
         gettimeofday(&tv, NULL);
         has_dirty = vnc_update_stats(vd, &tv);
@@ -3181,30 +3485,732 @@ static int vnc_refresh_server_surface(VncDisplay *vd)
     return has_dirty;
 }
 
+/* One scan can be in flight per display. The worker owns the detached dirty
+ * map and back image. The main loop retains all changes arriving meanwhile.
+ * A surface switch cancels publication and marks the new surface dirty.
+ */
+struct VncCompare {
+    VncDisplay *vd;
+    MemoryRegion *ram;
+    const uint8_t *guest;
+    int guest_stride;
+    pixman_format_code_t source_format;
+    pixman_image_t *front;
+    pixman_image_t *back;
+    int width, height;
+    bool running, stale, retry_sync;
+    bool worker_done;
+    int worker_result;
+    int changes;
+    QEMUTimer *scanout_timer;
+    bool scanout;
+    bool direct_publish;
+    bool scanout_stop;
+    DECLARE_BITMAP(dirty[VNC_MAX_HEIGHT], VNC_DIRTY_BITS);
+};
+
+static void vnc_compare_free(VncCompare *job)
+{
+    qemu_pixman_image_unref(job->front);
+    qemu_pixman_image_unref(job->back);
+    assert(!job->running && !job->ram);
+    timer_free(job->scanout_timer);
+    g_free(job);
+}
+
+static void vnc_scanout_resume(VncDisplay *vd)
+{
+    VncCompare *job = vd->compare;
+
+    if (vd->dcl.refresh_paused) {
+        if (job && job->running && job->scanout) {
+            qatomic_set(&job->scanout_stop, true);
+        }
+        displaychangelistener_pause_refresh(&vd->dcl, false);
+    }
+}
+
+static bool vnc_scanout_direct_running(VncDisplay *vd)
+{
+    VncCompare *job = vd->compare;
+
+    return job && job->running && job->direct_publish;
+}
+
+/*
+ * Output callbacks can request revocation without holding scanout_lock.
+ * Drain publication before changing the surface or client state and before
+ * joining the encoder. The encoder does not take scanout_lock.
+ */
+static void vnc_scanout_quiesce(VncDisplay *vd)
+{
+    if (vnc_scanout_direct_running(vd)) {
+        vnc_scanout_resume(vd);
+        qemu_mutex_lock(&vd->scanout_lock);
+        vd->request_poll_client = NULL;
+        vd->request_poll_job = NULL;
+        qemu_mutex_unlock(&vd->scanout_lock);
+    }
+}
+
+#ifndef _WIN32
+void *trial_vnc_request_poll_begin(int *fd);
+bool trial_vnc_request_poll_read(void *opaque, int fd);
+
+void *trial_vnc_request_poll_begin(int *fd)
+{
+    VncDisplay *vd;
+
+    if (!vnc_request_poll_enabled) {
+        return NULL;
+    }
+    /* The main loop holds the BQL while selecting its GLib source. */
+    QTAILQ_FOREACH(vd, &vnc_displays, next) {
+        VncState *vs = vd->request_poll_client;
+        if (vs && !qatomic_read(&vd->request_poll_job->scanout_stop) &&
+            !vs->disconnecting && vs->ioc_tag && !vs->input.offset &&
+            vs->read_handler == protocol_client_msg &&
+            vs->read_handler_expect == 1) {
+            *fd = vs->sioc->fd;
+            return vd;
+        }
+    }
+    return NULL;
+}
+
+bool trial_vnc_request_poll_read(void *opaque, int fd)
+{
+    VncDisplay *vd = opaque;
+    VncState *vs;
+    uint8_t request[10];
+    ssize_t n;
+
+    QEMU_LOCK_GUARD(&vd->scanout_lock);
+    vs = vd->request_poll_client;
+    if (!vs || qatomic_read(&vd->request_poll_job->scanout_stop) ||
+        qatomic_read(&global_dirty_tracking) || vs->input.offset) {
+        return false;
+    }
+
+    /*
+     * The main loop still owns GLib dispatch, so there is only one reader.
+     * The socket lock excludes close between the peek and the actual read.
+     */
+    WITH_QEMU_LOCK_GUARD(&vs->socket_mutex) {
+        if (vs->disconnecting || vs->sioc->fd != fd) {
+            return false;
+        }
+        n = recv(fd, request, sizeof(request), MSG_PEEK | MSG_DONTWAIT);
+        if (n != (ssize_t)sizeof(request) ||
+            request[0] != VNC_MSG_CLIENT_FRAMEBUFFER_UPDATE_REQUEST ||
+            request[1] != 1) {
+            return false;
+        }
+        n = recv(fd, request, sizeof(request), MSG_DONTWAIT);
+    }
+
+    if (n != (ssize_t)sizeof(request)) {
+        /* Retain any bytes already consumed for the ordinary parser. */
+        if (n > 0) {
+            buffer_reserve(&vs->input, n);
+            buffer_append(&vs->input, request, n);
+        }
+        return false;
+    }
+
+    /* The ordinary incremental path preserves pending forced requests. */
+    if (vs->update != VNC_STATE_UPDATE_FORCE) {
+        vs->update = VNC_STATE_UPDATE_INCREMENTAL;
+    }
+    qatomic_inc(&vnc_request_poll_reads);
+    return true;
+}
+#endif
+
+static void vnc_scanout_changed(DisplayChangeListener *dcl, bool discard_frame)
+{
+    VncDisplay *vd = container_of(dcl, VncDisplay, dcl);
+
+    vnc_scanout_quiesce(vd);
+    vnc_scanout_resume(vd);
+    if (discard_frame) {
+        vd->scanout_refresh_pending = true;
+        vnc_compare_cancel(vd);
+    }
+}
+
+static void vnc_compare_cancel(VncDisplay *vd)
+{
+    VncCompare *job = vd->compare;
+    if (!job) {
+        return;
+    }
+    if (job->running) {
+        job->stale = true;
+        if (job->scanout) {
+            qatomic_set(&job->scanout_stop, true);
+        }
+        return;
+    }
+    vd->compare = NULL;
+    vnc_compare_free(job);
+}
+
+static int vnc_compare_pixels(void *opaque)
+{
+    VncCompare *job = opaque;
+    const int bits = DIV_ROUND_UP(job->width, VNC_DIRTY_PIXELS_PER_BIT);
+    const int stride = pixman_image_get_stride(job->front);
+    const uint8_t *front = (void *)pixman_image_get_data(job->front);
+    if (!job->back) {
+        job->back = pixman_image_create_bits(VNC_SERVER_FB_FORMAT,
+                                             pixman_image_get_width(job->front),
+                                             pixman_image_get_height(job->front), NULL, 0);
+        if (!job->back) {
+            return -ENOMEM;
+        }
+    }
+    uint8_t *back = (void *)pixman_image_get_data(job->back);
+    int dst_stride = pixman_image_get_stride(job->back);
+    pixman_image_t *packed = NULL;
+    if (job->source_format == PIXMAN_r8g8b8) {
+        packed = pixman_image_create_bits(job->source_format, job->width, job->height,
+                                          (uint32_t *)job->guest, job->guest_stride);
+        if (!packed) {
+            return -ENOMEM;
+        }
+    }
+    job->changes = 0;
+    for (int y = 0; y < job->height; y++) {
+        unsigned long *map = job->dirty[y];
+        const uint32_t *src = (const void *)(job->guest + (size_t)y * job->guest_stride);
+        const uint8_t *old = front + (size_t)y * stride;
+        uint8_t *new = back + (size_t)y * dst_stride;
+        int first = find_first_bit(map, bits);
+        /* The old front includes unchanged pixels and right-edge padding. */
+        if (first || find_next_zero_bit(map, bits, 0) != bits) {
+            memcpy(new, old, MIN(stride, dst_stride));
+        } else if (job->width * 4 < MIN(stride, dst_stride)) {
+            memcpy(new + job->width * 4, old + job->width * 4,
+                   MIN(stride, dst_stride) - job->width * 4);
+        }
+        while (first < bits) {
+            int end = find_next_zero_bit(map, bits, first);
+            int x = first * VNC_DIRTY_PIXELS_PER_BIT;
+            int xmax = MIN(end * VNC_DIRTY_PIXELS_PER_BIT, job->width);
+            if (packed) {
+                pixman_image_composite32(PIXMAN_OP_SRC, packed, NULL, job->back,
+                                         x, y, 0, 0, x, y, xmax - x, 1);
+            } else {
+                for (int i = x; i < xmax; i++) {
+                    ((uint32_t *)new)[i] = qatomic_read(&src[i]);
+                }
+            }
+            /* Compare exactly the sample that the encoder will receive. */
+            if (!memcmp(new + 4 * x, old + 4 * x, 4 * (xmax - x))) {
+                bitmap_clear(map, first, end - first);
+            } else {
+                for (int bit = first; bit < end; bit++) {
+                    int p = bit * VNC_DIRTY_PIXELS_PER_BIT;
+                    int n = MIN(VNC_DIRTY_PIXELS_PER_BIT, job->width - p);
+                    if (!memcmp(new + 4 * p, old + 4 * p, 4 * n)) {
+                        clear_bit(bit, map);
+                    } else {
+                        job->changes++;
+                    }
+                }
+            }
+            first = find_next_bit(map, bits, end);
+        }
+    }
+    qemu_pixman_image_unref(packed);
+    return 0;
+}
+
+static unsigned vnc_compare_submitted, vnc_compare_collected;
+static unsigned vnc_scanout_quiet, vnc_scanout_publications;
+static unsigned vnc_scanout_direct_frames;
+static bool vnc_scanout_used;
+
+void trial_vnc_compare_census(const char *phase);
+void trial_vnc_compare_census(const char *phase)
+{
+    if (vnc_job_keep_read_watch) {
+        fprintf(stderr, "VNC_JOB_WATCH %s direct=%llu drained=%llu partial=%llu\n",
+                phase, vnc_job_direct, vnc_job_drained, vnc_job_partial);
+    }
+    if (vnc_worker_write) {
+        fprintf(stderr, "VNC_WORKER_WRITE %s full=%u partial=%u blocked=%u skipped=%u\n",
+                phase, qatomic_read(&vnc_worker_write_full),
+                qatomic_read(&vnc_worker_write_partial),
+                qatomic_read(&vnc_worker_write_blocked),
+                qatomic_read(&vnc_worker_write_skipped));
+    }
+    fprintf(stderr, "VNC_COMPARE %s submitted=%u collected=%u\n",
+            phase, vnc_compare_submitted, vnc_compare_collected);
+    if (vnc_scanout_used) {
+        fprintf(stderr, "VNC_SCANOUT %s quiet=%u wake=%u\n", phase,
+                qatomic_read(&vnc_scanout_quiet),
+                qatomic_read(&vnc_scanout_publications));
+    }
+    if (vnc_scanout_direct_publish) {
+        fprintf(stderr, "VNC_SCANOUT_DIRECT %s frames=%u\n", phase,
+                qatomic_read(&vnc_scanout_direct_frames));
+    }
+    if (vnc_request_poll_enabled) {
+        fprintf(stderr, "VNC_REQUEST_POLL %s reads=%u\n", phase,
+                qatomic_read(&vnc_request_poll_reads));
+    }
+    if (vnc_io_drain_enabled) {
+        fprintf(stderr, "VNC_IO_DRAIN %s armed=%u ready=%u drained=%u fallback=%u\n",
+                phase, qatomic_read(&vnc_io_drain_armed),
+                qatomic_read(&vnc_io_drain_ready),
+                qatomic_read(&vnc_io_drain_done),
+                qatomic_read(&vnc_io_drain_fallback));
+    }
+}
+
+static void vnc_compare_finish(VncCompare *job, int ret)
+{
+    VncDisplay *vd = job->vd;
+    if (vd->request_poll_job == job) {
+        QEMU_LOCK_GUARD(&vd->scanout_lock);
+        vd->request_poll_client = NULL;
+        vd->request_poll_job = NULL;
+    }
+
+    job->running = false;
+    memory_region_unref(job->ram);
+    job->ram = NULL;
+    if (ret < 0 && !job->stale) {
+        /* Allocation can fail before the worker consumes any bits. */
+        for (int y = 0; y < job->height; y++) {
+            bitmap_or(vd->guest.dirty[y], vd->guest.dirty[y], job->dirty[y],
+                      VNC_DIRTY_BITS);
+        }
+        job->retry_sync = true;
+    }
+    if (job->stale) {
+        vd->compare = NULL;
+        vnc_compare_free(job);
+    }
+}
+
+static void vnc_compare_done(void *opaque, int ret)
+{
+    VncCompare *job = opaque;
+    VncDisplay *vd = job->vd;
+
+    if (ret < 0) {
+        vnc_scanout_resume(vd);
+    }
+    vnc_compare_finish(job, ret);
+    if (!QTAILQ_EMPTY(&vd->clients)) {
+        update_displaychangelistener(&vd->dcl, VNC_REFRESH_INTERVAL_BASE);
+    }
+}
+
+static bool vnc_scanout_publish_direct(VncCompare *job)
+{
+    VncDisplay *vd = job->vd;
+    VncState *vs;
+    int bits = DIV_ROUND_UP(job->width, VNC_DIRTY_PIXELS_PER_BIT);
+    uint8_t *front = (void *)pixman_image_get_data(job->front);
+    const uint8_t *back = (const void *)pixman_image_get_data(job->back);
+    int front_stride = pixman_image_get_stride(job->front);
+    int back_stride = pixman_image_get_stride(job->back);
+
+    QEMU_LOCK_GUARD(&vd->mutex);
+    QEMU_LOCK_GUARD(&vd->scanout_lock);
+    if (qatomic_read(&job->scanout_stop) ||
+        qatomic_read(&global_dirty_tracking)) {
+        return false;
+    }
+
+    /* Preserve the image pointer used by the main thread's RFB input. */
+    if (job->changes) {
+        for (int y = 0; y < job->height; y++) {
+            unsigned long *map = job->dirty[y];
+            int first = find_first_bit(map, bits);
+
+            if (first == bits) {
+                continue;
+            }
+            while (first < bits) {
+                int end = find_next_zero_bit(map, bits, first);
+                int x = first * VNC_DIRTY_PIXELS_PER_BIT;
+                int right = MIN(end * VNC_DIRTY_PIXELS_PER_BIT, job->width);
+
+                memcpy(front + y * front_stride + 4 * x,
+                       back + y * back_stride + 4 * x, 4 * (right - x));
+                first = find_next_bit(map, bits, end);
+            }
+            QTAILQ_FOREACH(vs, &vd->clients, next) {
+                bitmap_or(vs->dirty[y], vs->dirty[y], map, VNC_DIRTY_BITS);
+            }
+        }
+    }
+    QTAILQ_FOREACH(vs, &vd->clients, next) {
+        if (vnc_queue_client_update(vs, job->changes != 0, true)) {
+            qatomic_inc(&vnc_scanout_direct_frames);
+        }
+    }
+    return true;
+}
+
+static void vnc_compare_run(void *opaque)
+{
+    VncCompare *job = opaque;
+    QEMUBH *ready = NULL;
+
+    if (job->scanout) {
+        int bits = DIV_ROUND_UP(job->width, VNC_DIRTY_PIXELS_PER_BIT);
+
+        /* This scanout runs without VGA dirty tracking. */
+        for (int y = 0; y < job->height; y++) {
+            bitmap_set(job->dirty[y], 0, bits);
+        }
+        ready = job->vd->scanout_ready;
+    }
+    job->worker_result = vnc_compare_pixels(job);
+    if (ready && !job->worker_result &&
+        (job->direct_publish ? vnc_scanout_publish_direct(job) :
+         (!job->changes && !qatomic_read(&job->scanout_stop) &&
+          !qatomic_read(&global_dirty_tracking)))) {
+        if (!job->changes) {
+            qatomic_inc(&vnc_scanout_quiet);
+        }
+        timer_mod(job->scanout_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                  VNC_REFRESH_INTERVAL_BASE);
+        return;
+    }
+    qatomic_store_release(&job->worker_done, true);
+    if (ready) {
+        qatomic_inc(&vnc_scanout_publications);
+        qemu_bh_schedule(ready);
+    }
+}
+
+static void vnc_scanout_publish(void *opaque)
+{
+    VncDisplay *vd = opaque;
+    VncCompare *job = vd->compare;
+
+    if (job && job->running && job->scanout &&
+        qatomic_load_acquire(&job->worker_done)) {
+        vnc_refresh(&vd->dcl);
+    }
+}
+
+static void vnc_compare_exit(Notifier *notifier, void *opaque)
+{
+    VncDisplay *vd;
+    bool use_lifecycle = lats_nobql_enabled() && !qemu_mutex_iothread_locked();
+    bool take_bql = !use_lifecycle && !qemu_mutex_iothread_locked();
+
+    if (use_lifecycle) {
+        qemu_vm_lifecycle_lock();
+    } else if (take_bql) {
+        qemu_mutex_lock_iothread();
+    }
+    if (vnc_io_drain_enabled) {
+        QTAILQ_FOREACH(vd, &vnc_displays, next) {
+            VncState *vs;
+            QTAILQ_FOREACH(vs, &vd->clients, next) {
+                QEMU_LOCK_GUARD(&vs->socket_mutex);
+                vnc_io_drain_disarm(vs);
+                vs->drain_context = NULL;
+            }
+        }
+    }
+    iothread_stop(vnc_compare_thread);
+    QTAILQ_FOREACH(vd, &vnc_displays, next) {
+        VncCompare *job = vd->compare;
+        if (job && job->running) {
+            job->stale = true;
+            if (!qatomic_load_acquire(&job->worker_done)) {
+                g_assert(job->scanout);
+                timer_del(job->scanout_timer);
+                vnc_compare_finish(job, -ECANCELED);
+            } else {
+                vnc_compare_finish(job, job->worker_result);
+            }
+        }
+        vnc_compare_cancel(vd);
+        if (vd->scanout_ready) {
+            qemu_bh_delete(vd->scanout_ready);
+            vd->scanout_ready = NULL;
+        }
+    }
+    iothread_destroy(vnc_compare_thread);
+    vnc_compare_thread = NULL;
+    if (use_lifecycle) {
+        qemu_vm_lifecycle_unlock();
+    } else if (take_bql) {
+        qemu_mutex_unlock_iothread();
+    }
+}
+
+static void vnc_compare_submit(VncCompare *job)
+{
+    static bool initialized;
+    static Notifier exit = { .notify = vnc_compare_exit };
+
+    if (!initialized) {
+        initialized = true;
+        if (lats_nobql_enabled()) {
+            Error *err = NULL;
+
+            vnc_compare_thread = iothread_create("vnc-compare", &err);
+            if (vnc_compare_thread) {
+                qemu_add_exit_notifier(&exit);
+            } else {
+                error_report_err(err);
+            }
+        }
+    }
+    if (vnc_compare_thread) {
+        qatomic_set(&job->worker_done, false);
+        ++vnc_compare_submitted;
+        if (job->scanout) {
+            timer_mod(job->scanout_timer,
+                      qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      VNC_REFRESH_INTERVAL_BASE);
+        } else {
+            aio_bh_schedule_oneshot(iothread_get_aio_context(vnc_compare_thread),
+                                    vnc_compare_run, job);
+        }
+    } else {
+        thread_pool_submit_aio(vnc_compare_pixels, job, vnc_compare_done, job);
+    }
+}
+
+static bool vnc_scanout_allowed(VncDisplay *vd)
+{
+    VncState *vs;
+
+    if (!vnc_compare_thread || !vd->ds->scanout_can_poll || vd->lossy) {
+        return false;
+    }
+    QTAILQ_FOREACH(vs, &vd->clients, next) {
+        if (vs->vnc_encoding != VNC_ENCODING_RAW || !vs->sioc ||
+            vs->sioc->localAddr.ss_family != AF_UNIX || vs->audio_cap ||
+            vs->ioc != QIO_CHANNEL(vs->sioc) || vs->auth != VNC_AUTH_NONE ||
+            (vs->share_mode != VNC_SHARE_MODE_SHARED &&
+             vs->share_mode != VNC_SHARE_MODE_EXCLUSIVE)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int vnc_refresh_server_surface(VncDisplay *vd)
+{
+    MemoryRegion *ram = vd->ds->scanout_ram;
+    VncCompare *job = vd->compare;
+    int width = MIN(pixman_image_get_width(vd->guest.fb),
+                    pixman_image_get_width(vd->server));
+    int height = MIN(pixman_image_get_height(vd->guest.fb),
+                     pixman_image_get_height(vd->server));
+    int stride = pixman_image_get_stride(vd->guest.fb);
+    uintptr_t ptr = (uintptr_t)pixman_image_get_data(vd->guest.fb);
+    struct timeval tv = { 0 };
+    int changed = 0;
+    if (job && job->running) {
+        return 0;
+    }
+    if (job && job->retry_sync) {
+        vnc_compare_cancel(vd);
+        return vnc_refresh_shadow(vd);
+    }
+    if (vd->scanout_refresh_pending && !(job && job->front)) {
+        VncState *vs;
+
+        /* The cancelled comparison may have taken the only dirty bits. */
+        vnc_dpy_update(&vd->dcl, 0, 0, vnc_width(vd), vnc_height(vd));
+        QTAILQ_FOREACH(vs, &vd->clients, next) {
+            if (vs->update == VNC_STATE_UPDATE_FORCE) {
+                return vnc_refresh_shadow(vd);
+            }
+        }
+    }
+    int bytes = PIXMAN_FORMAT_BPP(vd->guest.format) / 8;
+    if (!ram || (vd->guest.format != VNC_SERVER_FB_FORMAT &&
+                 vd->guest.format != PIXMAN_r8g8b8) || !width || !height ||
+        ptr % 4 || stride % 4 || stride < width * bytes) {
+        return vnc_refresh_shadow(vd);
+    }
+    uintptr_t base = (uintptr_t)memory_region_get_ram_ptr(ram);
+    uint64_t size = memory_region_size(ram);
+    if (ptr < base || ptr - base >= size ||
+        (uint64_t)height * stride > size - (ptr - base)) {
+        return vnc_refresh_shadow(vd);
+    }
+    if (!vd->non_adaptive) {
+        gettimeofday(&tv, NULL);
+        changed = vnc_update_stats(vd, &tv);
+    }
+    if (job && job->front) {
+        assert(!job->stale && vd->server == job->front);
+        vd->scanout_refresh_pending = false;
+        if (job->changes) {
+            /* The display mutex excludes encoding jobs during the swap. */
+            vd->server = job->back;
+            job->back = job->front;
+            int bits = DIV_ROUND_UP(width, VNC_DIRTY_PIXELS_PER_BIT);
+            for (int y = 0; y < height; y++) {
+                unsigned long *map = job->dirty[y];
+                int x = find_first_bit(map, bits);
+                if (x == bits) {
+                    continue;
+                }
+                VncState *vs;
+                QTAILQ_FOREACH(vs, &vd->clients, next) {
+                    bitmap_or(vs->dirty[y], vs->dirty[y], map, VNC_DIRTY_BITS);
+                }
+                if (!vd->non_adaptive) {
+                    while (x < bits) {
+                        int px = x * VNC_DIRTY_PIXELS_PER_BIT;
+                        vnc_rect_updated(vd, px, y, &tv);
+                        int next = ((px / VNC_STAT_RECT) + 1) * VNC_STAT_RECT;
+                        x = find_next_bit(map, bits,
+                                          MIN(bits, next / VNC_DIRTY_PIXELS_PER_BIT));
+                    }
+                }
+            }
+            changed += job->changes;
+        }
+        pixman_image_unref(job->front);
+        job->front = NULL;
+    }
+    if (bitmap_empty((unsigned long *)vd->guest.dirty,
+                     height * VNC_DIRTY_BPL(&vd->guest))) {
+        return changed;
+    }
+    if (!job) {
+        job = g_try_new0(VncCompare, 1);
+        if (!job) {
+            return vnc_refresh_shadow(vd);
+        }
+        vd->compare = job;
+        job->vd = vd;
+    }
+    job->width = width;
+    job->height = height;
+    job->guest = (const uint8_t *)ptr;
+    job->guest_stride = stride;
+    job->source_format = vd->guest.format;
+    job->front = pixman_image_ref(vd->server);
+    memory_region_ref(ram);
+    job->ram = ram;
+    memcpy(job->dirty, vd->guest.dirty, height * sizeof(job->dirty[0]));
+    memset(vd->guest.dirty, 0, height * sizeof(job->dirty[0]));
+    job->scanout = vnc_scanout_allowed(vd);
+    job->direct_publish = job->scanout && vnc_scanout_direct_publish &&
+                          vnc_worker_write;
+    if (job->direct_publish && vnc_request_poll_enabled) {
+        VncState *vs = QTAILQ_FIRST(&vd->clients);
+
+        if (vs && vs->request_poll_socket && !QTAILQ_NEXT(vs, next)) {
+            QEMU_LOCK_GUARD(&vd->scanout_lock);
+            vd->request_poll_job = job;
+            vd->request_poll_client = vs;
+        }
+    }
+    if (job->scanout) {
+        if (!vd->scanout_ready) {
+            vd->scanout_ready = qemu_bh_new(vnc_scanout_publish, vd);
+        }
+        if (!job->scanout_timer) {
+            job->scanout_timer = aio_timer_new(
+                iothread_get_aio_context(vnc_compare_thread),
+                QEMU_CLOCK_REALTIME, SCALE_MS, vnc_compare_run, job);
+        }
+        qatomic_set(&job->scanout_stop, false);
+        vnc_scanout_used = true;
+        displaychangelistener_pause_refresh(&vd->dcl, true);
+    }
+    job->running = true;
+    vnc_compare_submit(job);
+    return changed;
+}
+
+static bool vnc_idle_pause_enabled(void)
+{
+    return lats_nobql_enabled();
+}
+
+static void vnc_maybe_pause_idle_refresh(VncDisplay *vd)
+{
+    if (!vnc_idle_pause_enabled()) {
+        return;
+    }
+    if (QTAILQ_EMPTY(&vd->clients) && !(vnc_compare_thread && vd->compare)) {
+        displaychangelistener_pause_refresh(&vd->dcl, true);
+    }
+}
+
 static void vnc_refresh(DisplayChangeListener *dcl)
 {
     VncDisplay *vd = container_of(dcl, VncDisplay, dcl);
     VncState *vs, *vn;
     int has_dirty, rects = 0;
+    VncCompare *job = vd->compare;
+    bool pending = vnc_compare_thread && job && job->running;
+    bool direct;
 
+    if (pending && qatomic_load_acquire(&job->worker_done)) {
+        ++vnc_compare_collected;
+        vnc_compare_done(job, job->worker_result);
+        pending = false;
+    }
     if (QTAILQ_EMPTY(&vd->clients)) {
-        update_displaychangelistener(&vd->dcl, VNC_REFRESH_INTERVAL_MAX);
+        vnc_scanout_resume(vd);
+        vnc_compare_cancel(vd);
+        if (vnc_idle_pause_enabled() && !(vnc_compare_thread && vd->compare)) {
+            displaychangelistener_pause_refresh(&vd->dcl, true);
+        } else {
+            update_displaychangelistener(&vd->dcl,
+                vnc_compare_thread && vd->compare ?
+                VNC_REFRESH_INTERVAL_BASE : VNC_REFRESH_INTERVAL_MAX);
+        }
         return;
     }
 
     graphic_hw_update(vd->dcl.con);
 
+    if (dcl->refresh_paused && !vnc_scanout_allowed(vd)) {
+        vnc_scanout_resume(vd);
+    }
     if (vnc_trylock_display(vd)) {
+        vnc_scanout_resume(vd);
         update_displaychangelistener(&vd->dcl, VNC_REFRESH_INTERVAL_BASE);
         return;
     }
 
     has_dirty = vnc_refresh_server_surface(vd);
+    if (vnc_io_drain_enabled && vnc_compare_thread) {
+        QTAILQ_FOREACH(vs, &vd->clients, next) {
+            if (vs->request_poll_socket && !vs->drain_context) {
+                QEMU_LOCK_GUARD(&vs->socket_mutex);
+                vs->drain_context = iothread_get_aio_context(vnc_compare_thread);
+            }
+        }
+    }
+    direct = vnc_scanout_direct_running(vd);
+    if (direct && has_dirty) {
+        QTAILQ_FOREACH(vs, &vd->clients, next) {
+            vs->has_dirty = true;
+        }
+    }
     vnc_unlock_display(vd);
 
-    QTAILQ_FOREACH_SAFE(vs, &vd->clients, next, vn) {
-        rects += vnc_update_client(vs, has_dirty);
-        /* vs might be free()ed here */
+    if (!pending && !direct) {
+        QTAILQ_FOREACH_SAFE(vs, &vd->clients, next, vn) {
+            rects += vnc_update_client(vs, has_dirty);
+            /* vs might be free()ed here */
+        }
     }
 
     if (has_dirty && rects) {
@@ -3218,15 +4224,46 @@ static void vnc_refresh(DisplayChangeListener *dcl)
             vd->dcl.update_interval = VNC_REFRESH_INTERVAL_MAX;
         }
     }
+    if (vnc_compare_thread && vd->compare && vd->compare->running) {
+        vd->dcl.update_interval = VNC_REFRESH_INTERVAL_BASE;
+    }
+}
+
+static bool vnc_request_poll_socket(QIOChannelSocket *sioc)
+{
+#ifndef _WIN32
+    int type;
+    socklen_t len = sizeof(type);
+
+    if ((!vnc_request_poll_enabled && !vnc_io_drain_enabled) ||
+        sioc->localAddr.ss_family != AF_UNIX ||
+        getsockopt(sioc->fd, SOL_SOCKET, SO_TYPE, &type, &len) < 0 ||
+        type != SOCK_STREAM) {
+        return false;
+    }
+#ifdef SO_PEEK_OFF
+    int offset;
+    len = sizeof(offset);
+    if (getsockopt(sioc->fd, SOL_SOCKET, SO_PEEK_OFF, &offset, &len) < 0 ||
+        offset != -1) {
+        return false;
+    }
+#endif
+    return true;
+#else
+    return false;
+#endif
 }
 
 static void vnc_connect(VncDisplay *vd, QIOChannelSocket *sioc,
-                        bool skipauth, bool websocket)
+                        bool skipauth, bool websocket, bool accepted)
 {
     VncState *vs = g_new0(VncState, 1);
     bool first_client = QTAILQ_EMPTY(&vd->clients);
     int i;
 
+    vnc_scanout_resume(vd);
+    vnc_scanout_quiesce(vd);
     trace_vnc_client_connect(vs, sioc);
     vs->zrle = g_new0(VncZrle, 1);
     vs->tight = g_new0(VncTight, 1);
@@ -3236,6 +4273,9 @@ static void vnc_connect(VncDisplay *vd, QIOChannelSocket *sioc,
     vs->ioc = QIO_CHANNEL(sioc);
     object_ref(OBJECT(vs->ioc));
     vs->vd = vd;
+    vs->request_poll_socket =
+        accepted && !websocket && vnc_request_poll_socket(sioc);
+    vs->drain_fd = -1;
 
     buffer_init(&vs->input,          "vnc-input/%p", sioc);
     buffer_init(&vs->output,         "vnc-output/%p", sioc);
@@ -3276,6 +4316,7 @@ static void vnc_connect(VncDisplay *vd, QIOChannelSocket *sioc,
     }
 
     VNC_DEBUG("New client on socket %p\n", vs->sioc);
+    displaychangelistener_pause_refresh(&vd->dcl, false);
     update_displaychangelistener(&vd->dcl, VNC_REFRESH_INTERVAL_BASE);
     qio_channel_set_blocking(vs->ioc, false, NULL);
     if (vs->ioc_tag) {
@@ -3311,6 +4352,7 @@ static void vnc_connect(VncDisplay *vd, QIOChannelSocket *sioc,
     vs->as.endianness = 0;
 
     qemu_mutex_init(&vs->output_mutex);
+    qemu_mutex_init(&vs->socket_mutex);
     vs->bh = qemu_bh_new(vnc_jobs_bh, vs);
 
     QTAILQ_INSERT_TAIL(&vd->clients, vs, next);
@@ -3354,12 +4396,13 @@ static void vnc_listen_io(QIONetListener *listener,
     qio_channel_set_name(QIO_CHANNEL(cioc),
                          isWebsock ? "vnc-ws-server" : "vnc-server");
     qio_channel_set_delay(QIO_CHANNEL(cioc), false);
-    vnc_connect(vd, cioc, false, isWebsock);
+    vnc_connect(vd, cioc, false, isWebsock, true);
 }
 
 static const DisplayChangeListenerOps dcl_ops = {
     .dpy_name             = "vnc",
     .dpy_refresh          = vnc_refresh,
+    .dpy_scanout_changed  = vnc_scanout_changed,
     .dpy_gfx_update       = vnc_dpy_update,
     .dpy_gfx_switch       = vnc_dpy_switch,
     .dpy_gfx_check_format = qemu_pixman_check_format,
@@ -3398,10 +4441,24 @@ void vnc_display_init(const char *id, Error **errp)
     vd->connections_limit = 32;
 
     qemu_mutex_init(&vd->mutex);
+    qemu_mutex_init(&vd->scanout_lock);
+    vnc_job_keep_read_watch =
+        lats_nobql_enabled();
+    vnc_worker_write =
+        lats_nobql_enabled();
+    vnc_scanout_direct_publish =
+        lats_nobql_enabled();
+    vnc_io_drain_enabled = vnc_worker_write && vnc_scanout_direct_publish &&
+        lats_nobql_enabled();
+#ifndef _WIN32
+    vnc_request_poll_enabled =
+        lats_nobql_enabled();
+#endif
     vnc_start_worker_thread();
 
     vd->dcl.ops = &dcl_ops;
     register_displaychangelistener(&vd->dcl);
+    vnc_maybe_pause_idle_refresh(vd);
     vd->kbd = qkbd_state_init(vd->dcl.con);
 }
 
@@ -3411,6 +4468,7 @@ static void vnc_display_close(VncDisplay *vd)
     if (!vd) {
         return;
     }
+    vnc_scanout_quiesce(vd);
     vd->is_unix = false;
 
     if (vd->listener) {
@@ -3926,7 +4984,7 @@ static int vnc_display_connect(VncDisplay *vd,
         object_unref(OBJECT(sioc));
         return -1;
     }
-    vnc_connect(vd, sioc, false, false);
+    vnc_connect(vd, sioc, false, false, false);
     object_unref(OBJECT(sioc));
     return 0;
 }
@@ -4239,7 +5297,7 @@ void vnc_display_add_client(const char *id, int csock, bool skipauth)
     sioc = qio_channel_socket_new_fd(csock, NULL);
     if (sioc) {
         qio_channel_set_name(QIO_CHANNEL(sioc), "vnc-server");
-        vnc_connect(vd, sioc, skipauth, false);
+        vnc_connect(vd, sioc, skipauth, false, false);
         object_unref(OBJECT(sioc));
     }
 }

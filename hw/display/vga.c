@@ -23,8 +23,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "qemu/units.h"
+#include "exec/ramblock.h"
 #include "sysemu/reset.h"
+#include "sysemu/tcg.h"
 #include "qapi/error.h"
 #include "hw/core/cpu.h"
 #include "hw/display/vga.h"
@@ -148,6 +151,47 @@ static uint8_t expand4to8[16];
 
 static void vbe_update_vgaregs(VGACommonState *s);
 
+typedef VGACommonState VGALowmemPause;
+
+static void vga_resume_lowmem(VGALowmemPause *s)
+{
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+    --s->lowmem_paused;
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(VGALowmemPause, vga_resume_lowmem)
+
+static VGALowmemPause *vga_pause_lowmem(VGACommonState *s)
+{
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+    if (!lock) {
+        return NULL;
+    }
+    assert(qemu_mutex_iothread_locked() || lats_nobql_enabled());
+    /* Drain earlier accesses before changing mode or clearing VRAM. */
+    ++s->lowmem_paused;
+    return s;
+}
+
+bool vga_pause_remapped_crtc(void *opaque, hwaddr addr, unsigned size)
+{
+    VGACommonState *s = opaque;
+    unsigned index = VGA_CRT_IC - VGA_ATT_W;
+
+    if (s->local_ports && addr <= VGA_GFX_D - VGA_ATT_W) {
+        return vga_pause_lowmem(s);
+    }
+    return addr <= index && size > index + 1 - addr &&
+           vga_pause_lowmem(s);
+}
+
+void vga_resume_remapped_crtc(void *opaque)
+{
+    vga_resume_lowmem(opaque);
+}
+
 static inline bool vbe_enabled(VGACommonState *s)
 {
     return s->vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED;
@@ -158,23 +202,35 @@ static inline uint8_t sr(VGACommonState *s, int idx)
     return vbe_enabled(s) ? s->sr_vbe[idx] : s->sr[idx];
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+#define VGA_MEMORY_MAP_UPDATING 4
+#endif
+
+static void vga_invalidate_memory_map(VGACommonState *s)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* Called with the device writers serialized. */
+    if (qatomic_read(&s->published_memory_map) != VGA_MEMORY_MAP_UPDATING) {
+        qatomic_set_mb(&s->published_memory_map, VGA_MEMORY_MAP_UPDATING);
+    }
+#endif
+}
+
 static void vga_update_memory_access(VGACommonState *s)
 {
-    hwaddr base, offset, size;
+    hwaddr base = 0, offset = 0, size = 0;
+    bool want_chain4;
 
     if (s->legacy_address_space == NULL) {
         return;
     }
 
-    if (s->has_chain4_alias) {
-        memory_region_del_subregion(s->legacy_address_space, &s->chain4_alias);
-        object_unparent(OBJECT(&s->chain4_alias));
-        s->has_chain4_alias = false;
-        s->plane_updated = 0xf;
-    }
-    if ((sr(s, VGA_SEQ_PLANE_WRITE) & VGA_SR02_ALL_PLANES) ==
-        VGA_SR02_ALL_PLANES && sr(s, VGA_SEQ_MEMORY_MODE) & VGA_SR04_CHN_4M) {
-        offset = 0;
+    /* Stop fast reads before either edit can publish a new FlatView. */
+    vga_invalidate_memory_map(s);
+    want_chain4 = (sr(s, VGA_SEQ_PLANE_WRITE) & VGA_SR02_ALL_PLANES) ==
+                  VGA_SR02_ALL_PLANES &&
+                  (sr(s, VGA_SEQ_MEMORY_MODE) & VGA_SR04_CHN_4M);
+    if (want_chain4) {
         switch ((s->gr[VGA_GFX_MISC] >> 2) & 3) {
         case 0:
             base = 0xa0000;
@@ -196,12 +252,39 @@ static void vga_update_memory_access(VGACommonState *s)
             break;
         }
         assert(offset + size <= s->vram_size);
-        memory_region_init_alias(&s->chain4_alias, memory_region_owner(&s->vram),
-                                 "vga.chain4", &s->vram, offset, size);
-        memory_region_add_subregion_overlap(s->legacy_address_space, base,
-                                            &s->chain4_alias, 2);
-        s->has_chain4_alias = true;
     }
+
+    if (s->has_chain4_alias || want_chain4) {
+        memory_region_transaction_begin();
+        if (s->has_chain4_alias) {
+            memory_region_del_subregion(s->legacy_address_space,
+                                        &s->chain4_alias);
+            if (!s->chain4_alias_inited) {
+                object_unparent(OBJECT(&s->chain4_alias));
+            }
+            s->has_chain4_alias = false;
+            s->plane_updated = 0xf;
+        }
+        if (want_chain4) {
+            if (s->chain4_alias_inited) {
+                memory_region_set_alias_offset(&s->chain4_alias, offset);
+                memory_region_set_size(&s->chain4_alias, size);
+            } else {
+                memory_region_init_alias(&s->chain4_alias,
+                                         memory_region_owner(&s->vram),
+                                         "vga.chain4", &s->vram, offset, size);
+            }
+            memory_region_add_subregion_overlap(s->legacy_address_space, base,
+                                                &s->chain4_alias, 2);
+            s->has_chain4_alias = true;
+        }
+        memory_region_transaction_commit();
+    }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    /* Publish only after the aperture's address-space changes are committed. */
+    qatomic_store_release(&s->published_memory_map,
+                          (s->gr[VGA_GFX_MISC] >> 2) & 3);
+#endif
 }
 
 static void vga_dumb_update_retrace_info(VGACommonState *s)
@@ -337,18 +420,27 @@ static uint8_t vga_dumb_retrace(VGACommonState *s)
 
 int vga_ioport_invalid(VGACommonState *s, uint32_t addr)
 {
-    if (s->msr & VGA_MIS_COLOR) {
-        /* Color */
-        return (addr >= 0x3b0 && addr <= 0x3bf);
-    } else {
-        /* Monochrome */
-        return (addr >= 0x3d0 && addr <= 0x3df);
+    if (addr >= 0x3b0 && addr <= 0x3bf) {
+        return (s->msr & VGA_MIS_COLOR) != 0;
     }
+    if (addr >= 0x3d0 && addr <= 0x3df) {
+        return (s->msr & VGA_MIS_COLOR) == 0;
+    }
+    return 0;
 }
 
-uint32_t vga_ioport_read(void *opaque, uint32_t addr)
+static bool vga_crtc_index_port(uint32_t addr)
 {
-    VGACommonState *s = opaque;
+    return addr == VGA_CRT_IM || addr == VGA_CRT_IC;
+}
+
+static bool vga_port_remaps_memory(uint32_t addr)
+{
+    return addr == VGA_MIS_W || addr == VGA_SEQ_D || addr == VGA_GFX_D;
+}
+
+static uint32_t vga_read_port_locked(VGACommonState *s, uint32_t addr)
+{
     int val, index;
 
     if (vga_ioport_invalid(s, addr)) {
@@ -399,7 +491,7 @@ uint32_t vga_ioport_read(void *opaque, uint32_t addr)
             val = s->fcr;
             break;
         case VGA_MIS_R:
-            val = s->msr;
+            val = qatomic_read(&s->msr);
             break;
         case VGA_GFX_I:
             val = s->gr_index;
@@ -432,25 +524,68 @@ uint32_t vga_ioport_read(void *opaque, uint32_t addr)
             break;
         }
     }
+    return val;
+}
+
+uint32_t vga_ioport_read(void *opaque, uint32_t addr)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+    uint32_t val = vga_read_port_locked(s, addr);
+
     trace_vga_std_read_io(addr, val);
     return val;
+}
+
+void vga_scanout_changed(VGACommonState *s)
+{
+    if (s->scanout_notify) {
+        dpy_gfx_scanout_changed(s->con, true);
+    }
+}
+
+static bool vga_crtc_changes_scanout(uint8_t index)
+{
+    switch (index) {
+    case VGA_CRTC_H_DISP:
+    case VGA_CRTC_V_DISP_END:
+    case VGA_CRTC_OVERFLOW:
+    case VGA_CRTC_MAX_SCAN:
+    case VGA_CRTC_MODE:
+    case VGA_CRTC_OFFSET:
+    case VGA_CRTC_START_HI:
+    case VGA_CRTC_START_LO:
+    case VGA_CRTC_LINE_COMPARE:
+        return true;
+    }
+    return false;
 }
 
 void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 {
     VGACommonState *s = opaque;
+    g_autoptr(VGALowmemPause) pause = NULL;
+    g_autoptr(VGALowmemLock) port_lock =
+        vga_port_remaps_memory(addr) ? NULL : vga_lock_lowmem(s);
     int index;
 
-    /* check port range access depending on color/monochrome mode */
+    /* Check color/monochrome port decoding under the register lock. */
     if (vga_ioport_invalid(s, addr)) {
         return;
     }
     trace_vga_std_write_io(addr, val);
 
+    if (vga_port_remaps_memory(addr)) {
+        pause = vga_pause_lowmem(s);
+    }
+
     switch(addr) {
     case VGA_ATT_W:
         if (s->ar_flip_flop == 0) {
             val &= 0x3f;
+            if ((s->ar_index ^ val) & 0x20) {
+                vga_scanout_changed(s);
+            }
             s->ar_index = val;
         } else {
             index = s->ar_index & 0x1f;
@@ -459,6 +594,9 @@ void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
                 s->ar[index] = val & 0x3f;
                 break;
             case VGA_ATC_MODE:
+                if (s->ar[index] != (val & ~0x10)) {
+                    vga_scanout_changed(s);
+                }
                 s->ar[index] = val & ~0x10;
                 break;
             case VGA_ATC_OVERSCAN:
@@ -480,7 +618,10 @@ void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         s->ar_flip_flop ^= 1;
         break;
     case VGA_MIS_W:
-        s->msr = val & ~0x10;
+        if (s->msr != (val & ~0x10)) {
+            vga_scanout_changed(s);
+        }
+        qatomic_set(&s->msr, val & ~0x10);
         s->update_retrace_info(s);
         break;
     case VGA_SEQ_I:
@@ -490,6 +631,9 @@ void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 #ifdef DEBUG_VGA_REG
         printf("vga: write SR%x = 0x%02x\n", s->sr_index, val);
 #endif
+        if (s->sr[s->sr_index] != (val & sr_mask[s->sr_index])) {
+            vga_scanout_changed(s);
+        }
         s->sr[s->sr_index] = val & sr_mask[s->sr_index];
         if (s->sr_index == VGA_SEQ_CLOCK_MODE) {
             s->update_retrace_info(s);
@@ -521,6 +665,9 @@ void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
 #ifdef DEBUG_VGA_REG
         printf("vga: write GR%x = 0x%02x\n", s->gr_index, val);
 #endif
+        if (s->gr[s->gr_index] != (val & gr_mask[s->gr_index])) {
+            vga_scanout_changed(s);
+        }
         s->gr[s->gr_index] = val & gr_mask[s->gr_index];
         vbe_update_vgaregs(s);
         vga_update_memory_access(s);
@@ -539,11 +686,18 @@ void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             s->cr_index <= VGA_CRTC_OVERFLOW) {
             /* can always write bit 4 of CR7 */
             if (s->cr_index == VGA_CRTC_OVERFLOW) {
+                if ((s->cr[VGA_CRTC_OVERFLOW] ^ val) & 0x10) {
+                    vga_scanout_changed(s);
+                }
                 s->cr[VGA_CRTC_OVERFLOW] = (s->cr[VGA_CRTC_OVERFLOW] & ~0x10) |
                     (val & 0x10);
                 vbe_update_vgaregs(s);
             }
             return;
+        }
+        if (s->cr[s->cr_index] != val &&
+            vga_crtc_changes_scanout(s->cr_index)) {
+            vga_scanout_changed(s);
         }
         s->cr[s->cr_index] = val;
         vbe_update_vgaregs(s);
@@ -565,6 +719,26 @@ void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         s->fcr = val & 0x10;
         break;
     }
+}
+
+/* Keep an index and data transaction together across the legacy and PCI ports. */
+uint32_t vga_ioport_readw(void *opaque, uint32_t addr)
+{
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(opaque);
+    uint32_t lo = vga_ioport_read(opaque, addr);
+
+    return lo | (vga_ioport_read(opaque, addr + 1) << 8);
+}
+
+void vga_ioport_writew(void *opaque, uint32_t addr, uint32_t val)
+{
+    bool remaps = vga_port_remaps_memory(addr) ||
+                  vga_port_remaps_memory(addr + 1);
+    g_autoptr(VGALowmemPause) pause = remaps ? vga_pause_lowmem(opaque) : NULL;
+    g_autoptr(VGALowmemLock) lock = remaps ? NULL : vga_lock_lowmem(opaque);
+
+    vga_ioport_write(opaque, addr, val & 0xff);
+    vga_ioport_write(opaque, addr + 1, val >> 8);
 }
 
 /*
@@ -697,15 +871,8 @@ static void vbe_update_vgaregs(VGACommonState *s)
     s->cr[VGA_CRTC_MAX_SCAN] &= ~0x9f; /* no double scan */
 }
 
-static uint32_t vbe_ioport_read_index(void *opaque, uint32_t addr)
+static uint32_t vbe_read_data_locked(VGACommonState *s)
 {
-    VGACommonState *s = opaque;
-    return s->vbe_index;
-}
-
-uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
-{
-    VGACommonState *s = opaque;
     uint32_t val;
 
     if (s->vbe_index < VBE_DISPI_INDEX_NB) {
@@ -733,6 +900,23 @@ uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
     } else {
         val = 0;
     }
+    return val;
+}
+
+static uint32_t vbe_ioport_read_index(void *opaque, uint32_t addr)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+    return s->vbe_index;
+}
+
+uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+    uint32_t val = vbe_read_data_locked(s);
+
     trace_vga_vbe_read(s->vbe_index, val);
     return val;
 }
@@ -740,13 +924,13 @@ uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
 void vbe_ioport_write_index(void *opaque, uint32_t addr, uint32_t val)
 {
     VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
     s->vbe_index = val;
 }
 
-void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
+static void vbe_write_data_locked(VGACommonState *s, uint32_t val)
 {
-    VGACommonState *s = opaque;
-
     if (s->vbe_index <= VBE_DISPI_INDEX_NB) {
         trace_vga_vbe_write(s->vbe_index, val);
         switch(s->vbe_index) {
@@ -766,6 +950,9 @@ void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
         case VBE_DISPI_INDEX_VIRT_WIDTH:
         case VBE_DISPI_INDEX_X_OFFSET:
         case VBE_DISPI_INDEX_Y_OFFSET:
+            if (s->vbe_regs[s->vbe_index] != (uint16_t)val) {
+                vga_scanout_changed(s);
+            }
             s->vbe_regs[s->vbe_index] = val;
             vbe_fixup_regs(s);
             vbe_update_vgaregs(s);
@@ -777,6 +964,11 @@ void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
             vga_update_memory_access(s);
             break;
         case VBE_DISPI_INDEX_ENABLE:
+            /* Enabling VBE can clear directly mapped VRAM before remapping. */
+            if (s->vbe_regs[s->vbe_index] != (uint16_t)val) {
+                vga_scanout_changed(s);
+            }
+            vga_invalidate_memory_map(s);
             if ((val & VBE_DISPI_ENABLED) &&
                 !(s->vbe_regs[VBE_DISPI_INDEX_ENABLE] & VBE_DISPI_ENABLED)) {
 
@@ -802,6 +994,28 @@ void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
         default:
             break;
         }
+    }
+}
+
+void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemPause) pause = vga_pause_lowmem(s);
+
+    vbe_write_data_locked(s, val);
+}
+
+void vbe_write_registers(VGACommonState *s, unsigned index, uint32_t value,
+                         unsigned size)
+{
+    /* Keep the aperture paused through the index and data writes. */
+    g_autoptr(VGALowmemPause) pause = vga_pause_lowmem(s);
+
+    vbe_ioport_write_index(s, 0, index);
+    vbe_ioport_write_data(s, 0, (uint16_t)value);
+    if (size == 4) {
+        vbe_ioport_write_index(s, 0, index + 1);
+        vbe_ioport_write_data(s, 0, value >> 16);
     }
 }
 
@@ -1021,6 +1235,8 @@ typedef void vga_draw_line_func(VGACommonState *s1, uint8_t *d,
 /* return true if the palette was modified */
 static int update_palette16(VGACommonState *s)
 {
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+    g_autoptr(VGADACLock) dac = vga_lock_dac(s);
     int full_update, i;
     uint32_t v, col, *palette;
 
@@ -1048,6 +1264,8 @@ static int update_palette16(VGACommonState *s)
 /* return true if the palette was modified */
 static int update_palette256(VGACommonState *s)
 {
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+    g_autoptr(VGADACLock) dac = vga_lock_dac(s);
     int full_update, i;
     uint32_t v, col, *palette;
 
@@ -1078,6 +1296,7 @@ static void vga_get_offsets(VGACommonState *s,
                             uint32_t *pstart_addr,
                             uint32_t *pline_compare)
 {
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
     uint32_t start_addr, line_offset, line_compare;
 
     if (vbe_enabled(s)) {
@@ -1147,6 +1366,7 @@ static const uint8_t cursor_glyph[32 * 4] = {
 static void vga_get_text_resolution(VGACommonState *s, int *pwidth, int *pheight,
                                     int *pcwidth, int *pcheight)
 {
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
     int width, cwidth, height, cheight;
 
     /* total width & height */
@@ -1183,6 +1403,14 @@ static void vga_get_text_resolution(VGACommonState *s, int *pwidth, int *pheight
  * - underline
  * - flashing
  */
+static uint32_t vga_text_cursor_offset(VGACommonState *s)
+{
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+    return ((s->cr[VGA_CRTC_CURSOR_HI] << 8) | s->cr[VGA_CRTC_CURSOR_LO]) -
+           s->start_addr;
+}
+
 static void vga_draw_text(VGACommonState *s, int full_update)
 {
     DisplaySurface *surface = qemu_console_surface(s->con);
@@ -1211,11 +1439,14 @@ static void vga_draw_text(VGACommonState *s, int full_update)
         s->font_offsets[1] = offset;
         full_update = 1;
     }
-    if (s->plane_updated & (1 << 2) || s->has_chain4_alias) {
-        /* if the plane 2 was modified since the last display, it
-           indicates the font may have been modified */
-        s->plane_updated = 0;
-        full_update = 1;
+    {
+        g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+        if (s->plane_updated & (1 << 2) || s->has_chain4_alias) {
+            /* If plane 2 was modified, the font may have changed. */
+            s->plane_updated = 0;
+            full_update = 1;
+        }
     }
     full_update |= update_basic_params(s);
 
@@ -1257,8 +1488,7 @@ static void vga_draw_text(VGACommonState *s, int full_update)
         full_update |= 1;
     }
 
-    cursor_offset = ((s->cr[VGA_CRTC_CURSOR_HI] << 8) |
-                     s->cr[VGA_CRTC_CURSOR_LO]) - s->start_addr;
+    cursor_offset = vga_text_cursor_offset(s);
     if (cursor_offset != s->cursor_offset ||
         s->cr[VGA_CRTC_CURSOR_START] != s->cursor_start ||
         s->cr[VGA_CRTC_CURSOR_END] != s->cursor_end) {
@@ -1284,6 +1514,8 @@ static void vga_draw_text(VGACommonState *s, int full_update)
     line = 0;
     offset = s->start_addr * 4;
     for(cy = 0; cy < height; cy++) {
+        g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
         d1 = dest;
         src = s->vram_ptr + offset;
         cx_min = width;
@@ -1355,6 +1587,7 @@ static void vga_draw_text(VGACommonState *s, int full_update)
             src += 4;
             ch_attr_ptr++;
         }
+        g_clear_pointer(&lock, qemu_rec_mutex_unlock);
         if (cx_max != -1) {
             dpy_gfx_update(s->con, cx_min * cw, cy * cheight,
                            (cx_max - cx_min + 1) * cw, cheight);
@@ -1418,6 +1651,7 @@ static int vga_get_bpp(VGACommonState *s)
 
 static void vga_get_resolution(VGACommonState *s, int *pwidth, int *pheight)
 {
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
     int width, height;
 
     if (vbe_enabled(s)) {
@@ -1588,6 +1822,7 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
             surface = qemu_create_displaysurface_from(disp_width,
                     height, format, s->line_offset,
                     s->vram_ptr + (s->start_addr * 4));
+            surface->scanout_ram = &s->vram;
             dpy_gfx_replace_surface(s->con, surface);
         } else {
             qemu_console_resize(s->con, disp_width, height);
@@ -1648,6 +1883,22 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
         s->cursor_invalidate(s);
     }
 
+    /*
+     * With dirty tracking disabled for VRAM, every row is already reported
+     * dirty. Shared surfaces only need a single update notification. Keep
+     * the dirty bitmap synchronization and TLB work during global logging.
+     */
+    if (is_buffer_shared(surface) && tcg_enabled() && !global_dirty_tracking &&
+        memory_region_vga_dirty_tracking_disabled(&s->vram)) {
+        surface->scanout_can_poll = s->scanout_notify;
+        dpy_gfx_update(s->con, 0, 0, disp_width, height);
+        memset(s->invalidated_y_table, 0, sizeof(s->invalidated_y_table));
+        return;
+    }
+
+    /* Switching dirty tracking on does not invalidate a captured frame. */
+    dpy_gfx_scanout_changed(s->con, false);
+
 #if 0
     printf("w=%d h=%d v=%d line_offset=%d cr[0x09]=0x%02x cr[0x17]=0x%02x linecmp=%d sr[0x01]=0x%02x\n",
            width, height, v, line_offset, s->cr[9], s->cr[VGA_CRTC_MODE],
@@ -1702,7 +1953,11 @@ static void vga_draw_graphic(VGACommonState *s, int full_update)
             if (y_start < 0)
                 y_start = y;
             if (!(is_buffer_shared(surface))) {
-                vga_draw_line(s, d, addr, width);
+                {
+                    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+                    vga_draw_line(s, d, addr, width);
+                }
                 if (s->cursor_draw_line)
                     s->cursor_draw_line(s, d, y);
             }
@@ -1750,9 +2005,13 @@ static void vga_draw_blank(VGACommonState *s, int full_update)
 
     w = s->last_scr_width * surface_bytes_per_pixel(surface);
     d = surface_data(surface);
-    for(i = 0; i < s->last_scr_height; i++) {
-        memset(d, 0, w);
-        d += surface_stride(surface);
+    {
+        g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+        for (i = 0; i < s->last_scr_height; i++) {
+            memset(d, 0, w);
+            d += surface_stride(surface);
+        }
     }
     dpy_gfx_update_full(s->con);
 }
@@ -1770,18 +2029,25 @@ static void vga_update_display(void *opaque)
     qemu_flush_coalesced_mmio_buffer();
 
     if (surface_bits_per_pixel(surface) == 0) {
-        /* nothing to do */
+        vga_scanout_changed(s);
     } else {
         full_update = 0;
-        if (!(s->ar_index & 0x20)) {
-            graphic_mode = GMODE_BLANK;
-        } else {
-            graphic_mode = s->gr[VGA_GFX_MISC] & VGA_GR06_GRAPHICS_MODE;
+        {
+            g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+            if (!(s->ar_index & 0x20)) {
+                graphic_mode = GMODE_BLANK;
+            } else {
+                graphic_mode = s->gr[VGA_GFX_MISC] & VGA_GR06_GRAPHICS_MODE;
+            }
         }
         if (graphic_mode != s->graphic_mode) {
             s->graphic_mode = graphic_mode;
             s->cursor_blink_time = qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL);
             full_update = 1;
+            if (graphic_mode != GMODE_GRAPH) {
+                vga_scanout_changed(s);
+            }
         }
         switch(graphic_mode) {
         case GMODE_TEXT:
@@ -1803,12 +2069,17 @@ static void vga_invalidate_display(void *opaque)
 {
     VGACommonState *s = opaque;
 
+    vga_scanout_changed(s);
     s->last_width = -1;
     s->last_height = -1;
 }
 
 void vga_common_reset(VGACommonState *s)
 {
+    g_autoptr(VGALowmemPause) pause = vga_pause_lowmem(s);
+
+    vga_scanout_changed(s);
+    vga_invalidate_memory_map(s);
     s->sr_index = 0;
     memset(s->sr, '\0', sizeof(s->sr));
     memset(s->sr_vbe, '\0', sizeof(s->sr_vbe));
@@ -1819,17 +2090,21 @@ void vga_common_reset(VGACommonState *s)
     s->ar_flip_flop = 0;
     s->cr_index = 0;
     memset(s->cr, '\0', sizeof(s->cr));
-    s->msr = 0;
+    qatomic_set(&s->msr, 0);
     s->fcr = 0;
     s->st00 = 0;
     s->st01 = 0;
-    s->dac_state = 0;
-    s->dac_sub_index = 0;
-    s->dac_read_index = 0;
-    s->dac_write_index = 0;
-    memset(s->dac_cache, '\0', sizeof(s->dac_cache));
-    s->dac_8bit = 0;
-    memset(s->palette, '\0', sizeof(s->palette));
+    {
+        g_autoptr(VGADACLock) dac = vga_lock_dac(s);
+
+        s->dac_state = 0;
+        s->dac_sub_index = 0;
+        s->dac_read_index = 0;
+        s->dac_write_index = 0;
+        memset(s->dac_cache, 0, sizeof(s->dac_cache));
+        s->dac_8bit = 0;
+        memset(s->palette, 0, sizeof(s->palette));
+    }
     s->bank_offset = 0;
     s->vbe_index = 0;
     memset(s->vbe_regs, '\0', sizeof(s->vbe_regs));
@@ -1892,10 +2167,14 @@ static void vga_update_text(void *opaque, console_ch_t *chardata)
 
     qemu_flush_coalesced_mmio_buffer();
 
-    if (!(s->ar_index & 0x20)) {
-        graphic_mode = GMODE_BLANK;
-    } else {
-        graphic_mode = s->gr[VGA_GFX_MISC] & VGA_GR06_GRAPHICS_MODE;
+    {
+        g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+        if (!(s->ar_index & 0x20)) {
+            graphic_mode = GMODE_BLANK;
+        } else {
+            graphic_mode = s->gr[VGA_GFX_MISC] & VGA_GR06_GRAPHICS_MODE;
+        }
     }
     if (graphic_mode != s->graphic_mode) {
         s->graphic_mode = graphic_mode;
@@ -1912,24 +2191,7 @@ static void vga_update_text(void *opaque, console_ch_t *chardata)
         full_update |= update_basic_params(s);
 
         /* total width & height */
-        cheight = (s->cr[VGA_CRTC_MAX_SCAN] & 0x1f) + 1;
-        cw = 8;
-        if (!(sr(s, VGA_SEQ_CLOCK_MODE) & VGA_SR01_CHAR_CLK_8DOTS)) {
-            cw = 9;
-        }
-        if (sr(s, VGA_SEQ_CLOCK_MODE) & 0x08) {
-            cw = 16; /* NOTE: no 18 pixel wide */
-        }
-        width = (s->cr[VGA_CRTC_H_DISP] + 1);
-        if (s->cr[VGA_CRTC_V_TOTAL] == 100) {
-            /* ugly hack for CGA 160x100x16 - explain me the logic */
-            height = 100;
-        } else {
-            height = s->cr[VGA_CRTC_V_DISP_END] |
-                ((s->cr[VGA_CRTC_OVERFLOW] & 0x02) << 7) |
-                ((s->cr[VGA_CRTC_OVERFLOW] & 0x40) << 3);
-            height = (height + 1) / cheight;
-        }
+        vga_get_text_resolution(s, &width, &height, &cw, &cheight);
 
         size = (height * width);
         if (size > CH_ATTR_SIZE) {
@@ -1964,8 +2226,7 @@ static void vga_update_text(void *opaque, console_ch_t *chardata)
         }
 
         /* Update "hardware" cursor */
-        cursor_offset = ((s->cr[VGA_CRTC_CURSOR_HI] << 8) |
-                         s->cr[VGA_CRTC_CURSOR_LO]) - s->start_addr;
+        cursor_offset = vga_text_cursor_offset(s);
         if (cursor_offset != s->cursor_offset ||
             s->cr[VGA_CRTC_CURSOR_START] != s->cursor_start ||
             s->cr[VGA_CRTC_CURSOR_END] != s->cursor_end || full_update) {
@@ -1985,11 +2246,17 @@ static void vga_update_text(void *opaque, console_ch_t *chardata)
         dst = chardata;
 
         if (full_update) {
-            for (i = 0; i < size; src ++, dst ++, i ++)
-                console_write_ch(dst, VMEM2CHTYPE(le32_to_cpu(*src)));
+            {
+                g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+
+                for (i = 0; i < size; src++, dst++, i++) {
+                    console_write_ch(dst, VMEM2CHTYPE(le32_to_cpu(*src)));
+                }
+            }
 
             dpy_text_update(s->con, 0, 0, width, height);
         } else {
+            g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
             c_max = 0;
 
             for (i = 0; i < size; src ++, dst ++, i ++) {
@@ -2009,6 +2276,7 @@ static void vga_update_text(void *opaque, console_ch_t *chardata)
                 }
             }
 
+            g_clear_pointer(&lock, qemu_rec_mutex_unlock);
             if (c_min <= c_max) {
                 i = TEXTMODE_Y(c_min);
                 dpy_text_update(s->con, 0, i, width, TEXTMODE_Y(c_max) - i + 1);
@@ -2068,9 +2336,99 @@ static void vga_mem_write(void *opaque, hwaddr addr,
     vga_mem_writeb(s, addr, data);
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static VGALowmemLock *vga_lowmem_access_lock(VGACommonState *s, hwaddr addr,
+                                           bool is_write, IOThreadLockAuto **bql)
+{
+    VGALowmemLock *lock = vga_lock_lowmem(s);
+
+    if (s->lowmem_paused && !qemu_mutex_iothread_locked()) {
+        /* The mode writer can commit address-space changes under the BQL. */
+        qemu_rec_mutex_unlock(lock);
+        qemu_mutex_lock_iothread_mmio_profile_impl(s->lowmem_region,
+                                                   "vga-lowmem", addr,
+                                                   is_write, __FILE__,
+                                                   __LINE__);
+        *bql = (IOThreadLockAuto *)(uintptr_t)1;
+        lock = vga_lock_lowmem(s);
+    }
+    return lock;
+}
+
+static uint64_t vga_lowmem_read(void *opaque, hwaddr addr, unsigned size)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(IOThreadLockAuto) bql = NULL;
+    g_autoptr(VGALowmemLock) lock = vga_lowmem_access_lock(s, addr, false, &bql);
+    uint64_t value = 0;
+
+    for (unsigned i = 0; i < size; i++) {
+        value |= (uint64_t)vga_mem_readb(s, addr + i) << (i * 8);
+    }
+    return value;
+}
+
+static void vga_lowmem_write(void *opaque, hwaddr addr, uint64_t data,
+                             unsigned size)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(IOThreadLockAuto) bql = NULL;
+    g_autoptr(VGALowmemLock) lock = vga_lowmem_access_lock(s, addr, true, &bql);
+
+    for (unsigned i = 0; i < size; i++) {
+        vga_mem_writeb(s, addr + i, (uint8_t)(data >> (i * 8)));
+    }
+}
+
+static bool vga_lowmem_access_lockless(void *opaque, hwaddr addr,
+                                       unsigned size, bool is_write,
+                                       MemTxAttrs attrs)
+{
+    return size <= 8 && is_power_of_2(size) && !(addr & (size - 1));
+}
+
+static QemuRecMutex *vga_lowmem_split_lock(void *opaque, hwaddr addr,
+                                          unsigned size)
+{
+    VGACommonState *s = opaque;
+
+    if (size > 0x20000 || addr > 0x20000 - size) {
+        return NULL;
+    }
+    return &s->lowmem_lock;
+}
+
+static bool vga_try_read_unmapped(void *opaque, hwaddr addr, MemOp op,
+                                  MemTxAttrs attrs, uint64_t *value)
+{
+    static const hwaddr starts[] = { 0, 0, 0x10000, 0x18000 };
+    static const hwaddr ends[] = { 0x20000, 0x10000, 0x18000, 0x20000 };
+    VGACommonState *s = opaque;
+    unsigned int map;
+
+    if (!tcg_enabled() || !s->legacy_address_space ||
+        memop_size(op) != 4 || (addr & 3) || addr > 0x20000 - 4) {
+        return false;
+    }
+
+    /* A transaction outside the selected aperture never reads the latch. */
+    map = qatomic_load_acquire(&s->published_memory_map);
+    if (map == VGA_MEMORY_MAP_UPDATING ||
+        (addr < ends[map] && addr + 4 > starts[map])) {
+        return false;
+    }
+
+    *value = UINT32_MAX;
+    return true;
+}
+#endif
+
 const MemoryRegionOps vga_mem_ops = {
     .read = vga_mem_read,
     .write = vga_mem_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .try_read_lockless = vga_try_read_unmapped,
+#endif
     .endianness = DEVICE_LITTLE_ENDIAN,
     .impl = {
         .min_access_size = 1,
@@ -2078,11 +2436,33 @@ const MemoryRegionOps vga_mem_ops = {
     },
 };
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+/* Keep each naturally aligned access together, including VGA latch effects. */
+static const MemoryRegionOps vga_local_lowmem_ops = {
+    .read = vga_lowmem_read,
+    .write = vga_lowmem_write,
+    .try_read_lockless = vga_try_read_unmapped,
+    .access_lockless = vga_lowmem_access_lockless,
+    .mmio_split_lock = vga_lowmem_split_lock,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+};
+#endif
+
 static int vga_common_post_load(void *opaque, int version_id)
 {
     VGACommonState *s = opaque;
+    g_autoptr(VGALowmemPause) pause = vga_pause_lowmem(s);
 
     /* force refresh */
+    vga_scanout_changed(s);
     s->graphic_mode = -1;
     vbe_update_vgaregs(s);
     vga_update_memory_access(s);
@@ -2172,7 +2552,6 @@ static inline uint32_t uint_clamp(uint32_t val, uint32_t vmin, uint32_t vmax)
     return val;
 }
 
-VGACommonState *system_vga;
 bool vga_common_init(VGACommonState *s, Object *obj, Error **errp)
 {
     int i, j, v, b;
@@ -2201,10 +2580,6 @@ bool vga_common_init(VGACommonState *s, Object *obj, Error **errp)
         expand4to8[i] = v;
     }
 
-    if(system_vga != s) {
-        system_vga = s;
-    }
-
     s->vram_size_mb = uint_clamp(s->vram_size_mb, 1, 512);
     s->vram_size_mb = pow2ceil(s->vram_size_mb);
     s->vram_size = s->vram_size_mb * MiB;
@@ -2227,6 +2602,12 @@ bool vga_common_init(VGACommonState *s, Object *obj, Error **errp)
         error_propagate(errp, local_err);
         return false;
     }
+    memory_region_init_alias(&s->chain4_alias, memory_region_owner(&s->vram),
+                             "vga.chain4", &s->vram, 0, 0);
+    s->chain4_alias_inited = true;
+#ifdef CONFIG_LATX_HACK_MEM
+    s->vram.ram_block->vga = s;
+#endif
     vmstate_register_ram(&s->vram, s->global_vmstate ? NULL : DEVICE(obj));
     xen_register_framebuffer(&s->vram);
     s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
@@ -2258,25 +2639,491 @@ bool vga_common_init(VGACommonState *s, Object *obj, Error **errp)
     return true;
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static bool vga_try_write_cursor(void *opaque, uint32_t addr, uint32_t val)
+{
+    VGACommonState *s = opaque;
+    uint8_t index = val;
+    g_autoptr(VGALowmemLock) lock = NULL;
+
+#ifdef DEBUG_VGA_REG
+    return false;
+#endif
+    if ((index != VGA_CRTC_CURSOR_HI && index != VGA_CRTC_CURSOR_LO) ||
+        !s->lowmem_local || !current_cpu || !qemu_cpu_is_self(current_cpu)) {
+        return false;
+    }
+    lock = vga_lock_lowmem(s);
+    if (s->lowmem_paused || vbe_enabled(s) ||
+        trace_event_get_state_backends(TRACE_VGA_STD_WRITE_IO)) {
+        return false;
+    }
+    if (!vga_ioport_invalid(s, addr)) {
+        s->cr_index = index;
+        s->cr[index] = val >> 8;
+    }
+    return true;
+}
+
+static bool vga_can_write_port_local(VGACommonState *s, uint32_t addr,
+                                     int pending_sr_index,
+                                     int pending_gr_index)
+{
+    int idx;
+
+    if (vga_ioport_invalid(s, addr)) {
+        return true;
+    }
+    switch (addr) {
+    case VGA_MIS_W:
+        return false;
+    case VGA_SEQ_D:
+        idx = pending_sr_index >= 0 ? pending_sr_index : s->sr_index;
+        if (idx == VGA_SEQ_MEMORY_MODE || s->has_chain4_alias ||
+            (sr(s, VGA_SEQ_MEMORY_MODE) & VGA_SR04_CHN_4M)) {
+            return false;
+        }
+        return true;
+    case VGA_GFX_D:
+        idx = pending_gr_index >= 0 ? pending_gr_index : s->gr_index;
+        if (vbe_enabled(s) || idx == VGA_GFX_MODE || idx == VGA_GFX_MISC ||
+            s->has_chain4_alias ||
+            (sr(s, VGA_SEQ_MEMORY_MODE) & VGA_SR04_CHN_4M)) {
+            return false;
+        }
+        return true;
+    case VGA_CRT_DM:
+    case VGA_CRT_DC:
+        return !vbe_enabled(s);
+    default:
+        return true;
+    }
+}
+
+static void vga_write_port_local_locked(VGACommonState *s, uint32_t addr,
+                                        uint32_t val)
+{
+    int index;
+
+    if (vga_ioport_invalid(s, addr)) {
+        return;
+    }
+    switch (addr) {
+    case VGA_ATT_W:
+        if (s->ar_flip_flop == 0) {
+            val &= 0x3f;
+            s->ar_index = val;
+        } else {
+            index = s->ar_index & 0x1f;
+            switch (index) {
+            case VGA_ATC_PALETTE0 ... VGA_ATC_PALETTEF:
+                s->ar[index] = val & 0x3f;
+                break;
+            case VGA_ATC_MODE:
+                s->ar[index] = val & ~0x10;
+                break;
+            case VGA_ATC_OVERSCAN:
+                s->ar[index] = val;
+                break;
+            case VGA_ATC_PLANE_ENABLE:
+                s->ar[index] = val & ~0xc0;
+                break;
+            case VGA_ATC_PEL:
+                s->ar[index] = val & ~0xf0;
+                break;
+            case VGA_ATC_COLOR_PAGE:
+                s->ar[index] = val & ~0xf0;
+                break;
+            default:
+                break;
+            }
+        }
+        s->ar_flip_flop ^= 1;
+        break;
+    case VGA_SEQ_I:
+        s->sr_index = val & 7;
+        break;
+    case VGA_SEQ_D:
+        s->sr[s->sr_index] = val & sr_mask[s->sr_index];
+        if (s->sr_index == VGA_SEQ_CLOCK_MODE) {
+            s->update_retrace_info(s);
+        }
+        break;
+    case VGA_PEL_IR:
+        s->dac_read_index = val;
+        s->dac_sub_index = 0;
+        s->dac_state = 3;
+        break;
+    case VGA_PEL_IW:
+        s->dac_write_index = val;
+        s->dac_sub_index = 0;
+        s->dac_state = 0;
+        break;
+    case VGA_PEL_D:
+        s->dac_cache[s->dac_sub_index] = val;
+        if (++s->dac_sub_index == 3) {
+            memcpy(&s->palette[s->dac_write_index * 3], s->dac_cache, 3);
+            s->dac_sub_index = 0;
+            s->dac_write_index++;
+        }
+        break;
+    case VGA_GFX_I:
+        s->gr_index = val & 0x0f;
+        break;
+    case VGA_GFX_D:
+        s->gr[s->gr_index] = val & gr_mask[s->gr_index];
+        break;
+    case VGA_CRT_IM:
+    case VGA_CRT_IC:
+        s->cr_index = val;
+        break;
+    case VGA_CRT_DM:
+    case VGA_CRT_DC:
+        if ((s->cr[VGA_CRTC_V_SYNC_END] & VGA_CR11_LOCK_CR0_CR7) &&
+            s->cr_index <= VGA_CRTC_OVERFLOW) {
+            if (s->cr_index == VGA_CRTC_OVERFLOW) {
+                s->cr[VGA_CRTC_OVERFLOW] = (s->cr[VGA_CRTC_OVERFLOW] & ~0x10) |
+                    (val & 0x10);
+            }
+            return;
+        }
+        s->cr[s->cr_index] = val;
+        switch (s->cr_index) {
+        case VGA_CRTC_H_TOTAL:
+        case VGA_CRTC_H_SYNC_START:
+        case VGA_CRTC_H_SYNC_END:
+        case VGA_CRTC_V_TOTAL:
+        case VGA_CRTC_OVERFLOW:
+        case VGA_CRTC_V_SYNC_END:
+        case VGA_CRTC_MODE:
+            s->update_retrace_info(s);
+            break;
+        }
+        break;
+    case VGA_IS1_RM:
+    case VGA_IS1_RC:
+        s->fcr = val & 0x10;
+        break;
+    default:
+        break;
+    }
+}
+
+static bool vga_try_read_port(void *opaque, uint32_t addr, unsigned size,
+                              uint64_t *value)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = NULL;
+
+    if (!current_cpu || !qemu_cpu_is_self(current_cpu)) {
+        return false;
+    }
+    /* VMState restores the registers with the vCPUs stopped. */
+    if (size == 1 && addr == VGA_MIS_R && vga_has_local_lock(s)) {
+        /* An x86 port read orders earlier stores and subsequent guest accesses. */
+        smp_mb();
+        *value = qatomic_load_acquire(&s->msr);
+        /* If tracing is enabled at the sample, repeat the read under the BQL. */
+        return !trace_event_get_state_backends(TRACE_VGA_STD_READ_IO);
+    }
+#ifdef DEBUG_VGA_REG
+    return false;
+#endif
+    if (!s->local_ports || (size != 1 && size != 2)) {
+        return false;
+    }
+    lock = vga_lock_lowmem(s);
+    if (s->lowmem_paused ||
+        trace_event_get_state_backends(TRACE_VGA_STD_READ_IO)) {
+        return false;
+    }
+    smp_mb();
+    if (size == 1) {
+        *value = vga_read_port_locked(s, addr);
+    } else {
+        uint32_t lo = vga_read_port_locked(s, addr);
+        *value = lo | (vga_read_port_locked(s, addr + 1) << 8);
+    }
+    smp_mb();
+    return true;
+}
+
+static void vga_write_port_topo_locked(VGACommonState *s, uint32_t addr,
+                                       uint32_t val)
+{
+    if (vga_ioport_invalid(s, addr)) {
+        return;
+    }
+    switch (addr) {
+    case VGA_MIS_W:
+        qatomic_set(&s->msr, val & ~0x10);
+        s->update_retrace_info(s);
+        break;
+    case VGA_SEQ_D:
+        s->sr[s->sr_index] = val & sr_mask[s->sr_index];
+        if (s->sr_index == VGA_SEQ_CLOCK_MODE) {
+            s->update_retrace_info(s);
+        }
+        vga_update_memory_access(s);
+        break;
+    case VGA_GFX_D:
+        s->gr[s->gr_index] = val & gr_mask[s->gr_index];
+        vbe_update_vgaregs(s);
+        vga_update_memory_access(s);
+        break;
+    case VGA_CRT_DM:
+    case VGA_CRT_DC:
+        if ((s->cr[VGA_CRTC_V_SYNC_END] & VGA_CR11_LOCK_CR0_CR7) &&
+            s->cr_index <= VGA_CRTC_OVERFLOW) {
+            if (s->cr_index == VGA_CRTC_OVERFLOW) {
+                s->cr[VGA_CRTC_OVERFLOW] = (s->cr[VGA_CRTC_OVERFLOW] & ~0x10) |
+                    (val & 0x10);
+                vbe_update_vgaregs(s);
+            }
+            return;
+        }
+        s->cr[s->cr_index] = val;
+        vbe_update_vgaregs(s);
+        switch (s->cr_index) {
+        case VGA_CRTC_H_TOTAL:
+        case VGA_CRTC_H_SYNC_START:
+        case VGA_CRTC_H_SYNC_END:
+        case VGA_CRTC_V_TOTAL:
+        case VGA_CRTC_OVERFLOW:
+        case VGA_CRTC_V_SYNC_END:
+        case VGA_CRTC_MODE:
+            s->update_retrace_info(s);
+            break;
+        }
+        break;
+    default:
+        vga_write_port_local_locked(s, addr, val);
+        break;
+    }
+}
+
+/*
+ * Acquire memory_topology_mutex before device_lock (s->lowmem_lock) to
+ * strictly follow the global lock hierarchy:
+ * BQL > memory_topology_mutex > device_lock.
+ */
+static bool vga_try_write_port_topo(VGACommonState *s, uint32_t addr,
+                                    unsigned size, uint32_t val)
+{
+    g_autoptr(VGALowmemLock) lock = NULL;
+
+    if (!s->chain4_alias_inited || !qemu_memory_topology_nobql_enabled()) {
+        return false;
+    }
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
+    lock = vga_lock_lowmem(s);
+    if (s->lowmem_paused ||
+        trace_event_get_state_backends(TRACE_VGA_STD_WRITE_IO)) {
+        return false;
+    }
+    smp_mb();
+    if (size == 1) {
+        vga_write_port_topo_locked(s, addr, val & 0xff);
+    } else {
+        vga_write_port_topo_locked(s, addr, val & 0xff);
+        vga_write_port_topo_locked(s, addr + 1, (val >> 8) & 0xff);
+    }
+    smp_mb();
+    return true;
+}
+
+static bool vga_try_write_port(void *opaque, uint32_t addr, unsigned size,
+                               uint32_t val)
+{
+    VGACommonState *s = opaque;
+    int pending_sr = -1;
+    int pending_gr = -1;
+
+    if (!s->local_ports) {
+        if (size == 2 && vga_crtc_index_port(addr)) {
+            return vga_try_write_cursor(opaque, addr, val);
+        }
+        return false;
+    }
+#ifdef DEBUG_VGA_REG
+    return false;
+#endif
+    if ((size != 1 && size != 2) ||
+        !current_cpu || !qemu_cpu_is_self(current_cpu)) {
+        return false;
+    }
+    {
+        g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+        if (s->lowmem_paused ||
+            trace_event_get_state_backends(TRACE_VGA_STD_WRITE_IO)) {
+            return false;
+        }
+        if (size == 1) {
+            if (vga_can_write_port_local(s, addr, -1, -1)) {
+                smp_mb();
+                vga_write_port_local_locked(s, addr, val & 0xff);
+                smp_mb();
+                return true;
+            }
+        } else {
+            if (addr == VGA_SEQ_I && !vga_ioport_invalid(s, addr)) {
+                pending_sr = val & 7;
+            } else if (addr == VGA_GFX_I && !vga_ioport_invalid(s, addr)) {
+                pending_gr = val & 0x0f;
+            }
+            if (vga_can_write_port_local(s, addr, -1, -1) &&
+                vga_can_write_port_local(s, addr + 1, pending_sr, pending_gr)) {
+                smp_mb();
+                vga_write_port_local_locked(s, addr, val & 0xff);
+                vga_write_port_local_locked(s, addr + 1, (val >> 8) & 0xff);
+                smp_mb();
+                return true;
+            }
+        }
+    }
+    return vga_try_write_port_topo(s, addr, size, val);
+}
+
+static bool vbe_try_read_port(void *opaque, uint32_t addr, unsigned size,
+                              uint64_t *value)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = NULL;
+
+    if (size != 2 || !s->local_ports ||
+        !current_cpu || !qemu_cpu_is_self(current_cpu)) {
+        return false;
+    }
+    lock = vga_lock_lowmem(s);
+    if (s->lowmem_paused) {
+        return false;
+    }
+    if (addr == 0x1ce) {
+        smp_mb();
+        *value = s->vbe_index;
+        smp_mb();
+        return true;
+    }
+    if (trace_event_get_state_backends(TRACE_VGA_VBE_READ)) {
+        return false;
+    }
+    smp_mb();
+    *value = vbe_read_data_locked(s);
+    smp_mb();
+    return true;
+}
+
+static bool vbe_try_write_index(void *opaque, uint32_t addr, unsigned size,
+                                uint32_t val)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = NULL;
+
+    if (size != 2 || addr != 0x1ce || !s->local_ports ||
+        !current_cpu || !qemu_cpu_is_self(current_cpu)) {
+        return false;
+    }
+    lock = vga_lock_lowmem(s);
+    if (s->lowmem_paused) {
+        return false;
+    }
+    smp_mb();
+    s->vbe_index = val;
+    smp_mb();
+    return true;
+}
+
+static bool vbe_try_write_data(void *opaque, uint32_t addr, unsigned size,
+                               uint32_t val)
+{
+    VGACommonState *s = opaque;
+    g_autoptr(VGALowmemLock) lock = NULL;
+
+    if (size != 2 || !s->local_ports || !s->chain4_alias_inited ||
+        !qemu_memory_topology_nobql_enabled() ||
+        !current_cpu || !qemu_cpu_is_self(current_cpu)) {
+        return false;
+    }
+    QEMU_MEMORY_TOPOLOGY_LOCK_GUARD();
+    lock = vga_lock_lowmem(s);
+    if (s->lowmem_paused ||
+        trace_event_get_state_backends(TRACE_VGA_VBE_WRITE)) {
+        return false;
+    }
+    smp_mb();
+    vbe_write_data_locked(s, val);
+    smp_mb();
+    return true;
+}
+#endif
+
 static const MemoryRegionPortio vga_portio_list[] = {
-    { 0x04,  2, 1, .read = vga_ioport_read, .write = vga_ioport_write }, /* 3b4 */
-    { 0x0a,  1, 1, .read = vga_ioport_read, .write = vga_ioport_write }, /* 3ba */
-    { 0x10, 16, 1, .read = vga_ioport_read, .write = vga_ioport_write }, /* 3c0 */
-    { 0x24,  2, 1, .read = vga_ioport_read, .write = vga_ioport_write }, /* 3d4 */
-    { 0x2a,  1, 1, .read = vga_ioport_read, .write = vga_ioport_write }, /* 3da */
+    { 0x04,  2, 1, .read = vga_ioport_read, .write = vga_ioport_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vga_try_read_port, .try_write = vga_try_write_port,
+#endif
+    }, /* 3b4 */
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    { 0x04,  1, 2, .read = vga_ioport_readw, .write = vga_ioport_writew,
+      .try_read = vga_try_read_port, .try_write = vga_try_write_port },
+#endif
+    { 0x0a,  1, 1, .read = vga_ioport_read, .write = vga_ioport_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vga_try_read_port, .try_write = vga_try_write_port,
+#endif
+    }, /* 3ba */
+    { 0x10, 16, 1, .read = vga_ioport_read, .write = vga_ioport_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vga_try_read_port, .try_write = vga_try_write_port,
+#endif
+    }, /* 3c0 */
+    { 0x24,  2, 1, .read = vga_ioport_read, .write = vga_ioport_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vga_try_read_port, .try_write = vga_try_write_port,
+#endif
+    }, /* 3d4 */
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    { 0x24,  1, 2, .read = vga_ioport_readw, .write = vga_ioport_writew,
+      .try_read = vga_try_read_port, .try_write = vga_try_write_port },
+#endif
+    { 0x2a,  1, 1, .read = vga_ioport_read, .write = vga_ioport_write,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vga_try_read_port, .try_write = vga_try_write_port,
+#endif
+    }, /* 3da */
     PORTIO_END_OF_LIST(),
 };
 
 static const MemoryRegionPortio vbe_portio_list_x86[] = {
-    { 0, 1, 2, .read = vbe_ioport_read_index, .write = vbe_ioport_write_index },
-    { 1, 1, 2, .read = vbe_ioport_read_data, .write = vbe_ioport_write_data },
-    { 2, 1, 2, .read = vbe_ioport_read_data, .write = vbe_ioport_write_data },
+    { 0, 1, 2, .read = vbe_ioport_read_index, .write = vbe_ioport_write_index,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vbe_try_read_port, .try_write = vbe_try_write_index,
+#endif
+    },
+    { 1, 1, 2, .read = vbe_ioport_read_data, .write = vbe_ioport_write_data,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vbe_try_read_port, .try_write = vbe_try_write_data,
+#endif
+    },
+    { 2, 1, 2, .read = vbe_ioport_read_data, .write = vbe_ioport_write_data,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vbe_try_read_port, .try_write = vbe_try_write_data,
+#endif
+    },
     PORTIO_END_OF_LIST(),
 };
 
 static const MemoryRegionPortio vbe_portio_list_no_x86[] = {
-    { 0, 1, 2, .read = vbe_ioport_read_index, .write = vbe_ioport_write_index },
-    { 2, 1, 2, .read = vbe_ioport_read_data, .write = vbe_ioport_write_data },
+    { 0, 1, 2, .read = vbe_ioport_read_index, .write = vbe_ioport_write_index,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vbe_try_read_port, .try_write = vbe_try_write_index,
+#endif
+    },
+    { 2, 1, 2, .read = vbe_ioport_read_data, .write = vbe_ioport_write_data,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+      .try_read = vbe_try_read_port, .try_write = vbe_try_write_data,
+#endif
+    },
     PORTIO_END_OF_LIST(),
 };
 
@@ -2286,6 +3133,7 @@ MemoryRegion *vga_init_io(VGACommonState *s, Object *obj,
                           const MemoryRegionPortio **vbe_ports)
 {
     MemoryRegion *vga_mem;
+    const MemoryRegionOps *ops = &vga_mem_ops;
     MachineState *ms = MACHINE(qdev_get_machine());
 
     /*
@@ -2301,7 +3149,13 @@ MemoryRegion *vga_init_io(VGACommonState *s, Object *obj,
     *vga_ports = vga_portio_list;
 
     vga_mem = g_malloc(sizeof(*vga_mem));
-    memory_region_init_io(vga_mem, obj, &vga_mem_ops, s,
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (s->lowmem_local) {
+        s->lowmem_region = vga_mem;
+        ops = &vga_local_lowmem_ops;
+    }
+#endif
+    memory_region_init_io(vga_mem, obj, ops, s,
                           "vga-lowmem", 0x20000);
     memory_region_set_flush_coalesced(vga_mem);
 
@@ -2328,11 +3182,23 @@ void vga_init(VGACommonState *s, Object *obj, MemoryRegion *address_space,
     memory_region_set_coalescing(vga_io_memory);
     if (init_vga_ports) {
         portio_list_init(&s->vga_port_list, obj, vga_ports, s, "vga");
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        s->vga_port_list.local_registers = vga_has_local_lock(s);
+#endif
         portio_list_set_flush_coalesced(&s->vga_port_list);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (s->dac_local) {
+            portio_list_set_local_bytes(&s->vga_port_list, &s->dac_lock,
+                                        VGA_PEL_IR, VGA_PEL_D + 1);
+        }
+#endif
         portio_list_add(&s->vga_port_list, address_space_io, 0x3b0);
     }
     if (vbe_ports) {
         portio_list_init(&s->vbe_port_list, obj, vbe_ports, s, "vbe");
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        s->vbe_port_list.local_registers = s->local_ports;
+#endif
         portio_list_add(&s->vbe_port_list, address_space_io, 0x1ce);
     }
 }

@@ -148,6 +148,9 @@ typedef struct DisplaySurface {
     HANDLE handle;
     uint32_t handle_offset;
 #endif
+    /* Optional fixed RAM backing this surface, borrowed until a surface switch. */
+    MemoryRegion *scanout_ram;
+    bool scanout_can_poll;
 } DisplaySurface;
 
 typedef struct QemuUIInfo {
@@ -234,6 +237,7 @@ typedef struct DisplayChangeListenerOps {
 
     /* optional */
     void (*dpy_refresh)(DisplayChangeListener *dcl);
+    void (*dpy_scanout_changed)(DisplayChangeListener *dcl, bool discard_frame);
 
     /* optional */
     void (*dpy_gfx_update)(DisplayChangeListener *dcl,
@@ -299,6 +303,7 @@ struct DisplayChangeListener {
     const DisplayChangeListenerOps *ops;
     DisplayState *ds;
     QemuConsole *con;
+    bool refresh_paused;
 
     QLIST_ENTRY(DisplayChangeListener) next;
 };
@@ -358,6 +363,8 @@ static inline int is_placeholder(DisplaySurface *surface)
 void register_displaychangelistener(DisplayChangeListener *dcl);
 void update_displaychangelistener(DisplayChangeListener *dcl,
                                   uint64_t interval);
+void displaychangelistener_pause_refresh(DisplayChangeListener *dcl,
+                                         bool paused);
 void unregister_displaychangelistener(DisplayChangeListener *dcl);
 
 bool dpy_ui_info_supported(QemuConsole *con);
@@ -366,6 +373,7 @@ int dpy_set_ui_info(QemuConsole *con, QemuUIInfo *info, bool delay);
 
 void dpy_gfx_update(QemuConsole *con, int x, int y, int w, int h);
 void dpy_gfx_update_full(QemuConsole *con);
+void dpy_gfx_scanout_changed(QemuConsole *con, bool discard_frame);
 void dpy_gfx_replace_surface(QemuConsole *con,
                              DisplaySurface *surface);
 void dpy_text_cursor(QemuConsole *con, int x, int y);

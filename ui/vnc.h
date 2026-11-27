@@ -98,6 +98,7 @@ typedef void VncSendHextileTile(VncState *vs,
 #define VNC_AUTH_CHALLENGE_SIZE 16
 
 typedef struct VncDisplay VncDisplay;
+typedef struct VncCompare VncCompare;
 
 #include "vnc-auth-vencrypt.h"
 #ifdef CONFIG_VNC_SASL
@@ -162,6 +163,12 @@ struct VncDisplay
     int cursor_msize;
     uint8_t *cursor_mask;
 
+    VncCompare *compare;
+    QEMUBH *scanout_ready;
+    QemuMutex scanout_lock; /* Direct publication and pending RFB requests */
+    VncCompare *request_poll_job; /* Protected by scanout_lock */
+    VncState *request_poll_client;
+    bool scanout_refresh_pending;
     struct VncSurface guest;   /* guest visible surface (aka ds->surface) */
     pixman_image_t *server;    /* vnc server surface */
     int true_width; /* server surface width before rounding up */
@@ -250,6 +257,7 @@ struct VncJob
 {
     VncState *vs;
 
+    bool worker_write;
     QLIST_HEAD(, VncRectEntry) rectangles;
     QTAILQ_ENTRY(VncJob) next;
 };
@@ -269,6 +277,7 @@ struct VncState
     QIOChannel *ioc; /* The channel currently used for I/O */
     guint ioc_tag;
     gboolean disconnecting;
+    bool request_poll_socket; /* Owned, stream, and peeks at the queue head */
 
     DECLARE_BITMAP(dirty[VNC_MAX_HEIGHT], VNC_DIRTY_BITS);
     uint8_t **lossy_rect; /* Not an Array to avoid costly memcpy in
@@ -317,7 +326,7 @@ struct VncState
      * buffer size doesn't exceed this threshold. The value
      * is calculating dynamically based on framebuffer size
      * and audio sample settings in vnc_update_throttle_offset() */
-    size_t throttle_output_offset;
+    size_t throttle_output_offset; /* Updated by main, read by scanout */
     Buffer output;
     Buffer input;
     /* current output mode information */
@@ -334,6 +343,12 @@ struct VncState
 
     bool abort;
     QemuMutex output_mutex;
+    QemuMutex socket_mutex; /* Serialize the encoder's write against close. */
+    AioContext *drain_context; /* Protected by socket_mutex. */
+    int drain_fd; /* Published by socket_mutex, queried atomically. */
+    bool drain_used;
+    bool worker_write_pending; /* Unsent suffix needs a write watch. */
+    bool job_needs_refresh; /* A pending request was blocked by this job. */
     QEMUBH *bh;
     Buffer jobs_buffer;
 
@@ -575,6 +590,8 @@ void vnc_write_s32(VncState *vs, int32_t value);
 void vnc_write_u16(VncState *vs, uint16_t value);
 void vnc_write_u8(VncState *vs, uint8_t value);
 void vnc_flush(VncState *vs);
+bool vnc_job_output_ready_locked(VncState *vs);
+bool vnc_job_write_from_worker_locked(VncState *vs);
 void vnc_read_when(VncState *vs, VncReadEvent *func, size_t expecting);
 void vnc_disconnect_finish(VncState *vs);
 void vnc_start_protocol(VncState *vs);

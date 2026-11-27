@@ -27,6 +27,7 @@
 
 #include "exec/ioport.h"
 #include "exec/memory.h"
+#include "qemu/thread.h"
 
 #include "hw/display/bochs-vbe.h"
 #include "hw/acpi/acpi_aml_interface.h"
@@ -66,6 +67,7 @@ typedef struct VGACommonState {
     uint32_t vbe_size_mask;
     uint32_t latch;
     bool has_chain4_alias;
+    bool chain4_alias_inited;
     MemoryRegion chain4_alias;
     uint8_t sr_index;
     uint8_t sr[256];
@@ -146,7 +148,47 @@ typedef struct VGACommonState {
     vga_update_retrace_info_fn update_retrace_info;
     union vga_retrace retrace_info;
     uint8_t is_vbe_vmstate;
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    unsigned int published_memory_map;
+#endif
+    QemuRecMutex dac_lock;
+    bool dac_local;
+    QemuRecMutex lowmem_lock;
+    MemoryRegion *lowmem_region;
+    unsigned lowmem_paused;
+    bool lowmem_local;
+    bool local_ports;
+    bool scanout_notify;
 } VGACommonState;
+
+typedef QemuRecMutex VGADACLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(VGADACLock, qemu_rec_mutex_unlock)
+
+static inline VGADACLock *vga_lock_dac(VGACommonState *s)
+{
+    if (!s->dac_local) {
+        return NULL;
+    }
+    qemu_rec_mutex_lock(&s->dac_lock);
+    return &s->dac_lock;
+}
+
+typedef QemuRecMutex VGALowmemLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(VGALowmemLock, qemu_rec_mutex_unlock)
+
+static inline bool vga_has_local_lock(const VGACommonState *s)
+{
+    return s->lowmem_local || s->local_ports;
+}
+
+static inline VGALowmemLock *vga_lock_lowmem(VGACommonState *s)
+{
+    if (!vga_has_local_lock(s)) {
+        return NULL;
+    }
+    qemu_rec_mutex_lock(&s->lowmem_lock);
+    return &s->lowmem_lock;
+}
 
 static inline int c6_to_8(int v)
 {
@@ -163,6 +205,7 @@ MemoryRegion *vga_init_io(VGACommonState *s, Object *obj,
                           const MemoryRegionPortio **vga_ports,
                           const MemoryRegionPortio **vbe_ports);
 void vga_common_reset(VGACommonState *s);
+void vga_scanout_changed(VGACommonState *s);
 
 void vga_dirty_log_start(VGACommonState *s);
 void vga_dirty_log_stop(VGACommonState *s);
@@ -170,6 +213,10 @@ void vga_dirty_log_stop(VGACommonState *s);
 extern const VMStateDescription vmstate_vga_common;
 uint32_t vga_ioport_read(void *opaque, uint32_t addr);
 void vga_ioport_write(void *opaque, uint32_t addr, uint32_t val);
+bool vga_pause_remapped_crtc(void *opaque, hwaddr addr, unsigned size);
+void vga_resume_remapped_crtc(void *opaque);
+uint32_t vga_ioport_readw(void *opaque, uint32_t addr);
+void vga_ioport_writew(void *opaque, uint32_t addr, uint32_t val);
 uint32_t vga_mem_readb(VGACommonState *s, hwaddr addr);
 void vga_mem_writeb(VGACommonState *s, hwaddr addr, uint32_t val);
 void vga_invalidate_scanlines(VGACommonState *s, int y1, int y2);
@@ -179,6 +226,8 @@ int vga_ioport_invalid(VGACommonState *s, uint32_t addr);
 uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr);
 void vbe_ioport_write_index(void *opaque, uint32_t addr, uint32_t val);
 void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val);
+void vbe_write_registers(VGACommonState *s, unsigned index, uint32_t value,
+                         unsigned size);
 
 extern const uint8_t sr_mask[8];
 extern const uint8_t gr_mask[16];

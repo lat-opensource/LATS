@@ -25,14 +25,19 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "hw/pci/pci_device.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "vga_int.h"
+#include "vga_regs.h"
 #include "ui/pixel_ops.h"
 #include "ui/console.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
+#include "sysemu/tcg.h"
 #include "hw/loader.h"
 #include "hw/display/edid.h"
 #include "qom/object.h"
@@ -68,46 +73,93 @@ static const VMStateDescription vmstate_vga_pci = {
     }
 };
 
-static uint64_t pci_vga_ioport_read(void *ptr, hwaddr addr,
+static QemuRecMutex *pci_vga_dac_split_lock(void *opaque, hwaddr addr,
+                                           unsigned size)
+{
+    VGACommonState *s = opaque;
+    hwaddr port = addr + 0x3c0;
+
+    if (s->dac_local && port <= VGA_PEL_D && port + size > VGA_PEL_IR) {
+        return &s->dac_lock;
+    }
+    return NULL;
+}
+
+static VGADACLock *pci_vga_lock_dac(VGACommonState *s, hwaddr addr,
                                     unsigned size)
 {
-    VGACommonState *s = ptr;
-    uint64_t ret = 0;
+    QemuRecMutex *lock = pci_vga_dac_split_lock(s, addr, size);
 
-    switch (size) {
-    case 1:
-        ret = vga_ioport_read(s, addr + 0x3c0);
-        break;
-    case 2:
-        ret  = vga_ioport_read(s, addr + 0x3c0);
-        ret |= vga_ioport_read(s, addr + 0x3c1) << 8;
-        break;
+    if (lock) {
+        qemu_rec_mutex_lock(lock);
     }
-    return ret;
+    return lock;
 }
 
-static void pci_vga_ioport_write(void *ptr, hwaddr addr,
-                                 uint64_t val, unsigned size)
+static uint64_t pci_vga_ioport_read(void *ptr, hwaddr addr, unsigned size)
 {
     VGACommonState *s = ptr;
+    g_autoptr(VGADACLock) lock = pci_vga_lock_dac(s, addr, size);
+    uint64_t value = 0;
 
-    switch (size) {
-    case 1:
-        vga_ioport_write(s, addr + 0x3c0, val);
-        break;
-    case 2:
-        /*
-         * Update bytes in little endian order.  Allows to update
-         * indexed registers with a single word write because the
-         * index byte is updated first.
-         */
-        vga_ioport_write(s, addr + 0x3c0, val & 0xff);
-        vga_ioport_write(s, addr + 0x3c1, (val >> 8) & 0xff);
-        break;
+    for (unsigned offset = 0; offset < size; offset++) {
+        if (addr + 0x3c0 + offset == 0x3d4 && offset + 1 < size) {
+            value |= (uint64_t)vga_ioport_readw(s, 0x3d4) << (8 * offset);
+            offset++;
+        } else {
+            value |= (uint64_t)vga_ioport_read(s, addr + 0x3c0 + offset)
+                     << (8 * offset);
+        }
+    }
+    return value;
+}
+
+static void pci_vga_ioport_write(void *ptr, hwaddr addr, uint64_t val,
+                                 unsigned size)
+{
+    VGACommonState *s = ptr;
+    g_autoptr(VGADACLock) lock = pci_vga_lock_dac(s, addr, size);
+
+    /* Write the index byte before the data byte. */
+    for (unsigned offset = 0; offset < size; offset++) {
+        if (addr + 0x3c0 + offset == 0x3d4 && offset + 1 < size) {
+            vga_ioport_writew(s, 0x3d4, (val >> (8 * offset)) & 0xffff);
+            offset++;
+        } else {
+            vga_ioport_write(s, addr + 0x3c0 + offset, (val >> (8 * offset)) & 0xff);
+        }
     }
 }
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+static QemuRecMutex *pci_vga_crtc_split_lock(void *opaque, hwaddr addr,
+                                            unsigned size)
+{
+    VGACommonState *s = opaque;
+    unsigned index = VGA_CRT_IC - VGA_ATT_W;
+
+    /*
+     * This bank only accesses CRT and status registers. A transfer starting
+     * at or before the graphics controller can change the memory map and must
+     * use the pause callback without holding the VGA lock.
+     */
+    if (!vga_has_local_lock(s) || addr <= VGA_GFX_D - VGA_ATT_W ||
+        size > PCI_VGA_IOPORT_SIZE - addr) {
+        return NULL;
+    }
+    if (s->local_ports || (addr <= index && size > index + 1 - addr)) {
+        return &s->lowmem_lock;
+    }
+    return NULL;
+}
+#endif
+
 static const MemoryRegionOps pci_vga_ioport_ops = {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .mmio_split_lock = pci_vga_crtc_split_lock,
+    .mmio_split_pause = vga_pause_remapped_crtc,
+    .mmio_split_resume = vga_resume_remapped_crtc,
+#endif
     .read = pci_vga_ioport_read,
     .write = pci_vga_ioport_write,
     .valid.min_access_size = 1,
@@ -117,24 +169,51 @@ static const MemoryRegionOps pci_vga_ioport_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
+static QemuRecMutex *pci_vga_register_split_lock(void *opaque, hwaddr addr,
+                                                 unsigned size)
+{
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    QemuRecMutex *crtc = pci_vga_crtc_split_lock(opaque, addr, size);
+    if (crtc) {
+        return crtc;
+    }
+#endif
+    return pci_vga_dac_split_lock(opaque, addr, size);
+}
+
+static const MemoryRegionOps pci_vga_ioport_local_dac_ops = {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    .mmio_split_pause = vga_pause_remapped_crtc,
+    .mmio_split_resume = vga_resume_remapped_crtc,
+#endif
+    .read = pci_vga_ioport_read,
+    .write = pci_vga_ioport_write,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .mmio_split_lock = pci_vga_register_split_lock,
+};
+
 static uint64_t pci_vga_bochs_read(void *ptr, hwaddr addr,
                                    unsigned size)
 {
     VGACommonState *s = ptr;
-    int index = addr >> 1;
+    g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(s);
+    uint64_t value = 0;
 
-    vbe_ioport_write_index(s, 0, index);
-    return vbe_ioport_read_data(s, 0);
+    for (unsigned offset = 0; offset < size; offset += 2) {
+        vbe_ioport_write_index(s, 0, (addr + offset) >> 1);
+        value |= (uint64_t)(uint16_t)vbe_ioport_read_data(s, 0) << (offset * 8);
+    }
+    return value;
 }
 
 static void pci_vga_bochs_write(void *ptr, hwaddr addr,
                                 uint64_t val, unsigned size)
 {
-    VGACommonState *s = ptr;
-    int index = addr >> 1;
-
-    vbe_ioport_write_index(s, 0, index);
-    vbe_ioport_write_data(s, 0, val);
+    vbe_write_registers(ptr, addr >> 1, val, size);
 }
 
 static const MemoryRegionOps pci_vga_bochs_ops = {
@@ -143,7 +222,7 @@ static const MemoryRegionOps pci_vga_bochs_ops = {
     .valid.min_access_size = 1,
     .valid.max_access_size = 4,
     .impl.min_access_size = 2,
-    .impl.max_access_size = 2,
+    .impl.max_access_size = 4,
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
@@ -170,9 +249,11 @@ static void pci_vga_qext_write(void *ptr, hwaddr addr,
     switch (addr) {
     case PCI_VGA_QEXT_REG_BYTEORDER:
         if (val == PCI_VGA_QEXT_BIG_ENDIAN) {
+            vga_scanout_changed(s);
             s->big_endian_fb = true;
         }
         if (val == PCI_VGA_QEXT_LITTLE_ENDIAN) {
+            vga_scanout_changed(s);
             s->big_endian_fb = false;
         }
         break;
@@ -190,6 +271,7 @@ static void vga_set_big_endian_fb(Object *obj, bool value, Error **errp)
 {
     PCIVGAState *d = PCI_VGA(PCI_DEVICE(obj));
 
+    vga_scanout_changed(&d->vga);
     d->vga.big_endian_fb = value;
 }
 
@@ -209,7 +291,10 @@ void pci_std_vga_mmio_region_init(VGACommonState *s,
 {
     PCIVGAState *d = container_of(s, PCIVGAState, vga);
 
-    memory_region_init_io(&subs[0], owner, &pci_vga_ioport_ops, s,
+    const MemoryRegionOps *io_ops = s->dac_local ?
+        &pci_vga_ioport_local_dac_ops : &pci_vga_ioport_ops;
+
+    memory_region_init_io(&subs[0], owner, io_ops, s,
                           "vga ioports remapped", PCI_VGA_IOPORT_SIZE);
     memory_region_add_subregion(parent, PCI_VGA_IOPORT_OFFSET,
                                 &subs[0]);
@@ -244,6 +329,27 @@ static void pci_std_vga_realize(PCIDevice *dev, Error **errp)
     if (!vga_common_init(s, OBJECT(dev), errp)) {
         return;
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE) {
+        s->lowmem_local =
+            lats_nobql_enabled();
+        s->local_ports =
+            lats_nobql_enabled();
+    }
+    if (vga_has_local_lock(s)) {
+        qemu_rec_mutex_init(&s->lowmem_lock);
+    }
+    s->dac_local = tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        lats_nobql_enabled();
+    if (s->dac_local) {
+        qemu_rec_mutex_init(&s->dac_lock);
+    }
+    s->scanout_notify = tcg_enabled() && !icount_enabled() &&
+        replay_mode == REPLAY_MODE_NONE &&
+        lats_nobql_enabled();
+#endif
     vga_init(s, OBJECT(dev), pci_address_space(dev), pci_address_space_io(dev),
              true);
 
@@ -383,6 +489,8 @@ static void vga_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
 
+    k->plain_config_header = true;
+    k->plain_config_space = true;
     k->realize = pci_std_vga_realize;
     k->romfile = "vgabios-stdvga.bin";
     k->class_id = PCI_CLASS_DISPLAY_VGA;
@@ -406,10 +514,23 @@ static void secondary_class_init(ObjectClass *klass, void *data)
     dc->reset = pci_secondary_vga_reset;
 }
 
+static void pci_std_vga_finalize(Object *obj)
+{
+    VGACommonState *s = &PCI_VGA(obj)->vga;
+
+    if (s->dac_local) {
+        qemu_rec_mutex_destroy(&s->dac_lock);
+    }
+    if (s->lowmem_local) {
+        qemu_rec_mutex_destroy(&s->lowmem_lock);
+    }
+}
+
 static const TypeInfo vga_info = {
     .name          = "VGA",
     .parent        = TYPE_PCI_VGA,
     .class_init    = vga_class_init,
+    .instance_finalize = pci_std_vga_finalize,
 };
 
 static const TypeInfo secondary_info = {

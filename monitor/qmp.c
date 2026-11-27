@@ -31,6 +31,8 @@
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
 #include "qapi/qmp/qlist.h"
+#include "qemu/lockdep-lite.h"
+#include "qemu/main-loop.h"
 #include "trace.h"
 
 /*
@@ -332,7 +334,13 @@ void coroutine_fn monitor_qmp_dispatcher_co(void *data)
                 trace_monitor_qmp_cmd_in_band(id_json->str);
                 g_string_free(id_json, true);
             }
-            monitor_qmp_dispatch(mon, req_obj->req);
+            if (lats_nobql_enabled() && !qemu_mutex_iothread_locked()) {
+                qemu_vm_lifecycle_lock();
+                monitor_qmp_dispatch(mon, req_obj->req);
+                qemu_vm_lifecycle_unlock();
+            } else {
+                monitor_qmp_dispatch(mon, req_obj->req);
+            }
         } else {
             assert(req_obj->err);
             trace_monitor_qmp_err_in_band(error_get_pretty(req_obj->err));

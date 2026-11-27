@@ -44,6 +44,8 @@
 #include "qemu/error-report.h"
 #include "qemu/job.h"
 #include "qemu/log.h"
+#include "qemu/lockdep-lite.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/plugin.h"
 #include "qemu/sockets.h"
@@ -181,7 +183,7 @@ static bool runstate_valid_transitions[RUN_STATE__MAX][RUN_STATE__MAX];
 
 bool runstate_check(RunState state)
 {
-    return current_run_state == state;
+    return qatomic_read(&current_run_state) == state;
 }
 
 static void runstate_init(void)
@@ -215,7 +217,7 @@ void runstate_set(RunState new_state)
         abort();
     }
 
-    current_run_state = new_state;
+    qatomic_set(&current_run_state, new_state);
 }
 
 RunState runstate_get(void)
@@ -674,6 +676,12 @@ static bool main_loop_should_exit(int *status)
 {
     RunState r;
     ShutdownCause request;
+    bool exit_loop = false;
+    bool use_lifecycle = lats_nobql_enabled() && !qemu_mutex_iothread_locked();
+
+    if (use_lifecycle) {
+        qemu_vm_lifecycle_lock();
+    }
 
     if (qemu_debug_requested()) {
         vm_stop(RUN_STATE_DEBUG);
@@ -692,7 +700,8 @@ static bool main_loop_should_exit(int *status)
                 panic_action == PANIC_ACTION_EXIT_FAILURE) {
                 *status = EXIT_FAILURE;
             }
-            return true;
+            exit_loop = true;
+            goto out;
         }
     }
     request = qemu_reset_requested();
@@ -724,7 +733,11 @@ static bool main_loop_should_exit(int *status)
     if (qemu_vmstop_requested(&r)) {
         vm_stop(r);
     }
-    return false;
+out:
+    if (use_lifecycle) {
+        qemu_vm_lifecycle_unlock();
+    }
+    return exit_loop;
 }
 
 int qemu_main_loop(void)
@@ -763,7 +776,9 @@ void qemu_init_subsystems(void)
 
     qemu_init_cpu_list();
     qemu_init_cpu_loop();
-    qemu_mutex_lock_iothread();
+    if (!lats_nobql_enabled()) {
+        qemu_mutex_lock_iothread();
+    }
 
     atexit(qemu_run_exit_notifiers);
 

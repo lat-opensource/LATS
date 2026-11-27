@@ -31,7 +31,7 @@
 #define VNC_JOBS_H
 
 /* Jobs */
-VncJob *vnc_job_new(VncState *vs);
+VncJob *vnc_job_new(VncState *vs, bool worker_write);
 int vnc_job_add_rect(VncJob *job, int x, int y, int w, int h);
 void vnc_job_push(VncJob *job);
 void vnc_jobs_join(VncState *vs);

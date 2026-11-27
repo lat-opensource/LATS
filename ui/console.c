@@ -164,12 +164,17 @@ static void gui_update(void *opaque)
     uint64_t dcl_interval;
     DisplayState *ds = opaque;
     DisplayChangeListener *dcl;
+    bool active = false;
 
     ds->refreshing = true;
     dpy_refresh(ds);
     ds->refreshing = false;
 
     QLIST_FOREACH(dcl, &ds->listeners, next) {
+        if (dcl->refresh_paused) {
+            continue;
+        }
+        active |= dcl->ops->dpy_refresh != NULL;
         dcl_interval = dcl->update_interval ?
             dcl->update_interval : GUI_REFRESH_INTERVAL_DEFAULT;
         if (interval > dcl_interval) {
@@ -181,7 +186,12 @@ static void gui_update(void *opaque)
         trace_console_refresh(interval);
     }
     ds->last_update = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
-    timer_mod(ds->gui_timer, ds->last_update + interval);
+    if (active && ds->gui_timer) {
+        timer_mod(ds->gui_timer, ds->last_update + interval);
+    } else if (!active && ds->gui_timer) {
+        timer_free(ds->gui_timer);
+        ds->gui_timer = NULL;
+    }
 }
 
 static void gui_setup_refresh(DisplayState *ds)
@@ -192,7 +202,7 @@ static void gui_setup_refresh(DisplayState *ds)
     bool have_text = false;
 
     QLIST_FOREACH(dcl, &ds->listeners, next) {
-        if (dcl->ops->dpy_refresh != NULL) {
+        if (dcl->ops->dpy_refresh != NULL && !dcl->refresh_paused) {
             need_timer = true;
         }
         if (dcl->ops->dpy_gfx_update != NULL) {
@@ -1818,8 +1828,26 @@ void update_displaychangelistener(DisplayChangeListener *dcl,
     DisplayState *ds = dcl->ds;
 
     dcl->update_interval = interval;
-    if (!ds->refreshing && ds->update_interval > interval) {
+    if (ds->gui_timer && !dcl->refresh_paused &&
+        !ds->refreshing && ds->update_interval > interval) {
         timer_mod(ds->gui_timer, ds->last_update + interval);
+    }
+}
+
+void displaychangelistener_pause_refresh(DisplayChangeListener *dcl,
+                                         bool paused)
+{
+    DisplayState *ds = dcl->ds;
+
+    if (!ds || dcl->refresh_paused == paused) {
+        return;
+    }
+    dcl->refresh_paused = paused;
+    if (!ds->refreshing) {
+        gui_setup_refresh(ds);
+        if (!paused && ds->gui_timer) {
+            timer_mod(ds->gui_timer, qemu_clock_get_ms(QEMU_CLOCK_REALTIME));
+        }
     }
 }
 
@@ -1924,6 +1952,24 @@ void dpy_gfx_update_full(QemuConsole *con)
     dpy_gfx_update(con, 0, 0, w, h);
 }
 
+void dpy_gfx_scanout_changed(QemuConsole *con, bool discard_frame)
+{
+    DisplayChangeListener *dcl;
+
+    if (!con || !con->surface ||
+        (!con->surface->scanout_can_poll &&
+         !(discard_frame && con->surface->scanout_ram))) {
+        return;
+    }
+    con->surface->scanout_can_poll = false;
+    QLIST_FOREACH(dcl, &con->ds->listeners, next) {
+        if (con == (dcl->con ? dcl->con : active_console) &&
+            dcl->ops->dpy_scanout_changed) {
+            dcl->ops->dpy_scanout_changed(dcl, discard_frame);
+        }
+    }
+}
+
 void dpy_gfx_replace_surface(QemuConsole *con,
                              DisplaySurface *surface)
 {
@@ -1992,7 +2038,7 @@ static void dpy_refresh(DisplayState *s)
     DisplayChangeListener *dcl;
 
     QLIST_FOREACH(dcl, &s->listeners, next) {
-        if (dcl->ops->dpy_refresh) {
+        if (dcl->ops->dpy_refresh && !dcl->refresh_paused) {
             dcl->ops->dpy_refresh(dcl);
         }
     }

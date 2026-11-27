@@ -1,4 +1,5 @@
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "exec/memory.h"
 #include "hw/display/edid.h"
 
@@ -30,4 +31,10 @@ void qemu_edid_region_io(MemoryRegion *region, Object *owner,
 {
     memory_region_init_io(region, owner, &edid_region_ops,
                           edid, "edid", size);
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (lats_nobql_enabled()) {
+        /* The EDID bytes are fixed before mapping. Writes have no effect. */
+        region->immutable_byte_array = true;
+    }
+#endif
 }

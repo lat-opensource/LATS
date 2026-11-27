@@ -2975,6 +2975,8 @@ static void memory_region_add_subregion_common(MemoryRegion *mr,
     if (subregion->ram_block && subregion->ram_block->vga &&
         (uint64_t)offset < latx_memory_backend_size) {
         VGACommonState *vga = subregion->ram_block->vga;
+        /* Keep aperture accesses on the same backing through the copy. */
+        g_autoptr(VGALowmemLock) lock = vga_lock_lowmem(vga);
 
         vram_base = offset;
         vram_size = subregion->size;
