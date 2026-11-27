@@ -223,7 +223,8 @@ static inline void mask2str(char *str, uint32_t val, uint8_t size)
 
 static void dump_apic_icr(APICCommonState *s, CPUX86State *env)
 {
-    uint32_t icr = s->icr[0], icr2 = s->icr[1];
+    uint32_t icr = qatomic_read(&s->icr[0]);
+    uint32_t icr2 = qatomic_read(&s->icr[1]);
     uint8_t dest_shorthand = \
         (icr & APIC_ICR_DEST_SHORT) >> APIC_ICR_DEST_SHORT_SHIFT;
     bool logical_mod = icr & APIC_ICR_DEST_MOD;
@@ -323,8 +324,16 @@ void x86_cpu_dump_local_apic_state(CPUState *cs, int flags)
 
     qemu_printf("ESR\t 0x%08x\n", s->esr);
 
-    dump_apic_interrupt("ISR", s->isr, s->tmr);
-    dump_apic_interrupt("IRR", s->irr, s->tmr);
+    APICCommonClass *klass = APIC_COMMON_GET_CLASS(s);
+    uint32_t irr[8], tmr[8];
+    if (klass->read_pending) {
+        klass->read_pending(s, irr, tmr);
+        dump_apic_interrupt("ISR", s->isr, tmr);
+        dump_apic_interrupt("IRR", irr, tmr);
+    } else {
+        dump_apic_interrupt("ISR", s->isr, s->tmr);
+        dump_apic_interrupt("IRR", s->irr, s->tmr);
+    }
 
     qemu_printf("\nAPR 0x%02x TPR 0x%02x DFR 0x%02x LDR 0x%02x",
                 s->arb_id, s->tpr, s->dest_mode, s->log_dest);

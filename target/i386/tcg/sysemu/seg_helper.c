@@ -21,6 +21,8 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "cpu.h"
+#include "sysemu/kvm.h"
+#include "sysemu/whpx.h"
 #include "exec/helper-proto.h"
 #include "exec/cpu_ldst.h"
 #include "tcg/helper-tcg.h"
@@ -125,6 +127,93 @@ void x86_cpu_do_interrupt(CPUState *cs)
                          env->exception_next_eip, 0);
         /* successfully delivered */
         env->old_exception = -1;
+    }
+}
+
+bool x86_cpu_try_local_hard(CPUState *cs)
+{
+    X86CPU *cpu = X86_CPU(cs);
+    CPUX86State *env = &cpu->env;
+    if ((!(env->cr[0] & CR0_PG_MASK) && !qemu_vcpu_statelock_enabled()) ||
+        (env->hflags & HF_GUEST_MASK) ||
+        qemu_loglevel_mask(CPU_LOG_INT) ||
+        x86_cpu_pending_interrupt(cs, CPU_INTERRUPT_HARD) != CPU_INTERRUPT_HARD) {
+        return false;
+    }
+    int vector = apic_try_ack_local_hard(cpu->apic_state);
+    if (vector < 0 && qemu_vcpu_statelock_enabled() &&
+        !kvm_irqchip_in_kernel() && !whpx_apic_in_platform()) {
+        vector = apic_try_ack_pic_or_local_hard(cpu->apic_state, cs);
+    }
+    if (vector < 0) {
+        return false;
+    }
+#ifdef CONFIG_LATX_OPT_NOFP
+    __nofp_sync_xmm_to_env(cs);
+    __nofp_sync_fpr_to_env(cs, 0);
+#endif
+    /* TI has been restored before descriptor/stack accesses, which may fault. */
+    do_interrupt_x86_hardirq(env, vector, 1);
+    return true;
+}
+
+bool x86_cpu_try_statelock_interrupt(CPUState *cs, int interrupt_request)
+{
+    X86CPU *cpu = X86_CPU(cs);
+    CPUX86State *env = &cpu->env;
+    int pending;
+
+    if ((env->hflags & HF_GUEST_MASK) || qemu_loglevel_mask(CPU_LOG_INT)) {
+        return false;
+    }
+    pending = x86_cpu_pending_interrupt(cs, interrupt_request);
+    if (!pending) {
+        return false;
+    }
+
+    switch (pending) {
+    case CPU_INTERRUPT_SMI:
+#ifdef CONFIG_LATX_OPT_NOFP
+        __nofp_sync_xmm_to_env(cs);
+        __nofp_sync_fpr_to_env(cs, 0);
+#endif
+        qatomic_and(&cs->interrupt_request, ~CPU_INTERRUPT_SMI);
+        do_smm_enter(cpu);
+        return true;
+    case CPU_INTERRUPT_NMI:
+#ifdef CONFIG_LATX_OPT_NOFP
+        __nofp_sync_xmm_to_env(cs);
+        __nofp_sync_fpr_to_env(cs, 0);
+#endif
+        qatomic_and(&cs->interrupt_request, ~CPU_INTERRUPT_NMI);
+        env->hflags2 |= HF2_NMI_MASK;
+        do_interrupt_x86_hardirq(env, EXCP02_NMI, 1);
+        return true;
+    case CPU_INTERRUPT_MCE:
+#ifdef CONFIG_LATX_OPT_NOFP
+        __nofp_sync_xmm_to_env(cs);
+        __nofp_sync_fpr_to_env(cs, 0);
+#endif
+        qatomic_and(&cs->interrupt_request, ~CPU_INTERRUPT_MCE);
+        do_interrupt_x86_hardirq(env, EXCP12_MCHK, 0);
+        return true;
+    case CPU_INTERRUPT_HARD: {
+        int vector = apic_try_ack_local_hard(cpu->apic_state);
+        if (vector < 0 && !kvm_irqchip_in_kernel() && !whpx_apic_in_platform()) {
+            vector = apic_try_ack_pic_or_local_hard(cpu->apic_state, cs);
+        }
+        if (vector < 0) {
+            return false;
+        }
+#ifdef CONFIG_LATX_OPT_NOFP
+        __nofp_sync_xmm_to_env(cs);
+        __nofp_sync_fpr_to_env(cs, 0);
+#endif
+        do_interrupt_x86_hardirq(env, vector, 1);
+        return true;
+    }
+    default:
+        return false;
     }
 }
 

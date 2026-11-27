@@ -39,7 +39,9 @@ QEMU_BUILD_BUG_ON(TCG_PHYS_ADDR_BITS > TARGET_PHYS_ADDR_SPACE_BITS);
  */
 void x86_cpu_do_interrupt(CPUState *cpu);
 #ifndef CONFIG_USER_ONLY
+bool x86_cpu_try_local_hard(CPUState *cs);
 bool x86_cpu_exec_interrupt(CPUState *cpu, int int_req);
+bool x86_cpu_try_statelock_interrupt(CPUState *cs, int interrupt_request);
 #endif
 
 void breakpoint_handler(CPUState *cs);

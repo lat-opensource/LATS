@@ -12,6 +12,9 @@
 
 #include "qemu/timer.h"
 
+/* No nanosecond offset divided by ten can equal this value. */
+#define CPU_CLOCK_TICKS_PAUSED INT64_MIN
+
 /* init the whole cpu timers API, including icount, ticks, and cpu_throttle */
 void cpu_timers_init(void);
 

@@ -21,6 +21,7 @@
 #include "latx-hack.h"
 #include "exec/ram_addr.h"
 #include "qemu/qtree.h"
+#include "sysemu/cpu-timers.h"
 #include "sys-aot.h"
 
 #define LATX_MMIO_KERNEL_VADDR_BASE 0xffff800000000000ULL
@@ -396,18 +397,6 @@ void latx_do_mmio_detected_tb_invalidate(TranslationBlock *tb)
 
 #ifdef CONFIG_LATX_OPT_BQL
 
-extern QemuMutex qemu_global_mutex;
-
-static void emit_global_mutex_unlock(IR2_OPND *t0)
-{
-    la_outi(LISA_DBAR, 0x0);
-    la_out2i(LISA_LD_D, t0, &la_env, offsetof(CPUX86State, qemu_global_mutex_ptr));
-    if (hamt_enabled()) {
-        latxs_tr_dmw_in_fix_mem(t0);
-    }
-    la_out2i(LISA_ST_W, &la_zero, t0, 0);
-}
-
 static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
 {
     IR2_OPND t0 = la_new_itmp();
@@ -415,24 +404,14 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
     IR2_OPND t2 = la_new_itmp();
     IR2_OPND t3 = la_new_itmp();
     IR2_OPND t4 = la_new_itmp();
-    IR2_OPND out_unlock = la_new_label();
+    IR2_OPND done = la_new_label();
     IR2_OPND s2 = la_new_label();
 
-// (0) spin lock (TTAS)
-    IR2_OPND loop = la_new_label();
-    la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, qemu_global_mutex_ptr));
-    if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t0);
-    la_out2i(LISA_ADDI_D, &t2, &la_zero, 0x1);
-    la_label_name(loop, "LOOP: global mutex spin lock");
-    la_out2i(LISA_LD_W, &t1, &t0, 0);
-    la_out2(LISA_BNEZ, &t1, &loop);
-    la_out3(LISA_AMSWAP_DB_W, &t1, &t0, &t2);
-    la_out2(LISA_BNEZ, &t1, &loop);
-    la_comment("back to LOOP if lock fail");
-
+    /* ISR belongs to this vCPU. Classify the EOI before changing it,
+     * so the helper can handle VAPIC or an IOAPIC broadcast from scratch. */
     // t0 = &apic_state
     la_out2i(LISA_LD_D, &t0, &la_env, offsetof(CPUX86State, apic_state));
-    la_out2(LISA_BEQZ, &t0, &out_unlock);
+    la_out2(LISA_BEQZ, &t0, &done);
     if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t0);
     la_out2i(LISA_LD_D, &t2, &t0, offsetof(APICCommonState, vapic_paddr));
     la_out2(LISA_BNEZ, &t2, label_exit);
@@ -489,7 +468,7 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
     la_out2 (LISA_BNEZ,   &t1, &s2);
 
 // (2) if (isrv < 0) return;
-    la_out1(LISA_B, &out_unlock);
+    la_out1(LISA_B, &done);
     la_label_name(s2, "after read isr");
     la_out2i(LISA_ADDI_D, &t1, &t1, -1);
     // t0 = apic state
@@ -504,15 +483,20 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
 //    }
     IR2_OPND no_broadcast_io = la_new_label();
 
-    la_out2i(LISA_ADDI_D, &t2, &t3, offsetof(APICCommonState, tmr[0]));
-    la_out3 (LISA_LDX_WU, &t2, &t0, &t2);
-    la_comment("get tmr[i]");
-    la_out2i(LISA_ADDI_D, &t4, &la_zero, 0x1);
-    la_out3 (LISA_SLL_D,  &t4, &t4, &t1);
-    la_comment("mask = 1 << (bit index)");
-    la_out3(LISA_AND,  &t2, &t2, &t4);
-    la_out2(LISA_BEQZ, &t2, &no_broadcast_io);
-    la_comment("if tmr[i]'s bit = 1, no broadcast");
+    /* t3 holds four times the word index. Each pending word is 8 bytes. */
+    la_out2i(LISA_SLLI_D, &t2, &t3, 1);
+    la_out2i(LISA_ADDI_D, &t2, &t2, offsetof(APICCommonState, pending));
+    la_out3(LISA_LDX_D, &t2, &t0, &t2);
+    /* Tagged words always have a nonzero low half. Resolve a tagged
+     * trigger-mode word before the inline path changes ISR. */
+    la_out2i(LISA_SRLI_D, &t4, &t2, 52);
+    la_out2i(LISA_XORI, &t4, &t4, 0xa52);
+    la_out2(LISA_BEQZ, &t4, label_exit);
+    la_out2i(LISA_SRLI_D, &t2, &t2, 32);
+    la_out2i(LISA_ADDI_D, &t4, &la_zero, 1);
+    la_out3(LISA_SLL_D, &t4, &t4, &t1);
+    la_out3(LISA_AND, &t2, &t2, &t4);
+    la_out2(LISA_BNEZ, &t2, &no_broadcast_io);
 
     la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, spurious_vec));
     la_comment("get spurious_vec");
@@ -527,65 +511,75 @@ static void latxs_translate_mov_to_apic_eoi(IR2_OPND *label_exit)
 
     la_label_name(no_broadcast_io, "no ioapic broadcast, go on");
 
-// (3) apic_reset_bit(s->isr, isrv);
+    /* Atomically clear the in-service bit, matching apic_reset_bit(). */
     la_out2i(LISA_ADDI_D, &t3, &t3, offsetof(APICCommonState, isr[0]));
-    la_out3 (LISA_LDX_WU, &t2, &t0, &t3);
-    la_comment("get isr[i]");
-    la_out2i(LISA_ADDI_D, &t4, &la_zero, 0x1);
-    la_out3 (LISA_SLL_D,  &t4, &t4, &t1);
-    la_comment("mask = 1 << (bit index)");
-    la_out3(LISA_ANDN,  &t2, &t2, &t4);
-    la_out3(LISA_STX_W, &t2, &t0, &t3);
-    la_comment("isr[i] = isr[i] & ~mask");
-    // t0 = apic state
-    // t1 = bit index
-    // t3 = offset of isr[i]
+    la_out3(LISA_ADD_D, &t3, &t0, &t3);
+    la_out2i(LISA_ADDI_D, &t4, &la_zero, 1);
+    la_out3(LISA_SLL_D, &t4, &t4, &t1);
+    la_out3(LISA_NOR, &t4, &t4, &la_zero);
+    la_out3(LISA_AMAND_DB_W, &la_zero, &t3, &t4);
+    // Recompute env->isrv from updated s->isr[7..0]
+    IR2_OPND isrv_loop = la_new_label();
+    IR2_OPND isrv_found = la_new_label();
+    IR2_OPND isrv_done = la_new_label();
+    la_out2i(LISA_ADDI_D, &t3, &la_zero, 4 * 7);
+    la_label_name(isrv_loop, "scan next highest isr word");
+    la_out2i(LISA_ADDI_D, &t4, &t3, offsetof(APICCommonState, isr[0]));
+    la_out3(LISA_LDX_WU, &t1, &t0, &t4);
+    la_out2(LISA_BNEZ, &t1, &isrv_found);
+    la_out2i(LISA_ADDI_D, &t3, &t3, -4);
+    la_out3(LISA_BGE, &t3, &la_zero, &isrv_loop);
+    la_out2i(LISA_ST_W, &la_zero, &la_env, lsenv_offset_of_isrv(lsenv));
+    la_out1(LISA_B, &isrv_done);
 
-// (-) apic_sync_vapic(s, SYNC_FROM_VAPIC | SYNC_TO_VAPIC);
+    la_label_name(isrv_found, "compute new env->isrv");
+    la_out2(LISA_CLZ_W, &t1, &t1);
+    la_out2i(LISA_ADDI_D, &t2, &la_zero, 31);
+    la_out3(LISA_SUB_D, &t1, &t2, &t1);
+    la_out2i(LISA_SLLI_D, &t3, &t3, 3);
+    la_out3(LISA_ADD_D, &t1, &t1, &t3);
+    la_out2i(LISA_ANDI, &t1, &t1, 0xf0);
+    la_out2i(LISA_ST_W, &t1, &la_env, lsenv_offset_of_isrv(lsenv));
+    la_label_name(isrv_done, "env->isrv updated");
 
-// (5)  apic_update_irq(s) when irr[] != 0 or CPU_INTERRUPT_HARD is set
-    IR2_OPND need_poll = la_new_label();
-
-    la_out2i(LISA_LD_WU, &t1, &t0, offsetof(APICCommonState, irr[0]));
-    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[1]));
-    la_out3(LISA_OR, &t1, &t1, &t2);
-    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[2]));
-    la_out3(LISA_OR, &t1, &t1, &t2);
-    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[3]));
-    la_out3(LISA_OR, &t1, &t1, &t2);
-    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[4]));
-    la_out3(LISA_OR, &t1, &t1, &t2);
-    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[5]));
-    la_out3(LISA_OR, &t1, &t1, &t2);
-    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[6]));
-    la_out3(LISA_OR, &t1, &t1, &t2);
-    la_out2i(LISA_LD_WU, &t2, &t0, offsetof(APICCommonState, irr[7]));
-    la_out3(LISA_OR, &t1, &t1, &t2);
-
+    /* A hardware timer or another CPU can post while ISR is being
+     * updated. Ask the owner to recheck pending vectors and the PIC. */
     la_out2i(LISA_LD_D, &t2, &la_env, offsetof(CPUX86State, interrupt_request_ptr));
-    if (hamt_enabled()) latxs_tr_dmw_in_fix_mem(&t2);
-    la_out2i(LISA_LD_WU, &t4, &t2, 0);
-    la_out2(LISA_BNEZ, &t1, &need_poll);
-    la_out2i(LISA_ANDI, &t3, &t4, CPU_INTERRUPT_HARD);
-    la_out2(LISA_BNEZ, &t3, &need_poll);
+    if (hamt_enabled()) {
+        latxs_tr_dmw_in_fix_mem(&t2);
+    }
+    IR2_OPND poll = la_new_label();
 
+    /*
+     * The software APIC initializes la_ecfg only for the hardware timer.
+     * Read it at execution time, including when this TB came from AOT.
+     * Without that timer, only this vCPU writes its cached IRR. A remote
+     * post missed by the scan publishes its own POLL and exit request.
+     */
+    la_out2i(LISA_LD_D, &t3, &t0, offsetof(APICCommonState, la_ecfg));
+    la_out2(LISA_BNEZ, &t3, &poll);
+    la_out2i(LISA_LD_WU, &t1, &t0, offsetof(APICCommonState, pending[0]));
+    for (unsigned i = 1; i < ARRAY_SIZE(((APICCommonState *)0)->pending); i++) {
+        la_out2i(LISA_LD_WU, &t3, &t0,
+                 offsetof(APICCommonState, pending) + i * sizeof(uint64_t));
+        la_out3(LISA_OR, &t1, &t1, &t3);
+    }
+    la_out2(LISA_BNEZ, &t1, &poll);
+    la_out2i(LISA_LD_WU, &t3, &t2, 0);
+    la_out2i(LISA_ANDI, &t3, &t3, CPU_INTERRUPT_HARD);
+    la_out2(LISA_BNEZ, &t3, &poll);
     la_out2i(LISA_ADDI_D, &t3, &la_zero, -1);
     la_out2i(LISA_ST_W, &t3, &la_env, lsenv_offset_of_irrv(lsenv));
-    la_out1(LISA_B, &out_unlock);
+    la_out1(LISA_B, &done);
 
-    la_label_name(need_poll, "EOI pending IRQ -> trigger poll");
-    la_out2i(LISA_ORI, &t4, &t4, CPU_INTERRUPT_POLL);
-    la_out2i(LISA_ST_W, &t4, &t2, 0);
-    la_comment("cpu->interrupt_request |= CPU_INTERRUPT_POLL");
+    la_label_name(poll, "recheck pending interrupts after EOI");
+    la_out2i(LISA_ADDI_D, &t4, &la_zero, CPU_INTERRUPT_POLL);
+    la_out3(LISA_AMOR_DB_W, &la_zero, &t2, &t4);
     la_out2i(LISA_ADDI_D, &t4, &la_zero, -1);
-    la_out2i(LISA_ST_W, &t4, &la_env,
-                             (int)offsetof(X86CPU, neg.icount_decr.u32) -
-                             (int)offsetof(X86CPU, env));
-    la_comment("neg.icount_decr.u32 = -1");
-
-// (6)  spin unlock
-    la_label_name(out_unlock, "spin unlock and out");
-    emit_global_mutex_unlock(&t0);
+    la_out2i(LISA_ST_H, &t4, &la_env,
+             (int)offsetof(X86CPU, neg.icount_decr.u16.high) -
+             (int)offsetof(X86CPU, env));
+    la_label_name(done, "local APIC EOI done");
 
     la_tmp_free(t0);
     la_tmp_free(t1);
@@ -726,7 +720,7 @@ static void latxs_translate_mov_to_apic_icr_hi(IR1_OPND *dst, IR1_OPND *src)
 static void latxs_translate_mov_to_apic_eoi_mem(IR1_OPND *dst, IR1_OPND *src)
 {
     IR2_OPND eoi_fast = la_new_label();
-    IR2_OPND eoi_slow_unlock = la_new_label();
+    IR2_OPND eoi_slow = la_new_label();
     IR2_OPND apic_fallback = la_new_label();
     IR2_OPND eoi_done = la_new_label();
     IR2_OPND t4 = la_new_itmp();
@@ -748,13 +742,10 @@ static void latxs_translate_mov_to_apic_eoi_mem(IR1_OPND *dst, IR1_OPND *src)
     la_tmp_free(t4);
 
     la_label_name(eoi_fast, "inline APIC [reg+0xb0] EOI");
-    latxs_translate_mov_to_apic_eoi(&eoi_slow_unlock);
+    latxs_translate_mov_to_apic_eoi(&eoi_slow);
     la_out1(LISA_B, &eoi_done);
 
-    la_label_name(eoi_slow_unlock, "APIC [reg+0xb0] EOI slowpath unlock");
-    IR2_OPND utmp = la_new_itmp();
-    emit_global_mutex_unlock(&utmp);
-    la_tmp_free(utmp);
+    la_label_name(eoi_slow, "APIC [reg+0xb0] EOI helper");
     emit_apic_mem_write_helper(src, ir1_opnd_size(dst), 0xb0);
     la_out1(LISA_B, &eoi_done);
 
@@ -849,10 +840,6 @@ bool latxs_translate_mov_opt_apic(IR1_INST *pir1)
         la_out1(LISA_B, &eoi_opt_ok);
 
         la_label_name(label_exit, "EOI opt fail, fallback");
-        IR2_OPND t0 = la_new_itmp();
-        emit_global_mutex_unlock(&t0);
-        la_comment("global mutex spin unlock");
-        la_tmp_free(t0);
     }
 #endif
 
@@ -1002,6 +989,8 @@ bool latxs_translate_mov_opt_hpet(IR1_INST *pir1)
     // if (s->config & HPET_CFG_ENABLE)
     la_label(hpet_enable);
     la_out2 (LISA_RDTIME_D, &t1, &la_zero);
+    /* Sample the host clock before testing its running offset. */
+    la_outi(LISA_DBAR, 0);
     la_out2i(LISA_LD_D, &t2, &t0, hpet_offset_hpet_offset_ticks);
     la_out3(LISA_ADD_D, &t1, &t1, &t2);
 
@@ -1010,6 +999,8 @@ bool latxs_translate_mov_opt_hpet(IR1_INST *pir1)
         latxs_tr_dmw_in_fix_mem(&t2);
     }
     la_out2i(LISA_LD_D, &t2, &t2, ts_offset_cpu_clock_offset);
+    la_imm(&t3, CPU_CLOCK_TICKS_PAUSED);
+    la_out3(LISA_BEQ, &t2, &t3, &hpet_fallback);
     la_out3(LISA_ADD_D, &t1, &t1, &t2);
 
     /* Publish and return the greatest tick observed by any vCPU. */

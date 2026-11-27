@@ -26,6 +26,10 @@ bool all_cpu_threads_idle(void);
 bool cpu_can_run(CPUState *cpu);
 void qemu_wait_io_event_common(CPUState *cpu);
 void qemu_wait_io_event(CPUState *cpu);
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+bool qemu_try_resume_vcpu_unlocked(CPUState *cpu, bool guest_halted);
+void qemu_wait_io_event_unlocked(CPUState *cpu);
+#endif
 void cpu_thread_signal_created(CPUState *cpu);
 void cpu_thread_signal_destroyed(CPUState *cpu);
 void cpu_handle_guest_debug(CPUState *cpu);

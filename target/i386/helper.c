@@ -18,6 +18,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
 #include "qapi/qapi-events-run-state.h"
 #include "cpu.h"
 #include "exec/exec-all.h"
@@ -611,12 +612,13 @@ void do_cpu_init(X86CPU *cpu)
     CPUState *cs = CPU(cpu);
     CPUX86State *env = &cpu->env;
     CPUX86State *save = g_new(CPUX86State, 1);
-    int sipi = cs->interrupt_request & CPU_INTERRUPT_SIPI;
+    apic_ipi_quiesce();
+    int sipi = qatomic_read(&cs->interrupt_request) & CPU_INTERRUPT_SIPI;
 
     *save = *env;
 
     cpu_reset(cs);
-    cs->interrupt_request = sipi;
+    qatomic_or(&cs->interrupt_request, sipi);
     memcpy(&env->start_init_save, &save->start_init_save,
            offsetof(CPUX86State, end_init_save) -
            offsetof(CPUX86State, start_init_save));
@@ -626,6 +628,15 @@ void do_cpu_init(X86CPU *cpu)
         kvm_arch_do_init_vcpu(cpu);
     }
     apic_init_reset(cpu->apic_state);
+    if (qemu_vcpu_statelock_enabled()) {
+        lats_lockdep_acquire(&cs->state_lock, LOCK_RANK_LEAF,
+                             "cpu->state_lock");
+        qemu_spin_lock(&cs->state_lock);
+        qatomic_set(&cs->halted, !cpu_is_bsp(cpu));
+        qemu_spin_unlock(&cs->state_lock);
+        lats_lockdep_release(&cs->state_lock);
+    }
+    apic_ipi_resume();
 #endif /* CONFIG_USER_ONLY */
 }
 

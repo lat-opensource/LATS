@@ -23,6 +23,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
 #include "target/i386/latx/include/latx-options.h"
 #include "target/i386/latx/include/latx-sigrt-sys.h"
 #include "monitor/monitor.h"
@@ -44,6 +45,7 @@
 #include "hw/nmi.h"
 #include "sysemu/replay.h"
 #include "sysemu/runstate.h"
+#include "sysemu/tcg.h"
 #include "sysemu/cpu-timers.h"
 #include "sysemu/whpx.h"
 #include "hw/boards.h"
@@ -53,6 +55,7 @@
 #include "hamt-options.h"
 
 int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request);
+bool x86_cpu_has_wakeup_control_irq(int interrupt_request);
 
 
 #ifdef CONFIG_LINUX
@@ -73,7 +76,8 @@ int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request);
 
 #endif /* CONFIG_LINUX */
 
-QemuMutex qemu_global_mutex;
+/* Keep the lock address private to the CPU and main-loop APIs. */
+static QemuMutex qemu_global_mutex;
 
 /*
  * The chosen accelerator is supposed to register this.
@@ -82,7 +86,7 @@ static const AccelOpsClass *cpus_accel;
 
 bool cpu_is_stopped(CPUState *cpu)
 {
-    return cpu->stopped || !runstate_is_running();
+    return qatomic_read(&cpu->stopped) || !runstate_is_running();
 }
 
 bool cpu_work_list_empty(CPUState *cpu)
@@ -92,19 +96,27 @@ bool cpu_work_list_empty(CPUState *cpu)
 
 bool cpu_thread_is_idle(CPUState *cpu)
 {
-    if (cpu->stop || !cpu_work_list_empty(cpu)) {
+    if (qatomic_read(&cpu->stop) || !cpu_work_list_empty(cpu)) {
         return false;
     }
     if (cpu_is_stopped(cpu)) {
         return true;
     }
 #ifdef CONFIG_LATX_OPT
-    if (!cpu->halted || (x86_cpu_pending_interrupt(cpu, cpu->interrupt_request) != 0)) {
+    {
+        int req = qatomic_read(&cpu->interrupt_request);
+        if (!qatomic_read(&cpu->halted) ||
+            (x86_cpu_pending_interrupt(cpu, req) != 0) ||
+            (qemu_vcpu_statelock_enabled() &&
+             x86_cpu_has_wakeup_control_irq(req))) {
+            return false;
+        }
+    }
 #else
     if (!cpu->halted || cpu_has_work(cpu)) {
-#endif
         return false;
     }
+#endif
     if (cpus_accel->cpu_thread_is_idle) {
         return cpus_accel->cpu_thread_is_idle(cpu);
     }
@@ -248,7 +260,7 @@ int64_t cpus_get_elapsed_ticks(void)
 
 static void generic_handle_interrupt(CPUState *cpu, int mask)
 {
-    cpu->interrupt_request |= mask;
+    qatomic_or(&cpu->interrupt_request, mask);
 
     if (!qemu_cpu_is_self(cpu)) {
         qemu_cpu_kick(cpu);
@@ -295,7 +307,7 @@ int vm_shutdown(void)
 
 bool cpu_can_run(CPUState *cpu)
 {
-    if (cpu->stop) {
+    if (qatomic_read(&cpu->stop)) {
         return false;
     }
     if (cpu_is_stopped(cpu)) {
@@ -320,7 +332,7 @@ void cpu_handle_guest_debug(CPUState *cpu)
     } else {
         gdb_set_stop_cpu(cpu);
         qemu_system_debug_request();
-        cpu->stopped = true;
+        qatomic_set(&cpu->stopped, true);
     }
 }
 
@@ -389,14 +401,38 @@ static QemuCond qemu_cpu_cond;
 /* system init */
 static QemuCond qemu_pause_cond;
 
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+static bool trial_exclusive_cpu_work;
+static bool trial_exclusive_cpu_work_all;
+static uint64_t trial_exclusive_items, trial_exclusive_resumed;
+
+void trial_exclusive_work_counts(const char *phase);
+void trial_exclusive_work_counts(const char *phase)
+{
+    fprintf(stderr, "EXCLUSIVE_CPU_WORK %s items=%" PRIu64
+                    " resumed=%" PRIu64 "\n",
+            phase, qatomic_read(&trial_exclusive_items),
+            qatomic_read(&trial_exclusive_resumed));
+}
+#endif
+
+static bool io_thread_initialized;
+
 void qemu_init_cpu_loop(void)
 {
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+    trial_exclusive_cpu_work_all =
+        lats_nobql_enabled();
+    trial_exclusive_cpu_work = trial_exclusive_cpu_work_all ||
+        lats_nobql_enabled();
+#endif
     qemu_init_sigbus();
     qemu_cond_init(&qemu_cpu_cond);
     qemu_cond_init(&qemu_pause_cond);
     qemu_mutex_init(&qemu_global_mutex);
 
     qemu_thread_get_self(&io_thread);
+    qatomic_store_release(&io_thread_initialized, true);
 }
 
 void run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data)
@@ -404,11 +440,20 @@ void run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data)
     do_run_on_cpu(cpu, func, data, &qemu_global_mutex);
 }
 
+void run_on_cpu_nobql(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data)
+{
+    if (qemu_vcpu_statelock_enabled()) {
+        do_run_on_cpu_nobql(cpu, func, data, &qemu_global_mutex);
+    } else {
+        do_run_on_cpu(cpu, func, data, &qemu_global_mutex);
+    }
+}
+
 static void qemu_cpu_stop(CPUState *cpu, bool exit)
 {
     g_assert(qemu_cpu_is_self(cpu));
-    cpu->stop = false;
-    cpu->stopped = true;
+    qatomic_set(&cpu->stop, false);
+    qatomic_set(&cpu->stopped, true);
     if (exit) {
         cpu_exit(cpu);
     }
@@ -418,7 +463,7 @@ static void qemu_cpu_stop(CPUState *cpu, bool exit)
 void qemu_wait_io_event_common(CPUState *cpu)
 {
     qatomic_set_mb(&cpu->thread_kicked, false);
-    if (cpu->stop) {
+    if (qatomic_read(&cpu->stop)) {
         qemu_cpu_stop(cpu, false);
     }
     process_queued_cpu_work(cpu);
@@ -429,6 +474,102 @@ extern uint64_t latx_profile_cpu_halt_time[];
 #endif
 
 extern uint64_t qcondwait3_max;
+
+bool qemu_vcpu_statelock_enabled(void)
+{
+    static int enabled = -1;
+    int val = qatomic_read(&enabled);
+
+    if (unlikely(val < 0)) {
+        val = lats_nobql_enabled();
+        qatomic_set(&enabled, val);
+    }
+    return val != 0;
+}
+
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+/* Only the vCPU may enter the guest again. Management and work callbacks
+ * retain their existing synchronization when this returns false. */
+bool qemu_try_resume_vcpu_unlocked(CPUState *cpu, bool guest_halted)
+{
+    unsigned exclusive_items = 0;
+    bool statelock = qemu_vcpu_statelock_enabled();
+    bool resume;
+#ifdef CONFIG_LATX_PROFILER
+    uint64_t start = latx_host_rdtime();
+#endif
+
+    assert(!qemu_mutex_iothread_locked());
+    qatomic_set_mb(&cpu->exit_request, 0);
+    for (;;) {
+        unsigned seq = qatomic_load_acquire(&cpu->halt_cond->futex_seq);
+        bool halted;
+        int req;
+
+        /*
+         * Check the persistent requests after reading the sequence. Their
+         * producers publish the state before waking the vCPU. An arrival
+         * after this check changes the futex value or the TB exit flag.
+         */
+        if (!cpu_can_run(cpu) || qatomic_read(&cpu->unplug)) {
+            resume = false;
+            break;
+        }
+        if (!cpu_work_list_empty(cpu)) {
+            if (statelock && process_nobql_cpu_work_unlocked(cpu, true)) {
+                continue;
+            }
+            if (trial_exclusive_cpu_work &&
+                (trial_exclusive_cpu_work_all ||
+                 (!guest_halted && !qatomic_read(&cpu->halted) &&
+                  !qatomic_read(&cpu->interrupt_request))) &&
+                process_exclusive_cpu_work_unlocked(
+                    cpu, trial_exclusive_cpu_work_all)) {
+                ++exclusive_items;
+                continue;
+            }
+            resume = false;
+            break;
+        }
+        if (statelock) {
+            lats_lockdep_acquire(&cpu->state_lock, LOCK_RANK_LEAF,
+                                 "cpu->state_lock");
+            qemu_spin_lock(&cpu->state_lock);
+            halted = qatomic_read(&cpu->halted) != 0;
+            req = qatomic_read(&cpu->interrupt_request);
+            qemu_spin_unlock(&cpu->state_lock);
+            lats_lockdep_release(&cpu->state_lock);
+        } else {
+            halted = cpu->halted != 0;
+            req = qatomic_read(&cpu->interrupt_request);
+        }
+        if (!halted || x86_cpu_pending_interrupt(cpu, req) ||
+            (statelock && x86_cpu_has_wakeup_control_irq(req))) {
+            resume = true;
+            break;
+        }
+        if ((!guest_halted && !statelock) ||
+            test_bit(QEMU_PLUGIN_EV_VCPU_IDLE, cpu->plugin_mask) ||
+            test_bit(QEMU_PLUGIN_EV_VCPU_RESUME, cpu->plugin_mask)) {
+            resume = false;
+            break;
+        }
+        qemu_cond_wait_2_deadline_unlocked(cpu->halt_cond, seq, NULL, qcondwait3_max);
+    }
+#ifdef CONFIG_LATX_PROFILER
+    qatomic_add(&latx_profile_cpu_halt_time[cpu->cpu_index],
+                latx_host_rdtime() - start);
+#endif
+    if (exclusive_items) {
+        qatomic_add(&trial_exclusive_items, exclusive_items);
+        if (resume) {
+            qatomic_inc(&trial_exclusive_resumed);
+        }
+    }
+    return resume;
+}
+#endif
+
 void qemu_wait_io_event(CPUState *cpu)
 {
     bool slept = false;
@@ -436,13 +577,25 @@ void qemu_wait_io_event(CPUState *cpu)
 #ifdef CONFIG_LATX_PROFILER
     uint64_t cpu_halt_st = latx_host_rdtime();
 #endif
-    while (cpu_thread_is_idle(cpu)) {
+    for (;;) {
+#ifdef CONFIG_LATX_OPT_BQL
+        /* A kick can publish work without holding the global lock. */
+        unsigned seq = qatomic_load_acquire(&cpu->halt_cond->futex_seq);
+#endif
+        if (!cpu_thread_is_idle(cpu)) {
+            break;
+        }
         if (!slept) {
             slept = true;
             qemu_plugin_vcpu_idle_cb(cpu);
         }
-        qemu_cond_wait_3(cpu->halt_cond, &qemu_global_mutex, qcondwait3_max);
-	}
+#ifdef CONFIG_LATX_OPT_BQL
+        qemu_cond_wait_2_deadline(cpu->halt_cond, &qemu_global_mutex,
+                                  seq, NULL, qcondwait3_max);
+#else
+        qemu_cond_wait(cpu->halt_cond, &qemu_global_mutex);
+#endif
+    }
 #ifdef CONFIG_LATX_PROFILER
     uint64_t cpu_halt_ed = latx_host_rdtime();
     uint64_t *cpu_halt_time_ptr = &latx_profile_cpu_halt_time[cpu->cpu_index];
@@ -461,6 +614,52 @@ void qemu_wait_io_event(CPUState *cpu)
 #endif
     qemu_wait_io_event_common(cpu);
 }
+
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+void qemu_wait_io_event_unlocked(CPUState *cpu)
+{
+    bool slept = false;
+#ifdef CONFIG_LATX_PROFILER
+    uint64_t cpu_halt_st = latx_host_rdtime();
+#endif
+
+    assert(!qemu_mutex_iothread_locked());
+    for (;;) {
+        unsigned seq = qatomic_load_acquire(&cpu->halt_cond->futex_seq);
+        if (!cpu_thread_is_idle(cpu)) {
+            break;
+        }
+        if (!slept) {
+            slept = true;
+            if (unlikely(test_bit(QEMU_PLUGIN_EV_VCPU_IDLE,
+                                  cpu->plugin_mask))) {
+                qemu_mutex_lock_iothread();
+                qemu_plugin_vcpu_idle_cb(cpu);
+                qemu_mutex_unlock_iothread();
+            }
+        }
+        qemu_cond_wait_2_deadline_unlocked(cpu->halt_cond, seq, NULL,
+                                           qcondwait3_max);
+    }
+#ifdef CONFIG_LATX_PROFILER
+    uint64_t cpu_halt_ed = latx_host_rdtime();
+    uint64_t *cpu_halt_time_ptr = &latx_profile_cpu_halt_time[cpu->cpu_index];
+    qatomic_add(cpu_halt_time_ptr, (cpu_halt_ed - cpu_halt_st));
+#endif
+    if (slept && unlikely(test_bit(QEMU_PLUGIN_EV_VCPU_RESUME,
+                                   cpu->plugin_mask))) {
+        qemu_mutex_lock_iothread();
+        qemu_plugin_vcpu_resume_cb(cpu);
+        qemu_mutex_unlock_iothread();
+    }
+
+    qatomic_set_mb(&cpu->thread_kicked, false);
+    if (qatomic_read(&cpu->stop)) {
+        qemu_cpu_stop(cpu, false);
+    }
+    process_queued_cpu_work_unlocked(cpu);
+}
+#endif
 
 void cpus_kick_thread(CPUState *cpu)
 {
@@ -515,6 +714,10 @@ bool qemu_mutex_iothread_locked(void)
 
 bool qemu_in_main_thread(void)
 {
+    if (lats_nobql_enabled() && qatomic_load_acquire(&io_thread_initialized) &&
+        qemu_thread_is_self(&io_thread)) {
+        return true;
+    }
     return qemu_mutex_iothread_locked();
 }
 
@@ -527,6 +730,7 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock = qatomic_read(&qemu_bql_mutex_lock_func);
 
     g_assert(!qemu_mutex_iothread_locked());
+    lats_lockdep_acquire(&qemu_global_mutex, LOCK_RANK_BQL, "bql");
 #ifdef CONFIG_LATX_OPT_BQL
     if (likely(bql_lock == qemu_bql_lock_impl)) {
         pthread_spin_lock(&qemu_global_mutex.spin);
@@ -539,18 +743,34 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line)
     set_iothread_locked(true);
 }
 
-void qemu_mutex_lock_iothread_mmio_impl(const void *mr, const char *name,
-                                        uint64_t offset, bool is_write,
-                                        const char *file, int line)
+#ifdef CONFIG_LATX_PROFILER
+static __thread uint64_t mmio_bql_profile_ticks;
+
+uint64_t qemu_mmio_bql_profile_ticks(void)
+{
+    return mmio_bql_profile_ticks;
+}
+
+#endif
+
+static inline void qemu_mutex_lock_iothread_mmio(const void *mr, const char *name,
+                                                  uint64_t offset, bool is_write,
+                                                  const char *file, int line,
+                                                  bool profile_tb)
 {
     QemuMutexLockFunc bql_lock = qatomic_read(&qemu_bql_mutex_lock_func);
     bool profiling = unlikely(bql_lock != qemu_bql_lock_impl);
     int64_t start = 0;
 
     g_assert(!qemu_mutex_iothread_locked());
+    lats_lockdep_acquire(&qemu_global_mutex, LOCK_RANK_BQL,
+                         name ? name : "bql-mmio");
     if (profiling) {
         start = get_clock();
     }
+#ifdef CONFIG_LATX_PROFILER
+    uint64_t tb_start = profile_tb ? latx_host_rdtime() : 0;
+#endif
 #ifdef CONFIG_LATX_OPT_BQL
     if (likely(!profiling)) {
         pthread_spin_lock(&qemu_global_mutex.spin);
@@ -560,12 +780,33 @@ void qemu_mutex_lock_iothread_mmio_impl(const void *mr, const char *name,
 #else
     bql_lock(&qemu_global_mutex, file, line);
 #endif
+#ifdef CONFIG_LATX_PROFILER
+    if (profile_tb) {
+        mmio_bql_profile_ticks += latx_host_rdtime() - tb_start;
+    }
+#endif
     if (profiling) {
         qsp_record_mmio_bql(mr, name, offset, is_write,
                             get_clock() - start);
     }
     set_iothread_locked(true);
 }
+
+void qemu_mutex_lock_iothread_mmio_impl(const void *mr, const char *name,
+                                       uint64_t offset, bool is_write,
+                                       const char *file, int line)
+{
+    qemu_mutex_lock_iothread_mmio(mr, name, offset, is_write, file, line, false);
+}
+
+#ifdef CONFIG_LATX_PROFILER
+void qemu_mutex_lock_iothread_mmio_profile_impl(const void *mr, const char *name,
+                                                uint64_t offset, bool is_write,
+                                                const char *file, int line)
+{
+    qemu_mutex_lock_iothread_mmio(mr, name, offset, is_write, file, line, true);
+}
+#endif
 
 void qemu_mutex_unlock_iothread(void)
 {
@@ -576,6 +817,7 @@ void qemu_mutex_unlock_iothread(void)
 #else
     qemu_mutex_unlock(&qemu_global_mutex);
 #endif
+    lats_lockdep_release(&qemu_global_mutex);
     if (option_int_opt == IRQ_CHECK_ASYNC_NOTIFY && !current_cpu) {
         lats_notify_after_iothread_unlock();
     }
@@ -601,14 +843,14 @@ void qemu_cond_timedwait_iothread(QemuCond *cond, int ms)
 /* signal CPU creation */
 void cpu_thread_signal_created(CPUState *cpu)
 {
-    cpu->created = true;
+    qatomic_store_release(&cpu->created, true);
     qemu_cond_signal_1(&qemu_cpu_cond);
 }
 
 /* signal CPU destruction */
 void cpu_thread_signal_destroyed(CPUState *cpu)
 {
-    cpu->created = false;
+    qatomic_store_release(&cpu->created, false);
     qemu_cond_signal_1(&qemu_cpu_cond);
 }
 
@@ -618,7 +860,7 @@ static bool all_vcpus_paused(void)
     CPUState *cpu;
 
     CPU_FOREACH(cpu) {
-        if (!cpu->stopped) {
+        if (!qatomic_read(&cpu->stopped)) {
             return false;
         }
     }
@@ -630,12 +872,15 @@ void pause_all_vcpus(void)
 {
     CPUState *cpu;
 
+    if (cpus_accel->set_irq_delivery_paused) {
+        cpus_accel->set_irq_delivery_paused(true);
+    }
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false);
     CPU_FOREACH(cpu) {
         if (qemu_cpu_is_self(cpu)) {
             qemu_cpu_stop(cpu, true);
         } else {
-            cpu->stop = true;
+            qatomic_set(&cpu->stop, true);
             qemu_cpu_kick(cpu);
         }
     }
@@ -645,22 +890,70 @@ void pause_all_vcpus(void)
      */
     replay_mutex_unlock();
 
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+    if (qemu_vcpu_statelock_enabled() && qemu_tcg_mode_2_lat() &&
+        tcg_enabled() && replay_mode == REPLAY_MODE_NONE &&
+        !icount_enabled() && !option_htimer) {
+        /*
+         * Unlocked MTTCG vCPUs execute qemu_cpu_stop() without BQL. Wait
+         * without dropping BQL first; fall back to dropping BQL after
+         * bounded retries if any vCPU is blocked on BQL in legacy MMIO.
+         */
+        for (int attempt = 0; attempt < 64 && !all_vcpus_paused(); ++attempt) {
+            unsigned long ticket = qemu_cond_wait_prepare_1(&qemu_pause_cond);
+            if (all_vcpus_paused()) {
+                break;
+            }
+            if (!qemu_cond_wait_1_n_unlocked(&qemu_pause_cond, ticket, 10000)) {
+                CPU_FOREACH(cpu) {
+                    if (!qatomic_read(&cpu->stopped)) {
+                        qemu_cpu_kick(cpu);
+                    }
+                }
+                if (attempt >= 2) {
+                    g_usleep(100);
+                }
+            }
+        }
+    }
+#endif
+
     while (!all_vcpus_paused()) {
-        qemu_cond_wait_1(&qemu_pause_cond, &qemu_global_mutex);
+        if (!qemu_mutex_iothread_locked()) {
+            unsigned long ticket = qemu_cond_wait_prepare_1(&qemu_pause_cond);
+            if (all_vcpus_paused()) {
+                break;
+            }
+            if (!qemu_cond_wait_1_n_unlocked(&qemu_pause_cond, ticket, 10000)) {
+                g_usleep(100);
+            }
+        } else {
+            qemu_cond_wait_1(&qemu_pause_cond, &qemu_global_mutex);
+        }
         CPU_FOREACH(cpu) {
             qemu_cpu_kick(cpu);
         }
     }
 
-    qemu_mutex_unlock_iothread();
-    replay_mutex_lock();
-    qemu_mutex_lock_iothread();
+    if (replay_mode != REPLAY_MODE_NONE) {
+        bool had_bql = qemu_mutex_iothread_locked();
+        if (had_bql) {
+            qemu_mutex_unlock_iothread();
+        }
+        replay_mutex_lock();
+        if (had_bql) {
+            qemu_mutex_lock_iothread();
+        }
+    }
 }
 
 void cpu_resume(CPUState *cpu)
 {
-    cpu->stop = false;
-    cpu->stopped = false;
+    if (cpus_accel->set_irq_delivery_paused) {
+        cpus_accel->set_irq_delivery_paused(false);
+    }
+    qatomic_set(&cpu->stop, false);
+    qatomic_set(&cpu->stopped, false);
     qemu_cpu_kick(cpu);
 }
 
@@ -680,12 +973,18 @@ void resume_all_vcpus(void)
 
 void cpu_remove_sync(CPUState *cpu)
 {
-    cpu->stop = true;
-    cpu->unplug = true;
+    bool had_bql = qemu_mutex_iothread_locked();
+
+    qatomic_set(&cpu->stop, true);
+    qatomic_set(&cpu->unplug, true);
     qemu_cpu_kick(cpu);
-    qemu_mutex_unlock_iothread();
+    if (had_bql) {
+        qemu_mutex_unlock_iothread();
+    }
     qemu_thread_join(cpu->thread);
-    qemu_mutex_lock_iothread();
+    if (had_bql) {
+        qemu_mutex_lock_iothread();
+    }
 }
 
 void cpus_register_accel(const AccelOpsClass *ops)
@@ -708,7 +1007,7 @@ void qemu_init_vcpu(CPUState *cpu)
 
     cpu->nr_cores = ms->smp.cores;
     cpu->nr_threads =  ms->smp.threads;
-    cpu->stopped = true;
+    qatomic_set(&cpu->stopped, true);
     cpu->random_seed = qemu_guest_random_seed_thread_part1();
 
     if (!cpu->as) {
@@ -726,7 +1025,21 @@ void qemu_init_vcpu(CPUState *cpu)
 
     cpus_accel->create_vcpu_thread(cpu);
 
-    while (!cpu->created) {
+    while (!qatomic_load_acquire(&cpu->created)) {
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+        if (qemu_vcpu_statelock_enabled() && qemu_tcg_mode_2_lat() &&
+            tcg_enabled() && replay_mode == REPLAY_MODE_NONE &&
+            !icount_enabled() && !option_htimer) {
+            unsigned long ticket = qemu_cond_wait_prepare_1(&qemu_cpu_cond);
+            if (qatomic_load_acquire(&cpu->created)) {
+                break;
+            }
+            if (!qemu_cond_wait_1_n_unlocked(&qemu_cpu_cond, ticket, 10000)) {
+                g_usleep(50);
+            }
+            continue;
+        }
+#endif
 #ifdef CONFIG_LATX_OPT
         qemu_cond_wait_1(&qemu_cpu_cond, &qemu_global_mutex);
 #else
@@ -738,7 +1051,7 @@ void qemu_init_vcpu(CPUState *cpu)
 void cpu_stop_current(void)
 {
     if (current_cpu) {
-        current_cpu->stop = true;
+        qatomic_set(&current_cpu->stop, true);
         cpu_exit(current_cpu);
     }
 }

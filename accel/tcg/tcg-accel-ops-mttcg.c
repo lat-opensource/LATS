@@ -44,6 +44,7 @@
 #include "hamt-enter.h"
 #include "hamt-options.h"
 #include "latx-sigrt-sys.h"
+#include "latx/include/latx-options.h"
 
 typedef struct MttcgForceRcuNotifier {
     Notifier notifier;
@@ -190,7 +191,7 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
      * Called with rcu_registry_lock held, using async_run_on_cpu() ensures
      * that there are no deadlocks.
      */
-    async_run_on_cpu(cpu, do_nothing, RUN_ON_CPU_NULL);
+    async_run_on_cpu_nobql(cpu, do_nothing, RUN_ON_CPU_NULL);
 }
 
 /*
@@ -200,6 +201,20 @@ static void mttcg_force_rcu(Notifier *notify, void *data)
  */
 
 #include "latx/include/latx-native-asm.h"
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+static bool mttcg_atomic_unlocked_enabled(void)
+{
+    static int enabled = -1;
+    int val = qatomic_read(&enabled);
+
+    if (unlikely(val < 0)) {
+        val = lats_nobql_enabled();
+        qatomic_set(&enabled, val);
+    }
+    return val != 0;
+}
+#endif
+
 static void *mttcg_cpu_thread_fn(void *arg)
 {
     MttcgForceRcuNotifier force_rcu;
@@ -238,13 +253,29 @@ static void *mttcg_cpu_thread_fn(void *arg)
     rcu_add_force_rcu_notifier(&force_rcu.notifier);
     tcg_register_thread();
 
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+    bool statelock_mttcg = qemu_vcpu_statelock_enabled() &&
+                           qemu_tcg_mode_2_lat() &&
+                           replay_mode == REPLAY_MODE_NONE &&
+                           !option_htimer;
+    if (!statelock_mttcg) {
+        qemu_mutex_lock_iothread();
+    }
+#else
     qemu_mutex_lock_iothread();
+#endif
     qemu_thread_get_self(cpu->thread);
 
     cpu->thread_id = qemu_get_thread_id();
     cpu->can_do_io = 1;
     current_cpu = cpu;
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+    if (!statelock_mttcg) {
+        cpu_thread_signal_created(cpu);
+    }
+#else
     cpu_thread_signal_created(cpu);
+#endif
     qemu_guest_random_seed_thread_part2(cpu->random_seed);
 
     /* process any pending work */
@@ -258,15 +289,86 @@ static void *mttcg_cpu_thread_fn(void *arg)
 
     cpu_enter_hamt(cpu, HAMT_MODE_MT, cpu->cpu_index);
 
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+    if (statelock_mttcg) {
+        cpu_thread_signal_created(cpu);
+        do {
+            if (cpu_can_run(cpu)) {
+                int r;
+                do {
+                    r = tcg_cpus_exec(cpu);
+#ifdef CONFIG_LATX_OPT_NOFP
+                    if (qemu_tcg_mode_2_lat()) {
+                        __nofp_sync_fpr_to_env(cpu, 0);
+                    }
+#endif
+                    if (r == EXCP_ATOMIC && mttcg_atomic_unlocked_enabled() &&
+                        option_irq_kick_fast && qemu_tcg_mode_2_lat() &&
+                        !option_htimer && replay_mode == REPLAY_MODE_NONE &&
+                        !cpu->singlestep_enabled) {
+                        cpu_exec_step_atomic(cpu);
+                        r = EXCP_INTERRUPT;
+                    }
+                } while (option_irq_kick_fast && qemu_tcg_mode_2_lat() &&
+                         !option_htimer && replay_mode == REPLAY_MODE_NONE &&
+                         !cpu->singlestep_enabled &&
+                         (r == EXCP_INTERRUPT || r == EXCP_HLT || r == EXCP_HALTED) &&
+                         qemu_try_resume_vcpu_unlocked(cpu, r != EXCP_INTERRUPT));
+                switch (r) {
+                case EXCP_DEBUG:
+                    qemu_mutex_lock_iothread();
+                    cpu_handle_guest_debug(cpu);
+                    qemu_mutex_unlock_iothread();
+                    break;
+                case EXCP_HALTED:
+                    break;
+                case EXCP_ATOMIC:
+                    cpu_exec_step_atomic(cpu);
+                    break;
+                default:
+                    break;
+                }
+            }
+
+            qatomic_set_mb(&cpu->exit_request, 0);
+            qemu_wait_io_event_unlocked(cpu);
+        } while (!qatomic_read(&cpu->unplug) || cpu_can_run(cpu));
+
+        qemu_mutex_lock_iothread();
+        tcg_cpus_destroy(cpu);
+        qemu_mutex_unlock_iothread();
+        rcu_remove_force_rcu_notifier(&force_rcu.notifier);
+        rcu_unregister_thread();
+        return NULL;
+    }
+#endif
+
     do {
         if (cpu_can_run(cpu)) {
             int r;
             qemu_mutex_unlock_iothread();
-            r = tcg_cpus_exec(cpu);
+            do {
+                r = tcg_cpus_exec(cpu);
 #ifdef CONFIG_LATX_OPT_NOFP
-            if (qemu_tcg_mode_2_lat()) {
-                __nofp_sync_fpr_to_env(cpu, 0);
-            }
+                if (qemu_tcg_mode_2_lat()) {
+                    __nofp_sync_fpr_to_env(cpu, 0);
+                }
+#endif
+#if defined(CONFIG_LATX_OPT_BQL) && defined(CONFIG_LATX_OPT)
+                if (r == EXCP_ATOMIC && mttcg_atomic_unlocked_enabled() &&
+                    option_irq_kick_fast && qemu_tcg_mode_2_lat() &&
+                    !option_htimer && replay_mode == REPLAY_MODE_NONE &&
+                    !cpu->singlestep_enabled) {
+                    cpu_exec_step_atomic(cpu);
+                    r = EXCP_INTERRUPT;
+                }
+            } while (option_irq_kick_fast && qemu_tcg_mode_2_lat() &&
+                     !option_htimer && replay_mode == REPLAY_MODE_NONE &&
+                     !cpu->singlestep_enabled &&
+                     (r == EXCP_INTERRUPT || r == EXCP_HLT || r == EXCP_HALTED) &&
+                     qemu_try_resume_vcpu_unlocked(cpu, r != EXCP_INTERRUPT));
+#else
+            } while (false);
 #endif
             qemu_mutex_lock_iothread();
             switch (r) {

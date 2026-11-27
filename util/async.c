@@ -69,7 +69,7 @@ struct QEMUBH {
 };
 
 /* Called concurrently from any thread */
-static void aio_bh_enqueue(QEMUBH *bh, unsigned new_flags)
+static void aio_bh_enqueue(QEMUBH *bh, unsigned new_flags, bool notify)
 {
     AioContext *ctx = bh->ctx;
     unsigned old_flags;
@@ -93,6 +93,9 @@ static void aio_bh_enqueue(QEMUBH *bh, unsigned new_flags)
         QSLIST_INSERT_HEAD_ATOMIC(&ctx->bh_list, bh, next);
     }
 
+    if (!notify) {
+        return;
+    }
     aio_notify(ctx);
     /*
      * Workaround for record/replay.
@@ -134,7 +137,7 @@ void aio_bh_schedule_oneshot_full(AioContext *ctx, QEMUBHFunc *cb,
         .opaque = opaque,
         .name = name,
     };
-    aio_bh_enqueue(bh, BH_SCHEDULED | BH_ONESHOT);
+    aio_bh_enqueue(bh, BH_SCHEDULED | BH_ONESHOT, true);
 }
 
 QEMUBH *aio_bh_new_full(AioContext *ctx, QEMUBHFunc *cb, void *opaque,
@@ -152,6 +155,9 @@ QEMUBH *aio_bh_new_full(AioContext *ctx, QEMUBHFunc *cb, void *opaque,
     return bh;
 }
 
+void trial_poll_aio_activity(unsigned activity) __attribute__((weak));
+void trial_main_callback(unsigned kind, uintptr_t pc) __attribute__((weak));
+
 void aio_bh_call(QEMUBH *bh)
 {
     bool last_engaged_in_io = false;
@@ -166,6 +172,14 @@ void aio_bh_call(QEMUBH *bh)
         reentrancy_guard->engaged_in_io = true;
     }
 
+    if (trial_poll_aio_activity &&
+        g_strcmp0(bh->name, "notify_event_cb") &&
+        g_strcmp0(bh->name, "main_timer_notify_bh_cb")) {
+        trial_poll_aio_activity(4u);
+    }
+    if (trial_main_callback) {
+        trial_main_callback(2, (uintptr_t)bh->cb);
+    }
     bh->cb(bh->opaque);
 
     if (reentrancy_guard) {
@@ -225,12 +239,17 @@ int aio_bh_poll(AioContext *ctx)
 
 void qemu_bh_schedule_idle(QEMUBH *bh)
 {
-    aio_bh_enqueue(bh, BH_SCHEDULED | BH_IDLE);
+    aio_bh_enqueue(bh, BH_SCHEDULED | BH_IDLE, true);
 }
 
 void qemu_bh_schedule(QEMUBH *bh)
 {
-    aio_bh_enqueue(bh, BH_SCHEDULED);
+    aio_bh_enqueue(bh, BH_SCHEDULED, true);
+}
+
+void qemu_bh_schedule_no_notify(QEMUBH *bh)
+{
+    aio_bh_enqueue(bh, BH_SCHEDULED, false);
 }
 
 /* This func is async.
@@ -245,7 +264,7 @@ void qemu_bh_cancel(QEMUBH *bh)
  */
 void qemu_bh_delete(QEMUBH *bh)
 {
-    aio_bh_enqueue(bh, BH_DELETED);
+    aio_bh_enqueue(bh, BH_DELETED, true);
 }
 
 static int64_t aio_compute_bh_timeout(BHList *head, int timeout)

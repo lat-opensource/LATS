@@ -69,11 +69,26 @@ static uint64_t tcg_cputlb_static_rdtime(void)
     return rd;
 }
 
-#define QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb) \
-    st = tcg_cputlb_static_rdtime();                \
-    QEMU_IOTHREAD_LOCK_GUARD();                     \
-    ed = tcg_cputlb_static_rdtime();                \
-    qatomic_fetch_add(&(tb->profile.exec_mmio_lock_rdtime), ed - st);
+static void profile_mmio_done(TranslationBlock *tb, uint64_t start,
+                                    uint64_t lock_start)
+{
+    uint64_t elapsed = tcg_cputlb_static_rdtime() - start;
+    uint64_t wait = qemu_mmio_bql_profile_ticks() - lock_start;
+
+    qatomic_add(&tb->profile.exec_mmio_rdtime, elapsed - wait);
+    if (wait) {
+        qatomic_add(&tb->profile.exec_mmio_lock_rdtime, wait);
+    }
+}
+
+/* The timing wrapper must use the same guard as the unprofiled access. */
+#define PROFILE_MMIO_GUARD(tb, guard)                                     \
+    uint64_t guard_start = tcg_cputlb_static_rdtime();                    \
+    guard;                                                                \
+    if (_iothread_lock_auto) {                                            \
+        qatomic_add(&(tb)->profile.exec_mmio_lock_rdtime,                 \
+                    tcg_cputlb_static_rdtime() - guard_start);            \
+    }
 
 #endif
 
@@ -669,7 +684,7 @@ static void flush_all_helper(CPUState *src, run_on_cpu_func fn,
 
     CPU_FOREACH(cpu) {
         if (cpu != src) {
-            async_run_on_cpu(cpu, fn, d);
+            async_run_on_cpu_nobql(cpu, fn, d);
         }
     }
 }
@@ -781,7 +796,7 @@ void tlb_flush_by_mmuidx(CPUState *cpu, uint16_t idxmap)
     tlb_debug("mmu_idx: 0x%" PRIx16 "\n", idxmap);
 
     if (cpu->created && !qemu_cpu_is_self(cpu)) {
-        async_run_on_cpu(cpu, tlb_flush_by_mmuidx_async_work,
+        async_run_on_cpu_nobql(cpu, tlb_flush_by_mmuidx_async_work,
                          RUN_ON_CPU_HOST_INT(idxmap));
     } else {
         tlb_flush_by_mmuidx_async_work(cpu, RUN_ON_CPU_HOST_INT(idxmap));
@@ -1039,7 +1054,7 @@ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, uint16_t idxmap)
          * we can stuff idxmap into the low TARGET_PAGE_BITS, avoid
          * allocating memory for this operation.
          */
-        async_run_on_cpu(cpu, tlb_flush_page_by_mmuidx_async_1,
+        async_run_on_cpu_nobql(cpu, tlb_flush_page_by_mmuidx_async_1,
                          RUN_ON_CPU_TARGET_PTR(addr | idxmap));
     } else {
         TLBFlushPageByMMUIdxData *d = g_new(TLBFlushPageByMMUIdxData, 1);
@@ -1047,7 +1062,7 @@ void tlb_flush_page_by_mmuidx(CPUState *cpu, vaddr addr, uint16_t idxmap)
         /* Otherwise allocate a structure, freed by the worker.  */
         d->addr = addr;
         d->idxmap = idxmap;
-        async_run_on_cpu(cpu, tlb_flush_page_by_mmuidx_async_2,
+        async_run_on_cpu_nobql(cpu, tlb_flush_page_by_mmuidx_async_2,
                          RUN_ON_CPU_HOST_PTR(d));
     }
 }
@@ -1083,7 +1098,7 @@ void tlb_flush_page_by_mmuidx_all_cpus(CPUState *src_cpu, vaddr addr,
 
                 d->addr = addr;
                 d->idxmap = idxmap;
-                async_run_on_cpu(dst_cpu, tlb_flush_page_by_mmuidx_async_2,
+                async_run_on_cpu_nobql(dst_cpu, tlb_flush_page_by_mmuidx_async_2,
                                  RUN_ON_CPU_HOST_PTR(d));
             }
         }
@@ -1125,7 +1140,7 @@ void tlb_flush_page_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
                 d = g_new(TLBFlushPageByMMUIdxData, 1);
                 d->addr = addr;
                 d->idxmap = idxmap;
-                async_run_on_cpu(dst_cpu, tlb_flush_page_by_mmuidx_async_2,
+                async_run_on_cpu_nobql(dst_cpu, tlb_flush_page_by_mmuidx_async_2,
                                  RUN_ON_CPU_HOST_PTR(d));
             }
         }
@@ -1288,7 +1303,7 @@ void tlb_flush_range_by_mmuidx(CPUState *cpu, vaddr addr,
     } else {
         /* Otherwise allocate a structure, freed by the worker.  */
         TLBFlushRangeData *p = g_memdup(&d, sizeof(d));
-        async_run_on_cpu(cpu, tlb_flush_range_by_mmuidx_async_1,
+        async_run_on_cpu_nobql(cpu, tlb_flush_range_by_mmuidx_async_1,
                          RUN_ON_CPU_HOST_PTR(p));
     }
 }
@@ -1330,8 +1345,8 @@ void tlb_flush_range_by_mmuidx_all_cpus(CPUState *src_cpu,
     CPU_FOREACH(dst_cpu) {
         if (dst_cpu != src_cpu) {
             TLBFlushRangeData *p = g_memdup(&d, sizeof(d));
-            async_run_on_cpu(dst_cpu,
-                             tlb_flush_range_by_mmuidx_async_1,
+            async_run_on_cpu_nobql(dst_cpu,
+                                   tlb_flush_range_by_mmuidx_async_1,
                              RUN_ON_CPU_HOST_PTR(p));
         }
     }
@@ -1380,7 +1395,7 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
     CPU_FOREACH(dst_cpu) {
         if (dst_cpu != src_cpu) {
             p = g_memdup(&d, sizeof(d));
-            async_run_on_cpu(dst_cpu, tlb_flush_range_by_mmuidx_async_1,
+            async_run_on_cpu_nobql(dst_cpu, tlb_flush_range_by_mmuidx_async_1,
                              RUN_ON_CPU_HOST_PTR(p));
         }
     }
@@ -2084,14 +2099,15 @@ static void save_iotlb_data(CPUState *cs, MemoryRegionSection *section,
 /*
  * CONFIG_LATX_OPT_MMIO_LOCKLESS: skip the BQL around MMIO dispatch when the
  * target MemoryRegion was marked lockless (memory_region_disable_locking).
- * Cross-page accesses skip the BQL only when every MMIO page is lockless.
+ * Cross-page accesses skip the BQL only when every MMIO page is lockless
+ * and none needs a lock across all of its dispatches.
  * The APIC fast path keeps the unconditional guard.
  */
 #ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
 #define QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, full, addr, size, is_write)      \
     g_autoptr(IOThreadLockAuto) _iothread_lock_auto __attribute__((unused)) \
         = qemu_iothread_auto_lock_mmio(env, full, addr, size, is_write,      \
-                                       __FILE__, __LINE__)
+                                       __FILE__, __LINE__, false)
 
 typedef struct QEMUMMIOAccess {
     MemoryRegion *mr;
@@ -2125,12 +2141,78 @@ static inline bool qemu_mmio_access_lockless(QEMUMMIOAccess access,
         mr->ops->access_lockless(mr->opaque, access.offset, size, is_write,
                                  full->attrs);
 
-    return qatomic_read(&mr->disable_locking) || access_lockless;
+    return qatomic_read(&mr->disable_locking) ||
+           qatomic_read(&mr->device_lock) != NULL ||
+           access_lockless;
 }
+
+typedef QemuRecMutex MMIOAccessLock;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(MMIOAccessLock, qemu_rec_mutex_unlock)
+
+static QemuRecMutex *qemu_mmio_get_split_lock(QEMUMMIOAccess access,
+                                               unsigned size)
+{
+    MemoryRegion *mr = access.mr;
+
+    return mr->ops->mmio_split_lock ?
+        mr->ops->mmio_split_lock(mr->opaque, access.offset, size) : NULL;
+}
+
+static MMIOAccessLock *qemu_mmio_take_split_lock(QemuRecMutex *lock)
+{
+    if (lock) {
+        qemu_rec_mutex_lock(lock);
+    }
+    return lock;
+}
+
+typedef struct MMIOSplitGuard {
+    MMIOAccessLock *lock;
+    MemoryRegionSplitPause *pause;
+} MMIOSplitGuard;
+
+static void qemu_mmio_split_guard_clear(MMIOSplitGuard *guard)
+{
+    if (guard->pause) {
+        memory_region_resume_split(guard->pause);
+    }
+    if (guard->lock) {
+        qemu_rec_mutex_unlock(guard->lock);
+    }
+}
+
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC(MMIOSplitGuard, qemu_mmio_split_guard_clear)
+
+static inline MMIOSplitGuard qemu_mmio_guard_split_access(
+    CPUArchState *env, CPUTLBEntryFull *full, vaddr addr, unsigned size,
+    bool split)
+{
+    MMIOSplitGuard guard = { 0 };
+    QEMUMMIOAccess access;
+
+    /*
+     * Ineligible I/O can leave the helper via cpu_io_recompile(), without
+     * running cleanup functions. Only group dispatches that cannot fail.
+     */
+    if (!split || !env_cpu(env)->can_do_io || !qemu_mutex_iothread_locked()) {
+        return guard;
+    }
+    access = qemu_mmio_resolve(env, full, addr);
+    guard.lock = qemu_mmio_take_split_lock(qemu_mmio_get_split_lock(access,
+                                                                   size));
+    guard.pause = access.mr->subpage ?
+        subpage_pause_split(access.mr, access.offset, size) :
+        memory_region_pause_split(access.mr, access.offset, size);
+    return guard;
+}
+
+#define QEMU_MMIO_SPLIT_GUARD(env, full, addr, size, split)               \
+    g_auto(MMIOSplitGuard) _mmio_split_guard G_GNUC_UNUSED =              \
+        qemu_mmio_guard_split_access(env, full, addr, size, split)
 
 static inline IOThreadLockAuto *qemu_iothread_auto_lock_mmio(
     CPUArchState *env, CPUTLBEntryFull *full, vaddr addr, unsigned size,
-    bool is_write, const char *file, int line)
+    bool is_write, const char *file, int line, bool profile_tb)
 {
     QEMUMMIOAccess access = qemu_mmio_resolve(env, full, addr);
 
@@ -2138,19 +2220,43 @@ static inline IOThreadLockAuto *qemu_iothread_auto_lock_mmio(
         qemu_mutex_iothread_locked()) {
         return NULL;
     }
-    qemu_mutex_lock_iothread_mmio_impl(access.mr,
-                                      memory_region_name(access.mr),
-                                      access.offset, is_write, file, line);
+    const char *name = memory_region_name(access.mr);
+
+    if (profile_tb) {
+        qemu_mutex_lock_iothread_mmio_profile_impl(access.mr, name, access.offset,
+                                                  is_write, file, line);
+    } else {
+        qemu_mutex_lock_iothread_mmio_impl(access.mr, name, access.offset,
+                                          is_write, file, line);
+    }
     return (IOThreadLockAuto *)(uintptr_t)1;
 }
 #else
 #define QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, full, addr, size, is_write) \
     QEMU_IOTHREAD_LOCK_GUARD()
+#define QEMU_MMIO_SPLIT_GUARD(env, full, addr, size, split) do { } while (0)
+#endif
+
+#ifdef CONFIG_LATX_PROFILER
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+/* The outer guard and device fallback use the same acquisition timer. */
+#define PROFILE_MMIO_ACCESS_GUARD(tb, env, full, addr, size, is_write)      \
+    lock_st = qemu_mmio_bql_profile_ticks();                                \
+    st = tcg_cputlb_static_rdtime();                                         \
+    g_autoptr(IOThreadLockAuto) guard =                                      \
+        qemu_iothread_auto_lock_mmio(env, full, addr, size, is_write,        \
+                                    __FILE__, __LINE__, true)
+#else
+#define PROFILE_MMIO_ACCESS_GUARD(tb, env, full, addr, size, is_write)      \
+    PROFILE_MMIO_GUARD(tb, QEMU_IOTHREAD_LOCK_GUARD());                     \
+    lock_st = qemu_mmio_bql_profile_ticks();                               \
+    st = tcg_cputlb_static_rdtime()
+#endif
 #endif
 
 static uint64_t io_readx(CPUArchState *env, CPUTLBEntryFull *full,
                          int mmu_idx, vaddr addr, uintptr_t retaddr,
-                         MMUAccessType access_type, MemOp op)
+                         MMUAccessType access_type, MemOp op, bool profile_tb)
 {
     CPUState *cpu = env_cpu(env);
     hwaddr mr_offset;
@@ -2179,10 +2285,29 @@ static uint64_t io_readx(CPUArchState *env, CPUTLBEntryFull *full,
      */
     save_iotlb_data(cpu, section, mr_offset);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (!qatomic_read(&mr->device_lock) && mr->ops->try_read_lockless &&
+        !qemu_mutex_iothread_locked() &&
+        memory_region_access_valid(mr, mr_offset, memop_size(op), false,
+                                   full->attrs) &&
+        memory_region_try_read_lockless(mr, mr_offset, &val, op, full->attrs)) {
+        r = MEMTX_OK;
+        goto dispatched;
+    }
+#endif
     {
+#if defined(CONFIG_LATX_PROFILER) && defined(CONFIG_LATX_OPT_MMIO_LOCKLESS)
+        g_autoptr(IOThreadLockAuto) guard =
+            qemu_iothread_auto_lock_mmio(env, full, addr, memop_size(op), false,
+                                       __FILE__, __LINE__, profile_tb);
+#else
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, full, addr, memop_size(op), false);
+#endif
         r = memory_region_dispatch_read(mr, mr_offset, &val, op, full->attrs);
     }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+ dispatched:
+#endif
 
     if (r != MEMTX_OK) {
         hwaddr physaddr = mr_offset +
@@ -2202,7 +2327,7 @@ static uint64_t io_readx(CPUArchState *env, CPUTLBEntryFull *full,
 
 static void io_writex(CPUArchState *env, CPUTLBEntryFull *full,
                       int mmu_idx, uint64_t val, vaddr addr,
-                      uintptr_t retaddr, MemOp op)
+                      uintptr_t retaddr, MemOp op, bool profile_tb)
 {
     CPUState *cpu = env_cpu(env);
     hwaddr mr_offset;
@@ -2230,11 +2355,34 @@ static void io_writex(CPUArchState *env, CPUTLBEntryFull *full,
      */
     save_iotlb_data(cpu, section, mr_offset);
 
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (op == MO_LEUW && mr->ops->try_write_eventfd &&
+        !qemu_mutex_iothread_locked() &&
+        memory_region_access_valid(mr, mr_offset, 2, true, full->attrs) &&
+        mr->ops->try_write_eventfd(mr->opaque, mr_offset, 2)) {
+        r = MEMTX_OK;
+        goto dispatched;
+    }
+    if (!qatomic_read(&mr->device_lock) && mr->ops->try_write_lockless &&
+        !qemu_mutex_iothread_locked() &&
+        memory_region_try_write_lockless(mr, mr_offset, val, op, full->attrs)) {
+        r = MEMTX_OK;
+        goto dispatched;
+    }
+#endif
     {
+#if defined(CONFIG_LATX_PROFILER) && defined(CONFIG_LATX_OPT_MMIO_LOCKLESS)
+        g_autoptr(IOThreadLockAuto) guard =
+            qemu_iothread_auto_lock_mmio(env, full, addr, memop_size(op), true,
+                                       __FILE__, __LINE__, profile_tb);
+#else
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, full, addr, memop_size(op), true);
+#endif
         r = memory_region_dispatch_write(mr, mr_offset, val, op, full->attrs);
     }
-
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+ dispatched:
+#endif
     if (r != MEMTX_OK) {
         hwaddr physaddr = mr_offset +
             section->offset_within_address_space -
@@ -2642,10 +2790,45 @@ typedef struct MMULookupPageData {
 } MMULookupPageData;
 
 #ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
-#define QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, pages, is_write)         \
+#define QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, pages, is_write, ra)         \
     g_autoptr(IOThreadLockAuto) _iothread_lock_auto __attribute__((unused)) \
         = qemu_iothread_auto_lock_mmio_cross(env, pages, is_write,        \
-                                             __FILE__, __LINE__)
+                                             __FILE__, __LINE__);       \
+    g_autoptr(MMIOAccessLock) _mmio_split_guard G_GNUC_UNUSED =           \
+        qemu_mmio_lock_split_cross(env, pages, ra)
+
+static inline MMIOAccessLock *qemu_mmio_lock_split_cross(
+    CPUArchState *env, MMULookupPageData pages[2], uintptr_t ra)
+{
+    QEMUMMIOAccess first, second;
+    QemuRecMutex *lock;
+
+    if (!(pages[0].flags & pages[1].flags & TLB_MMIO) ||
+        !env_cpu(env)->can_do_io || !qemu_mutex_iothread_locked()) {
+        return NULL;
+    }
+    first = qemu_mmio_resolve(env, pages[0].full, pages[0].addr);
+    second = qemu_mmio_resolve(env, pages[1].full, pages[1].addr);
+    if (first.mr != second.mr) {
+        return NULL;
+    }
+    lock = qemu_mmio_get_split_lock(first, pages[0].size);
+    if (!lock || lock != qemu_mmio_get_split_lock(second, pages[1].size)) {
+        return NULL;
+    }
+#ifdef CONFIG_LATX_PROFILER
+    TranslationBlock *tb = tcg_tb_lookup(ra);
+    if (tb) {
+        uint64_t start = tcg_cputlb_static_rdtime();
+
+        qemu_rec_mutex_lock(lock);
+        qatomic_add(&tb->profile.exec_mmio_rdtime,
+                    tcg_cputlb_static_rdtime() - start);
+        return lock;
+    }
+#endif
+    return qemu_mmio_take_split_lock(lock);
+}
 
 static inline IOThreadLockAuto *qemu_iothread_auto_lock_mmio_cross(
     CPUArchState *env, MMULookupPageData pages[2], bool is_write,
@@ -2663,7 +2846,8 @@ static inline IOThreadLockAuto *qemu_iothread_auto_lock_mmio_cross(
             continue;
         }
         access = qemu_mmio_resolve(env, pages[i].full, pages[i].addr);
-        if (!qemu_mmio_access_lockless(access, pages[i].full, pages[i].size,
+        if (access.mr->ops->mmio_split_lock ||
+            !qemu_mmio_access_lockless(access, pages[i].full, pages[i].size,
                                        is_write)) {
             blocking = access;
             break;
@@ -2678,7 +2862,7 @@ static inline IOThreadLockAuto *qemu_iothread_auto_lock_mmio_cross(
     return (IOThreadLockAuto *)(uintptr_t)1;
 }
 #else
-#define QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, pages, is_write) \
+#define QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, pages, is_write, ra) \
     do { } while (0)
 #endif
 
@@ -3055,6 +3239,8 @@ static uint64_t do_ld_mmio_beN(CPUArchState *env, CPUTLBEntryFull *full,
     uint64_t t;
 
     tcg_debug_assert(size > 0 && size <= 8);
+    QEMU_MMIO_SPLIT_GUARD(env, full, addr, size,
+                         !is_power_of_2(size) || (addr & (size - 1)));
     do {
         /* Read aligned pieces up to 8 bytes. */
         switch ((size | (int)addr) & 7) {
@@ -3062,26 +3248,26 @@ static uint64_t do_ld_mmio_beN(CPUArchState *env, CPUTLBEntryFull *full,
         case 3:
         case 5:
         case 7:
-            t = io_readx(env, full, mmu_idx, addr, ra, type, MO_UB);
+            t = io_readx(env, full, mmu_idx, addr, ra, type, MO_UB, false);
             ret_be = (ret_be << 8) | t;
             size -= 1;
             addr += 1;
             break;
         case 2:
         case 6:
-            t = io_readx(env, full, mmu_idx, addr, ra, type, MO_BEUW);
+            t = io_readx(env, full, mmu_idx, addr, ra, type, MO_BEUW, false);
             ret_be = (ret_be << 16) | t;
             size -= 2;
             addr += 2;
             break;
         case 4:
-            t = io_readx(env, full, mmu_idx, addr, ra, type, MO_BEUL);
+            t = io_readx(env, full, mmu_idx, addr, ra, type, MO_BEUL, false);
             ret_be = (ret_be << 32) | t;
             size -= 4;
             addr += 4;
             break;
         case 0:
-            return io_readx(env, full, mmu_idx, addr, ra, type, MO_BEUQ);
+            return io_readx(env, full, mmu_idx, addr, ra, type, MO_BEUQ, false);
         default:
             qemu_build_not_reached();
         }
@@ -3235,7 +3421,8 @@ static uint64_t do_ld_beN(CPUArchState *env, MMULookupPageData *p,
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
             uint64_t st, ed, res;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+            PROFILE_MMIO_GUARD(tb,
+                QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, p->size, false));
             st = tcg_cputlb_static_rdtime();
             res = do_ld_mmio_beN(env, p->full, ret_be, p->addr, p->size,
                                   mmu_idx, type, ra);
@@ -3299,11 +3486,13 @@ static Int128 do_ld16_beN(CPUArchState *env, MMULookupPageData *p,
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
             uint64_t st, ed;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+            PROFILE_MMIO_GUARD(tb,
+                QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, p->size, false));
             st = tcg_cputlb_static_rdtime();
+            QEMU_MMIO_SPLIT_GUARD(env, p->full, p->addr, size, true);
             a = do_ld_mmio_beN(env, p->full, a, p->addr, size - 8,
                                mmu_idx, MMU_DATA_LOAD, ra);
-            b = do_ld_mmio_beN(env, p->full, 0, p->addr + 8, 8,
+            b = do_ld_mmio_beN(env, p->full, 0, p->addr + size - 8, 8,
                                mmu_idx, MMU_DATA_LOAD, ra);
             ed = tcg_cputlb_static_rdtime();
             qatomic_fetch_add(&(tb->profile.exec_mmio_rdtime), ed - st);
@@ -3311,9 +3500,10 @@ static Int128 do_ld16_beN(CPUArchState *env, MMULookupPageData *p,
         }
 #endif
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, p->size, false);
+        QEMU_MMIO_SPLIT_GUARD(env, p->full, p->addr, size, true);
         a = do_ld_mmio_beN(env, p->full, a, p->addr, size - 8,
                            mmu_idx, MMU_DATA_LOAD, ra);
-        b = do_ld_mmio_beN(env, p->full, 0, p->addr + 8, 8,
+        b = do_ld_mmio_beN(env, p->full, 0, p->addr + size - 8, 8,
                            mmu_idx, MMU_DATA_LOAD, ra);
         return int128_make128(b, a);
     }
@@ -3360,7 +3550,7 @@ static uint8_t do_ld_1(CPUArchState *env, MMULookupPageData *p, int mmu_idx,
                        MMUAccessType type, uintptr_t ra)
 {
     if (unlikely(p->flags & TLB_MMIO)) {
-        return io_readx(env, p->full, mmu_idx, p->addr, ra, type, MO_UB);
+        return io_readx(env, p->full, mmu_idx, p->addr, ra, type, MO_UB, false);
     } else {
         return *(uint8_t *)p->haddr;
     }
@@ -3372,15 +3562,33 @@ static uint16_t do_ld_2(CPUArchState *env, MMULookupPageData *p, int mmu_idx,
     uint16_t ret;
 
     if (unlikely(p->flags & TLB_MMIO)) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        /* As for 32-bit loads, let aligned reads try the device before BQL. */
+        if (!(p->addr & 1)) {
+            MemOp op = MO_16 | (memop & MO_BSWAP);
+
+#ifdef CONFIG_LATX_PROFILER
+            TranslationBlock *tb = tcg_tb_lookup(ra);
+            if (tb) {
+                uint64_t lock_st = qemu_mmio_bql_profile_ticks();
+                uint64_t st = tcg_cputlb_static_rdtime();
+
+                ret = io_readx(env, p->full, mmu_idx, p->addr, ra, type, op, true);
+                profile_mmio_done(tb, st, lock_st);
+                return ret;
+            }
+#endif
+            return io_readx(env, p->full, mmu_idx, p->addr, ra, type, op, false);
+        }
+#endif
 #ifdef CONFIG_LATX_PROFILER
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
-            uint64_t st, ed;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
-            st = tcg_cputlb_static_rdtime();
+            uint64_t st, lock_st;
+
+            PROFILE_MMIO_ACCESS_GUARD(tb, env, p->full, p->addr, 2, false);
             ret = do_ld_mmio_beN(env, p->full, 0, p->addr, 2, mmu_idx, type, ra);
-            ed = tcg_cputlb_static_rdtime();
-            qatomic_fetch_add(&(tb->profile.exec_mmio_rdtime), ed - st);
+            profile_mmio_done(tb, st, lock_st);
             if ((memop & MO_BSWAP) == MO_LE) ret = bswap16(ret);
             return ret;
         }
@@ -3406,11 +3614,31 @@ static uint32_t do_ld_4(CPUArchState *env, MMULookupPageData *p, int mmu_idx,
     uint32_t ret;
 
     if (unlikely(p->flags & TLB_MMIO)) {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        /* Complete an aligned read as one device transaction. */
+        if (!(p->addr & 3)) {
+            MemOp op = MO_32 | (memop & MO_BSWAP);
+
+#ifdef CONFIG_LATX_PROFILER
+            TranslationBlock *tb = tcg_tb_lookup(ra);
+            if (tb) {
+                uint64_t lock_st = qemu_mmio_bql_profile_ticks();
+                uint64_t st = tcg_cputlb_static_rdtime();
+
+                ret = io_readx(env, p->full, mmu_idx, p->addr, ra, type, op, true);
+                profile_mmio_done(tb, st, lock_st);
+                return ret;
+            }
+#endif
+            return io_readx(env, p->full, mmu_idx, p->addr, ra, type, op, false);
+        }
+#endif
 #ifdef CONFIG_LATX_PROFILER
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
             uint64_t st, ed;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+            PROFILE_MMIO_GUARD(tb,
+                QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, 4, false));
             st = tcg_cputlb_static_rdtime();
             ret = do_ld_mmio_beN(env, p->full, 0, p->addr, 4, mmu_idx, type, ra);
             ed = tcg_cputlb_static_rdtime();
@@ -3443,11 +3671,11 @@ static uint64_t do_ld_8(CPUArchState *env, MMULookupPageData *p, int mmu_idx,
 #ifdef CONFIG_LATX_PROFILER
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
-            uint64_t st, ed;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
-            st = tcg_cputlb_static_rdtime();
+            uint64_t st, lock_st;
+
+            PROFILE_MMIO_ACCESS_GUARD(tb, env, p->full, p->addr, 8, false);
             ret = do_ld_mmio_beN(env, p->full, 0, p->addr, 8, mmu_idx, type, ra);
-            ed = tcg_cputlb_static_rdtime();
+            profile_mmio_done(tb, st, lock_st);
             if ((memop & MO_BSWAP) == MO_LE) ret = bswap64(ret);
             return ret;
         }
@@ -3509,7 +3737,7 @@ static uint16_t do_ld2_mmu(CPUArchState *env, vaddr addr, MemOpIdx oi,
         return do_ld_2(env, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false, ra);
 
     a = do_ld_1(env, &l.page[0], l.mmu_idx, access_type, ra);
     b = do_ld_1(env, &l.page[1], l.mmu_idx, access_type, ra);
@@ -3546,7 +3774,7 @@ static uint32_t do_ld4_mmu(CPUArchState *env, vaddr addr, MemOpIdx oi,
         return do_ld_4(env, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false, ra);
 
     ret = do_ld_beN(env, &l.page[0], 0, l.mmu_idx, access_type, l.memop, ra);
     ret = do_ld_beN(env, &l.page[1], ret, l.mmu_idx, access_type, l.memop, ra);
@@ -3580,7 +3808,7 @@ static uint64_t do_ld8_mmu(CPUArchState *env, vaddr addr, MemOpIdx oi,
         return do_ld_8(env, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false, ra);
 
     ret = do_ld_beN(env, &l.page[0], 0, l.mmu_idx, access_type, l.memop, ra);
     ret = do_ld_beN(env, &l.page[1], ret, l.mmu_idx, access_type, l.memop, ra);
@@ -3652,8 +3880,9 @@ static Int128 do_ld16_mmu(CPUArchState *env, vaddr addr,
             TranslationBlock *tb = tcg_tb_lookup(ra);
             if (tb) {
                 uint64_t st, ed;
-                QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+                PROFILE_MMIO_GUARD(tb, QEMU_IOTHREAD_LOCK_GUARD());
                 st = tcg_cputlb_static_rdtime();
+                QEMU_MMIO_SPLIT_GUARD(env, l.page[0].full, addr, 16, true);
                 a = do_ld_mmio_beN(env, l.page[0].full, 0, addr, 8,
                                    l.mmu_idx, MMU_DATA_LOAD, ra);
                 b = do_ld_mmio_beN(env, l.page[0].full, 0, addr + 8, 8,
@@ -3666,6 +3895,7 @@ static Int128 do_ld16_mmu(CPUArchState *env, vaddr addr,
             }
 #endif
             QEMU_IOTHREAD_LOCK_GUARD();
+            QEMU_MMIO_SPLIT_GUARD(env, l.page[0].full, addr, 16, true);
             a = do_ld_mmio_beN(env, l.page[0].full, 0, addr, 8,
                                l.mmu_idx, MMU_DATA_LOAD, ra);
             b = do_ld_mmio_beN(env, l.page[0].full, 0, addr + 8, 8,
@@ -3684,7 +3914,7 @@ static Int128 do_ld16_mmu(CPUArchState *env, vaddr addr,
         return ret;
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, false, ra);
 
     first = l.page[0].size;
     if (first == 8) {
@@ -3807,7 +4037,8 @@ Int128 cpu_ld16_mmu(CPUArchState *env, abi_ptr addr,
  * @size: number of bytes
  * @mmu_idx: virtual address context
  * @ra: return address into tcg generated code, or 0
- * Context: iothread lock held
+ * @profile_tb: account for locks needed by individual pieces
+ * Context: iothread lock held unless the device allows unlocked access
  *
  * Store @size bytes at @addr, which is memory-mapped i/o.
  * The bytes to store are extracted in little-endian order from @val_le;
@@ -3815,9 +4046,11 @@ Int128 cpu_ld16_mmu(CPUArchState *env, abi_ptr addr,
  */
 static uint64_t do_st_mmio_leN(CPUArchState *env, CPUTLBEntryFull *full,
                                uint64_t val_le, vaddr addr, int size,
-                               int mmu_idx, uintptr_t ra)
+                               int mmu_idx, uintptr_t ra, bool profile_tb)
 {
     tcg_debug_assert(size > 0 && size <= 8);
+    QEMU_MMIO_SPLIT_GUARD(env, full, addr, size,
+                         !is_power_of_2(size) || (addr & (size - 1)));
 
     do {
         /* Store aligned pieces up to 8 bytes. */
@@ -3826,26 +4059,26 @@ static uint64_t do_st_mmio_leN(CPUArchState *env, CPUTLBEntryFull *full,
         case 3:
         case 5:
         case 7:
-            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_UB);
+            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_UB, profile_tb);
             val_le >>= 8;
             size -= 1;
             addr += 1;
             break;
         case 2:
         case 6:
-            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_LEUW);
+            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_LEUW, profile_tb);
             val_le >>= 16;
             size -= 2;
             addr += 2;
             break;
         case 4:
-            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_LEUL);
+            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_LEUL, profile_tb);
             val_le >>= 32;
             size -= 4;
             addr += 4;
             break;
         case 0:
-            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_LEUQ);
+            io_writex(env, full, mmu_idx, val_le, addr, ra, MO_LEUQ, profile_tb);
             return 0;
         default:
             qemu_build_not_reached();
@@ -3869,19 +4102,17 @@ static uint64_t do_st_leN(CPUArchState *env, MMULookupPageData *p,
 #ifdef CONFIG_LATX_PROFILER
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
-            uint64_t st, ed, res;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
-            st = tcg_cputlb_static_rdtime();
+            uint64_t st, lock_st, res;
+            PROFILE_MMIO_ACCESS_GUARD(tb, env, p->full, p->addr, p->size, true);
             res = do_st_mmio_leN(env, p->full, val_le, p->addr,
-                                  p->size, mmu_idx, ra);
-            ed = tcg_cputlb_static_rdtime();
-            qatomic_fetch_add(&(tb->profile.exec_mmio_rdtime), ed - st);
+                                  p->size, mmu_idx, ra, true);
+            profile_mmio_done(tb, st, lock_st);
             return res;
         }
 #endif
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, p->size, true);
         return do_st_mmio_leN(env, p->full, val_le, p->addr,
-                              p->size, mmu_idx, ra);
+                              p->size, mmu_idx, ra, false);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
         return val_le >> (p->size * 8);
     }
@@ -3938,22 +4169,25 @@ static uint64_t do_st16_leN(CPUArchState *env, MMULookupPageData *p,
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
             uint64_t st, ed, res;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+            PROFILE_MMIO_GUARD(tb,
+                QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, p->size, true));
             st = tcg_cputlb_static_rdtime();
+            QEMU_MMIO_SPLIT_GUARD(env, p->full, p->addr, size, true);
             do_st_mmio_leN(env, p->full, int128_getlo(val_le),
-                                p->addr, 8, mmu_idx, ra);
+                                p->addr, 8, mmu_idx, ra, false);
             res = do_st_mmio_leN(env, p->full, int128_gethi(val_le),
-                                      p->addr + 8, size - 8, mmu_idx, ra);
+                                      p->addr + 8, size - 8, mmu_idx, ra, false);
             ed = tcg_cputlb_static_rdtime();
             qatomic_fetch_add(&(tb->profile.exec_mmio_rdtime), ed - st);
             return res;
         }
 #endif
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, p->size, true);
+        QEMU_MMIO_SPLIT_GUARD(env, p->full, p->addr, size, true);
         do_st_mmio_leN(env, p->full, int128_getlo(val_le),
-                       p->addr, 8, mmu_idx, ra);
+                       p->addr, 8, mmu_idx, ra, false);
         return do_st_mmio_leN(env, p->full, int128_gethi(val_le),
-                              p->addr + 8, size - 8, mmu_idx, ra);
+                              p->addr + 8, size - 8, mmu_idx, ra, false);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
         return int128_gethi(val_le) >> ((size - 8) * 8);
     }
@@ -3997,7 +4231,7 @@ static void do_st_1(CPUArchState *env, MMULookupPageData *p, uint8_t val,
                     int mmu_idx, uintptr_t ra)
 {
     if (unlikely(p->flags & TLB_MMIO)) {
-        io_writex(env, p->full, mmu_idx, val, p->addr, ra, MO_UB);
+        io_writex(env, p->full, mmu_idx, val, p->addr, ra, MO_UB, false);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
         /* nothing */
     } else {
@@ -4012,20 +4246,39 @@ static void do_st_2(CPUArchState *env, MMULookupPageData *p, uint16_t val,
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap16(val);
         }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        /* An aligned halfword is one transaction. io_writex locks on a miss. */
+        if (!(p->addr & 1)) {
+#ifdef CONFIG_LATX_PROFILER
+            TranslationBlock *tb = tcg_tb_lookup(ra);
+            if (tb) {
+                uint64_t lock_st = qemu_mmio_bql_profile_ticks();
+                uint64_t st = tcg_cputlb_static_rdtime();
+
+                io_writex(env, p->full, mmu_idx, val, p->addr, ra, MO_LEUW, true);
+                profile_mmio_done(tb, st, lock_st);
+                return;
+            }
+#endif
+            io_writex(env, p->full, mmu_idx, val, p->addr, ra, MO_LEUW, false);
+            return;
+        }
+#endif
 #ifdef CONFIG_LATX_PROFILER
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
             uint64_t st, ed;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+            PROFILE_MMIO_GUARD(tb,
+                QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, 2, true));
             st = tcg_cputlb_static_rdtime();
-            do_st_mmio_leN(env, p->full, val, p->addr, 2, mmu_idx, ra);
+            do_st_mmio_leN(env, p->full, val, p->addr, 2, mmu_idx, ra, false);
             ed = tcg_cputlb_static_rdtime();
             qatomic_fetch_add(&(tb->profile.exec_mmio_rdtime), ed - st);
             return;
         }
 #endif
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, 2, true);
-        do_st_mmio_leN(env, p->full, val, p->addr, 2, mmu_idx, ra);
+        do_st_mmio_leN(env, p->full, val, p->addr, 2, mmu_idx, ra, false);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
         /* nothing */
     } else {
@@ -4044,20 +4297,36 @@ static void do_st_4(CPUArchState *env, MMULookupPageData *p, uint32_t val,
         if ((memop & MO_BSWAP) != MO_LE) {
             val = bswap32(val);
         }
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+        if (!(p->addr & 3)) {
+#ifdef CONFIG_LATX_PROFILER
+            TranslationBlock *tb = tcg_tb_lookup(ra);
+            if (tb) {
+                uint64_t lock_st = qemu_mmio_bql_profile_ticks();
+                uint64_t st = tcg_cputlb_static_rdtime();
+
+                io_writex(env, p->full, mmu_idx, val, p->addr, ra,
+                          MO_LEUL, true);
+                profile_mmio_done(tb, st, lock_st);
+                return;
+            }
+#endif
+            io_writex(env, p->full, mmu_idx, val, p->addr, ra, MO_LEUL, false);
+            return;
+        }
+#endif
 #ifdef CONFIG_LATX_PROFILER
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
-            uint64_t st, ed;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
-            st = tcg_cputlb_static_rdtime();
-            do_st_mmio_leN(env, p->full, val, p->addr, 4, mmu_idx, ra);
-            ed = tcg_cputlb_static_rdtime();
-            qatomic_fetch_add(&(tb->profile.exec_mmio_rdtime), ed - st);
+            uint64_t st, lock_st;
+            PROFILE_MMIO_ACCESS_GUARD(tb, env, p->full, p->addr, 4, true);
+            do_st_mmio_leN(env, p->full, val, p->addr, 4, mmu_idx, ra, true);
+            profile_mmio_done(tb, st, lock_st);
             return;
         }
 #endif
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, 4, true);
-        do_st_mmio_leN(env, p->full, val, p->addr, 4, mmu_idx, ra);
+        do_st_mmio_leN(env, p->full, val, p->addr, 4, mmu_idx, ra, false);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
         /* nothing */
     } else {
@@ -4079,17 +4348,16 @@ static void do_st_8(CPUArchState *env, MMULookupPageData *p, uint64_t val,
 #ifdef CONFIG_LATX_PROFILER
         TranslationBlock *tb = tcg_tb_lookup(ra);
         if (tb) {
-            uint64_t st, ed;
-            QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
-            st = tcg_cputlb_static_rdtime();
-            do_st_mmio_leN(env, p->full, val, p->addr, 8, mmu_idx, ra);
-            ed = tcg_cputlb_static_rdtime();
-            qatomic_fetch_add(&(tb->profile.exec_mmio_rdtime), ed - st);
+            uint64_t st, lock_st;
+
+            PROFILE_MMIO_ACCESS_GUARD(tb, env, p->full, p->addr, 8, true);
+            do_st_mmio_leN(env, p->full, val, p->addr, 8, mmu_idx, ra, true);
+            profile_mmio_done(tb, st, lock_st);
             return;
         }
 #endif
         QEMU_IOTHREAD_LOCK_GUARD_MMIO(env, p->full, p->addr, 8, true);
-        do_st_mmio_leN(env, p->full, val, p->addr, 8, mmu_idx, ra);
+        do_st_mmio_leN(env, p->full, val, p->addr, 8, mmu_idx, ra, false);
     } else if (unlikely(p->flags & TLB_DISCARD_WRITE)) {
         /* nothing */
     } else {
@@ -4137,7 +4405,7 @@ static void do_st2_mmu(CPUArchState *env, vaddr addr, uint16_t val,
         return;
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true, ra);
 
     if ((l.memop & MO_BSWAP) == MO_LE) {
         a = val, b = val >> 8;
@@ -4172,7 +4440,7 @@ static void do_st4_mmu(CPUArchState *env, vaddr addr, uint32_t val,
         return;
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true, ra);
 
     /* Swap to little endian for simplicity, then store by bytes. */
     if ((l.memop & MO_BSWAP) != MO_LE) {
@@ -4206,7 +4474,7 @@ static void do_st8_mmu(CPUArchState *env, vaddr addr, uint64_t val,
         return;
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true, ra);
 
     /* Swap to little endian for simplicity, then store by bytes. */
     if ((l.memop & MO_BSWAP) != MO_LE) {
@@ -4276,18 +4544,20 @@ static void do_st16_mmu(CPUArchState *env, vaddr addr, Int128 val,
             TranslationBlock *tb = tcg_tb_lookup(ra);
             if (tb) {
                 uint64_t st, ed;
-                QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+                PROFILE_MMIO_GUARD(tb, QEMU_IOTHREAD_LOCK_GUARD());
                 st = tcg_cputlb_static_rdtime();
-                do_st_mmio_leN(env, l.page[0].full, a, addr, 8, l.mmu_idx, ra);
-                do_st_mmio_leN(env, l.page[0].full, b, addr + 8, 8, l.mmu_idx, ra);
+                QEMU_MMIO_SPLIT_GUARD(env, l.page[0].full, addr, 16, true);
+                do_st_mmio_leN(env, l.page[0].full, a, addr, 8, l.mmu_idx, ra, false);
+                do_st_mmio_leN(env, l.page[0].full, b, addr + 8, 8, l.mmu_idx, ra, false);
                 ed = tcg_cputlb_static_rdtime();
                 qatomic_add(&(tb->profile.exec_mmio_rdtime), (ed-st));
                 return;
             }
 #endif
             QEMU_IOTHREAD_LOCK_GUARD();
-            do_st_mmio_leN(env, l.page[0].full, a, addr, 8, l.mmu_idx, ra);
-            do_st_mmio_leN(env, l.page[0].full, b, addr + 8, 8, l.mmu_idx, ra);
+            QEMU_MMIO_SPLIT_GUARD(env, l.page[0].full, addr, 16, true);
+            do_st_mmio_leN(env, l.page[0].full, a, addr, 8, l.mmu_idx, ra, false);
+            do_st_mmio_leN(env, l.page[0].full, b, addr + 8, 8, l.mmu_idx, ra, false);
         } else if (unlikely(l.page[0].flags & TLB_DISCARD_WRITE)) {
             /* nothing */
         } else {
@@ -4300,7 +4570,7 @@ static void do_st16_mmu(CPUArchState *env, vaddr addr, Int128 val,
         return;
     }
 
-    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true);
+    QEMU_IOTHREAD_LOCK_GUARD_MMIO_CROSS(env, l.page, true, ra);
 
     first = l.page[0].size;
     if (first == 8) {
@@ -4606,6 +4876,7 @@ void cpu_fast_itlb_fill(CPUState *cpu, int mmu_idx,
     }
 }
 
+bool latx_apic_try_write_unlocked(uint64_t addr, uint64_t val, unsigned size);
 void latx_apic_mem_write_locked(uint64_t addr, uint64_t val, unsigned size);
 void latx_apic_mem_write(uint64_t addr, uint64_t val, unsigned size, void *tcptr);
 void latx_apic_mem_write(uint64_t addr, uint64_t val, unsigned size, void *tcptr)
@@ -4614,8 +4885,15 @@ void latx_apic_mem_write(uint64_t addr, uint64_t val, unsigned size, void *tcptr
     uint64_t ra = DMW_OUT(tcptr);
     TranslationBlock *tb = tcg_tb_lookup(ra);
     if (tb) {
-        uint64_t st, ed;
-        QEMU_IOTHREAD_LOCK_GUARD_RDTIME(st, ed, tb);
+        uint64_t st = tcg_cputlb_static_rdtime();
+        uint64_t ed;
+
+        if (latx_apic_try_write_unlocked(addr, val, size)) {
+            qatomic_add(&tb->profile.exec_mmio_rdtime,
+                        tcg_cputlb_static_rdtime() - st);
+            return;
+        }
+        PROFILE_MMIO_GUARD(tb, QEMU_IOTHREAD_LOCK_GUARD());
         st = tcg_cputlb_static_rdtime();
         latx_apic_mem_write_locked(addr & 0xfff, val, size);
         ed = tcg_cputlb_static_rdtime();
@@ -4623,6 +4901,9 @@ void latx_apic_mem_write(uint64_t addr, uint64_t val, unsigned size, void *tcptr
         return;
     }
 #endif
+    if (latx_apic_try_write_unlocked(addr, val, size)) {
+        return;
+    }
     // TODO: safety check the address mapping of appic
     QEMU_IOTHREAD_LOCK_GUARD();
     /*printf("%s:%d addr %016lx val %lx size %lx\n", __func__, __LINE__,*/

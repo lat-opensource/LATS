@@ -42,6 +42,7 @@ struct AccelOpsClass {
     void (*synchronize_pre_resume)(bool step_pending);
 
     void (*handle_interrupt)(CPUState *cpu, int mask);
+    void (*set_irq_delivery_paused)(bool paused);
 
     int64_t (*get_virtual_clock)(void);
     int64_t (*get_elapsed_ticks)(void);

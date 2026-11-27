@@ -111,7 +111,9 @@ void cpu_enable_ticks(void)
     if (!timers_state.cpu_ticks_enabled) {
         timers_state.cpu_ticks_offset -= cpu_get_host_ticks();
         timers_state.cpu_clock_offset -= get_clock();
-        timers_state.cpu_clock_offset_ticks = timers_state.cpu_clock_offset / 10;
+        int64_t offset_ticks = timers_state.cpu_clock_offset / 10;
+        qatomic_set_i64(&timers_state.cpu_clock_offset_ticks, offset_ticks);
+        qatomic_set_i64(&timers_state.hpet_running_offset_ticks, offset_ticks);
         timers_state.cpu_ticks_enabled = 1;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
@@ -128,9 +130,12 @@ void cpu_disable_ticks(void)
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     if (timers_state.cpu_ticks_enabled) {
+        /* vCPUs can still read HPET until pause_all_vcpus() finishes. */
+        qatomic_set_i64(&timers_state.hpet_running_offset_ticks,
+                        CPU_CLOCK_TICKS_PAUSED);
+        smp_mb(); /* Publish the marker before sampling the frozen clock. */
         timers_state.cpu_ticks_offset += cpu_get_host_ticks();
         timers_state.cpu_clock_offset = cpu_get_clock_locked();
-        timers_state.cpu_clock_offset_ticks = timers_state.cpu_clock_offset / 10;
         timers_state.cpu_ticks_enabled = 0;
     }
     seqlock_write_unlock(&timers_state.vm_clock_seqlock,
@@ -262,7 +267,7 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
          * If we have no CPUs at all for some reason, we don't
          * need to do anything.
          */
-        async_run_on_cpu(first_cpu, do_nothing, RUN_ON_CPU_NULL);
+        async_run_on_cpu_nobql(first_cpu, do_nothing, RUN_ON_CPU_NULL);
     }
 }
 
@@ -274,11 +279,12 @@ int ts_offset_cpu_clock_offset;
 /* initialize timers state and the cpu throttle for convenience */
 void cpu_timers_init(void)
 {
+    timers_state.hpet_running_offset_ticks = CPU_CLOCK_TICKS_PAUSED;
     seqlock_init(&timers_state.vm_clock_seqlock);
     qemu_spin_init(&timers_state.vm_clock_lock);
     vmstate_register(NULL, 0, &vmstate_timers, &timers_state);
     timers_state_ptr = &timers_state;
-    ts_offset_cpu_clock_offset = offsetof(TimersState, cpu_clock_offset_ticks);
+    ts_offset_cpu_clock_offset = offsetof(TimersState, hpet_running_offset_ticks);
 
     cpu_throttle_init();
 }

@@ -1677,7 +1677,7 @@ typedef struct CPUArchState {
 
     void *syscall_tb;
     uint64_t *rr_counter_ptr;
-    uint64_t *qemu_global_mutex_ptr;
+    uintptr_t reserved_bql_slot; /* Preserve offsets used by cached host code. */
     void *apic_state;
     void *hpet_state;
     void *timers_state;

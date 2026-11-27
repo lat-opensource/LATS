@@ -7532,12 +7532,17 @@ static void x86_cpu_realizefn(DeviceState *dev, Error **errp)
     }
 
 #ifndef CONFIG_USER_ONLY
+    apic_ipi_quiesce();
     x86_cpu_apic_realize(cpu, &local_err);
     if (local_err != NULL) {
+        apic_ipi_resume();
         goto out;
     }
 #endif /* !CONFIG_USER_ONLY */
     cpu_reset(cs);
+#ifndef CONFIG_USER_ONLY
+    apic_ipi_resume();
+#endif
 
     xcc->parent_realize(dev, &local_err);
 
@@ -7562,6 +7567,7 @@ static void x86_cpu_unrealizefn(DeviceState *dev)
     migrate_del_blocker(cpu->invtsc_migration_blocker);
     error_free(cpu->invtsc_migration_blocker);
     cpu->invtsc_migration_blocker = NULL;
+    apic_ipi_unplug(cpu->apic_state);
     cpu_remove_sync(CPU(dev));
 #if defined(__loongarch__) && defined(CONFIG_LATX_HACK_MEM)
     hamt_native_fault_clear(&cpu->env);
@@ -7821,6 +7827,12 @@ int x86_cpu_pending_interrupt(CPUState *cs, int interrupt_request)
 static bool x86_cpu_has_work(CPUState *cs)
 {
     return x86_cpu_pending_interrupt(cs, cs->interrupt_request) != 0;
+}
+
+bool x86_cpu_has_wakeup_control_irq(int interrupt_request);
+bool x86_cpu_has_wakeup_control_irq(int interrupt_request)
+{
+    return (interrupt_request & (CPU_INTERRUPT_INIT | CPU_INTERRUPT_HALT)) != 0;
 }
 
 static void x86_disas_set_info(CPUState *cs, disassemble_info *info)

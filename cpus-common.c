@@ -127,21 +127,25 @@ struct qemu_work_item {
     QSIMPLEQ_ENTRY(qemu_work_item) node;
     run_on_cpu_func func;
     run_on_cpu_data data;
-    bool free, exclusive, done;
+    bool free, exclusive, nobql, done;
 };
 
 static void queue_work_on_cpu(CPUState *cpu, struct qemu_work_item *wi)
 {
     qemu_mutex_lock(&cpu->work_mutex);
-    QSIMPLEQ_INSERT_TAIL(&cpu->work_list, wi, node);
+    /* An idle vCPU tests the head without taking work_mutex. */
+    QSIMPLEQ_NEXT(wi, node) = NULL;
     wi->done = false;
+    qatomic_set(cpu->work_list.sqh_last, wi);
+    cpu->work_list.sqh_last = &QSIMPLEQ_NEXT(wi, node);
     qemu_mutex_unlock(&cpu->work_mutex);
 
     qemu_cpu_kick(cpu);
 }
 
-void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
-                   QemuMutex *mutex)
+static void do_run_on_cpu_common(CPUState *cpu, run_on_cpu_func func,
+                                 run_on_cpu_data data, QemuMutex *mutex,
+                                 bool nobql)
 {
     struct qemu_work_item wi;
 #ifdef CONFIG_LATX_OPT_BQL
@@ -158,26 +162,72 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
     wi.done = false;
     wi.free = false;
     wi.exclusive = false;
+    wi.nobql = nobql || !qemu_mutex_iothread_locked();
 
     queue_work_on_cpu(cpu, &wi);
+#ifdef CONFIG_LATX_OPT_BQL
+    if (wi.nobql) {
+        /*
+         * Target vCPU can execute nobql work without BQL. Wait without
+         * releasing mutex first; fall back to releasing mutex after bounded
+         * retries in case the target vCPU is blocked on BQL in legacy MMIO.
+         */
+        for (int attempt = 0;
+             attempt < 256 && !qatomic_load_acquire(&wi.done);
+             ++attempt) {
+            unsigned long ticket = qemu_cond_wait_prepare_1(&qemu_work_cond);
+            if (qatomic_load_acquire(&wi.done)) {
+                break;
+            }
+            if (!qemu_cond_wait_1_n_unlocked(&qemu_work_cond, ticket, 10000)) {
+                qemu_cpu_kick(cpu);
+                if (attempt >= 2) {
+                    g_usleep(200);
+                }
+            }
+        }
+    }
+#endif
     while (!qatomic_load_acquire(&wi.done)) {
         CPUState *self_cpu = current_cpu;
+        bool had_bql = qemu_mutex_iothread_locked();
 
 #ifdef CONFIG_LATX_OPT_BQL
         unsigned long ticket = qemu_cond_wait_prepare_1(&qemu_work_cond);
 
-        pthread_spin_unlock(&mutex->spin);
+        if (had_bql) {
+            pthread_spin_unlock(&mutex->spin);
+        }
         waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, ticket, 10000);
         while (!waked) {
             qemu_cpu_kick(cpu);
             waked = qemu_cond_wait_1_n_unlocked(&qemu_work_cond, ticket, 10000);
         }
-        pthread_spin_lock(&mutex->spin);
+        if (had_bql) {
+            pthread_spin_lock(&mutex->spin);
+        }
 #else
-        qemu_cond_wait_1(&qemu_work_cond, mutex);
+        if (had_bql) {
+            qemu_cond_wait_1(&qemu_work_cond, mutex);
+        } else {
+            qemu_cpu_kick(cpu);
+            g_usleep(100);
+        }
 #endif
         current_cpu = self_cpu;
     }
+}
+
+void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
+                   QemuMutex *mutex)
+{
+    do_run_on_cpu_common(cpu, func, data, mutex, false);
+}
+
+void do_run_on_cpu_nobql(CPUState *cpu, run_on_cpu_func func,
+                         run_on_cpu_data data, QemuMutex *mutex)
+{
+    do_run_on_cpu_common(cpu, func, data, mutex, true);
 }
 
 void async_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data)
@@ -188,6 +238,20 @@ void async_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data)
     wi->func = func;
     wi->data = data;
     wi->free = true;
+
+    queue_work_on_cpu(cpu, wi);
+}
+
+void async_run_on_cpu_nobql(CPUState *cpu, run_on_cpu_func func,
+                            run_on_cpu_data data)
+{
+    struct qemu_work_item *wi;
+
+    wi = g_new0(struct qemu_work_item, 1);
+    wi->func = func;
+    wi->data = data;
+    wi->free = true;
+    wi->nobql = true;
 
     queue_work_on_cpu(cpu, wi);
 }
@@ -352,6 +416,111 @@ void async_safe_run_on_cpu(CPUState *cpu, run_on_cpu_func func,
     queue_work_on_cpu(cpu, wi);
 }
 
+static struct qemu_work_item *pop_cpu_work(CPUState *cpu)
+{
+    struct qemu_work_item *work = QSIMPLEQ_FIRST(&cpu->work_list);
+
+    qatomic_set(&QSIMPLEQ_FIRST(&cpu->work_list), QSIMPLEQ_NEXT(work, node));
+    if (QSIMPLEQ_EMPTY(&cpu->work_list)) {
+        cpu->work_list.sqh_last = &QSIMPLEQ_FIRST(&cpu->work_list);
+    }
+    QSIMPLEQ_NEXT(work, node) = NULL;
+    return work;
+}
+
+static void run_exclusive_cpu_work(CPUState *cpu, struct qemu_work_item *work)
+{
+    start_exclusive();
+    work->func(cpu, work->data);
+    end_exclusive();
+}
+
+bool process_exclusive_cpu_work_unlocked(CPUState *cpu, bool blocking)
+{
+    struct qemu_work_item *work;
+
+    assert(!qemu_mutex_iothread_locked());
+    if (blocking) {
+        qemu_mutex_lock(&cpu->work_mutex);
+    } else if (qemu_mutex_trylock(&cpu->work_mutex)) {
+        return false;
+    }
+    work = QSIMPLEQ_FIRST(&cpu->work_list);
+    if (!work || !work->exclusive || !work->free) {
+        qemu_mutex_unlock(&cpu->work_mutex);
+        return false;
+    }
+    work = pop_cpu_work(cpu);
+    qemu_mutex_unlock(&cpu->work_mutex);
+
+    run_exclusive_cpu_work(cpu, work);
+    g_free(work);
+    return true;
+}
+
+bool process_nobql_cpu_work_unlocked(CPUState *cpu, bool blocking)
+{
+    struct qemu_work_item *work;
+
+    assert(!qemu_mutex_iothread_locked());
+    if (blocking) {
+        qemu_mutex_lock(&cpu->work_mutex);
+    } else if (qemu_mutex_trylock(&cpu->work_mutex)) {
+        return false;
+    }
+    work = QSIMPLEQ_FIRST(&cpu->work_list);
+    if (!work || !work->nobql) {
+        qemu_mutex_unlock(&cpu->work_mutex);
+        return false;
+    }
+    work = pop_cpu_work(cpu);
+    qemu_mutex_unlock(&cpu->work_mutex);
+
+    work->func(cpu, work->data);
+    if (work->free) {
+        g_free(work);
+    } else {
+        qemu_mutex_lock(&cpu->work_mutex);
+        qatomic_store_release(&work->done, true);
+        qemu_mutex_unlock(&cpu->work_mutex);
+        qemu_cond_broadcast_1(&qemu_work_cond);
+    }
+    return true;
+}
+
+void process_queued_cpu_work_unlocked(CPUState *cpu)
+{
+    struct qemu_work_item *wi;
+
+    assert(!qemu_mutex_iothread_locked());
+    qemu_mutex_lock(&cpu->work_mutex);
+    if (QSIMPLEQ_EMPTY(&cpu->work_list)) {
+        qemu_mutex_unlock(&cpu->work_mutex);
+        return;
+    }
+    while (!QSIMPLEQ_EMPTY(&cpu->work_list)) {
+        wi = pop_cpu_work(cpu);
+        qemu_mutex_unlock(&cpu->work_mutex);
+        if (wi->exclusive) {
+            run_exclusive_cpu_work(cpu, wi);
+        } else if (wi->nobql) {
+            wi->func(cpu, wi->data);
+        } else {
+            qemu_mutex_lock_iothread();
+            wi->func(cpu, wi->data);
+            qemu_mutex_unlock_iothread();
+        }
+        qemu_mutex_lock(&cpu->work_mutex);
+        if (wi->free) {
+            g_free(wi);
+        } else {
+            qatomic_store_release(&wi->done, true);
+        }
+    }
+    qemu_mutex_unlock(&cpu->work_mutex);
+    qemu_cond_broadcast_1(&qemu_work_cond);
+}
+
 void process_queued_cpu_work(CPUState *cpu)
 {
     struct qemu_work_item *wi;
@@ -362,8 +531,7 @@ void process_queued_cpu_work(CPUState *cpu)
         return;
     }
     while (!QSIMPLEQ_EMPTY(&cpu->work_list)) {
-        wi = QSIMPLEQ_FIRST(&cpu->work_list);
-        QSIMPLEQ_REMOVE_HEAD(&cpu->work_list, node);
+        wi = pop_cpu_work(cpu);
         qemu_mutex_unlock(&cpu->work_mutex);
         if (wi->exclusive) {
             /* Running work items outside the BQL avoids the following deadlock:
@@ -373,9 +541,7 @@ void process_queued_cpu_work(CPUState *cpu)
              * neither CPU can proceed.
              */
             qemu_mutex_unlock_iothread();
-            start_exclusive();
-            wi->func(cpu, wi->data);
-            end_exclusive();
+            run_exclusive_cpu_work(cpu, wi);
             qemu_mutex_lock_iothread();
         } else {
             wi->func(cpu, wi->data);

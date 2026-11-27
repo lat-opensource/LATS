@@ -51,6 +51,7 @@ typedef struct TimersState {
 
     int64_t vm_clock_warp_start;
     int64_t cpu_clock_offset;
+    /* Previously translated HPET reads always add this offset to RDTIME. */
     int64_t cpu_clock_offset_ticks;
 
     /* Only written by TCG thread */
@@ -60,6 +61,8 @@ typedef struct TimersState {
     QEMUTimer *icount_rt_timer;
     QEMUTimer *icount_vm_timer;
     QEMUTimer *icount_warp_timer;
+    /* New HPET reads can fall back while the virtual clock is stopped. */
+    aligned_int64_t hpet_running_offset_ticks;
 } TimersState;
 
 extern TimersState timers_state;

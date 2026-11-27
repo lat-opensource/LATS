@@ -31,6 +31,7 @@
 #include "include/tcg/tcg-split-tb.h"
 #include "latx-options.h"
 #include "latx-misc.h"
+#include "hw/i386/apic_internal.h"
 #include <syscall.h>
 #include "include/qemu/cacheinfo.h"
 #include "accel/tcg/internal.h"
@@ -2499,6 +2500,31 @@ static void aot_link_page_ras(CPUState *cpu, uint64_t cs_base,
     }
 }
 
+/* Retranslate old inline EOI blocks. Their code may address either the
+ * old TMR array or the retired global-lock pointer in the CPU environment. */
+static bool aot_uses_legacy_apic_eoi(const aot_block *tb)
+{
+    if (!(tb->misc_flags & MF_MMIO_OPT)) {
+        return false;
+    }
+    /* ADDI.D rd,rj,offsetof(tmr) in latxs_translate_mov_to_apic_eoi.
+     * Both the absolute-address and base-register forms use this sequence. */
+    const uint32_t tmr_address = 0x02c00000u |
+        (offsetof(APICCommonState, tmr) << 10);
+    /* LD.D rd, $s0, offset. LATX keeps the CPU environment in $s0 (r23). */
+    const uint32_t bql_load = 0x28c00000u | (23u << 5) |
+        (offsetof(CPUX86State, reserved_bql_slot) << 10);
+    const uint8_t *code = (const uint8_t *)(tb + 1);
+    for (unsigned i = 0; i < tb->ir2_num; i++) {
+        uint32_t insn = ldl_le_p(code + 4 * i);
+        if ((insn & 0xfffffc00u) == tmr_address ||
+            (insn & 0xffffffe0u) == bql_load) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static TranslationBlock *register_page_tb(CPUState *cpu, vaddr pc,
         uint64_t cs_base, uint32_t flags, int cflags, vaddr hva,
         int page_tb_count, uint64_t file_disp, ENV *lsenv)
@@ -2556,7 +2582,8 @@ static TranslationBlock *register_page_tb(CPUState *cpu, vaddr pc,
             continue;
         }
 
-        if (!test_tb_reloc(curr_tb_rel_table, rel_count, page_pc + offset)) {
+        if (aot_uses_legacy_apic_eoi(curr_file_tb) ||
+            !test_tb_reloc(curr_tb_rel_table, rel_count, page_pc + offset)) {
             file_disp += sum_size;
             continue;
         }

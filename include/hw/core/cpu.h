@@ -364,6 +364,7 @@ struct CPUState {
     sigjmp_buf jmp_env;
 
     QemuMutex work_mutex;
+    QemuSpin state_lock;
     QSIMPLEQ_HEAD(, qemu_work_item) work_list;
 
     CPUAddressSpace *cpu_ases;
@@ -790,6 +791,8 @@ bool cpu_is_stopped(CPUState *cpu);
  */
 void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
                    QemuMutex *mutex);
+void do_run_on_cpu_nobql(CPUState *cpu, run_on_cpu_func func,
+                         run_on_cpu_data data, QemuMutex *mutex);
 
 /**
  * run_on_cpu:
@@ -800,6 +803,8 @@ void do_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data,
  * Schedules the function @func for execution on the vCPU @cpu.
  */
 void run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data);
+void run_on_cpu_nobql(CPUState *cpu, run_on_cpu_func func,
+                      run_on_cpu_data data);
 
 /**
  * async_run_on_cpu:
@@ -810,6 +815,8 @@ void run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data);
  * Schedules the function @func for execution on the vCPU @cpu asynchronously.
  */
 void async_run_on_cpu(CPUState *cpu, run_on_cpu_func func, run_on_cpu_data data);
+void async_run_on_cpu_nobql(CPUState *cpu, run_on_cpu_func func,
+                            run_on_cpu_data data);
 
 /**
  * async_safe_run_on_cpu:
@@ -929,6 +936,12 @@ void cpu_remove_sync(CPUState *cpu);
  * @cpu: The CPU which work queue to process.
  */
 void process_queued_cpu_work(CPUState *cpu);
+void process_queued_cpu_work_unlocked(CPUState *cpu);
+
+/* Run one asynchronous exclusive item at the head, without BQL. */
+bool process_exclusive_cpu_work_unlocked(CPUState *cpu, bool blocking);
+bool process_nobql_cpu_work_unlocked(CPUState *cpu, bool blocking);
+bool qemu_vcpu_statelock_enabled(void);
 
 /**
  * cpu_exec_start:
@@ -1123,9 +1136,5 @@ extern const VMStateDescription vmstate_cpu_common;
 
 #define UNASSIGNED_CPU_INDEX -1
 #define UNASSIGNED_CLUSTER_INDEX -1
-
-#define run_on_cpu_nobql run_on_cpu
-#define async_run_on_cpu_nobql async_run_on_cpu
-static inline bool qemu_vcpu_statelock_enabled(void) { return false; }
 
 #endif

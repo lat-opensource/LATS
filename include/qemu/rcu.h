@@ -143,12 +143,16 @@ pid_t rcu_fork_snapshot(void);
 struct rcu_head;
 typedef void RCUCBFunc(struct rcu_head *head);
 
+#define RCU_HEAD_NO_BQL (1U << 0)
+
 struct rcu_head {
     struct rcu_head *next;
     RCUCBFunc *func;
+    uint32_t flags;
 };
 
 extern void call_rcu1(struct rcu_head *head, RCUCBFunc *func);
+extern void call_rcu1_nobql(struct rcu_head *head, RCUCBFunc *func);
 extern void drain_call_rcu(void);
 
 /* The operands of the minus operator must have the same type,
@@ -163,8 +167,17 @@ extern void drain_call_rcu(void);
       }),                                                                \
       (RCUCBFunc *)(func))
 
+#define call_rcu_nobql(head, func, field)                                \
+    call_rcu1_nobql(({                                                   \
+         char __attribute__((unused))                                    \
+            offset_must_be_zero[-offsetof(typeof(*(head)), field)],      \
+            func_type_invalid = (func) - (void (*)(typeof(head)))(func); \
+         &(head)->field;                                                 \
+      }),                                                                \
+      (RCUCBFunc *)(func))
+
 #define g_free_rcu(obj, field) \
-    call_rcu1(({                                                         \
+    call_rcu1_nobql(({                                                   \
         char __attribute__((unused))                                     \
             offset_must_be_zero[-offsetof(typeof(*(obj)), field)];       \
         &(obj)->field;                                                   \
@@ -202,7 +215,5 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(RCUReadAuto, rcu_read_auto_unlock)
  */
 void rcu_add_force_rcu_notifier(Notifier *n);
 void rcu_remove_force_rcu_notifier(Notifier *n);
-
-#define call_rcu_nobql(s, fn, field) call_rcu(s, fn, field)
 
 #endif /* QEMU_RCU_H */

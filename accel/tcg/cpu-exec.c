@@ -21,6 +21,7 @@
 #include "latx-sigrt-sys.h"
 #include "hamt.h"
 #include "qemu/osdep.h"
+#include "qemu/lockdep-lite.h"
 #include "qemu/qemu-print.h"
 #include "qapi/error.h"
 #include "qapi/type-helpers.h"
@@ -2040,30 +2041,87 @@ static void tb_add_jump(TranslationBlock *tb, int n,
     return;
 }
 
+#if defined(CONFIG_LATX_OPT) && defined(TARGET_I386) && !defined(CONFIG_USER_ONLY)
+static bool latx_irq_fast_v2_enabled(void)
+{
+    static int enabled = -1;
+    int val = qatomic_read(&enabled);
+
+    if (unlikely(val < 0)) {
+        val = lats_nobql_enabled();
+        qatomic_set(&enabled, val);
+    }
+    return val != 0;
+}
+
+static bool latx_try_apic_poll(CPUState *cpu, int request)
+{
+    bool poll_match = (request == CPU_INTERRUPT_POLL ||
+                       request == (CPU_INTERRUPT_HARD | CPU_INTERRUPT_POLL));
+
+    if (!poll_match && qemu_vcpu_statelock_enabled() &&
+        (request & CPU_INTERRUPT_POLL) &&
+        !(request & (CPU_INTERRUPT_DEBUG | CPU_INTERRUPT_HALT |
+                     CPU_INTERRUPT_INIT))) {
+        poll_match = true;
+    }
+    return poll_match &&
+           !cpu->singlestep_enabled &&
+           replay_mode == REPLAY_MODE_NONE && !icount_enabled() &&
+           qemu_tcg_mode_2_lat() &&
+           apic_try_poll_irq(X86_CPU(cpu)->apic_state, request);
+}
+#endif
+
 static bool cpu_handle_halt(CPUState *cpu)
 {
 #ifndef CONFIG_USER_ONLY
     if (cpu->halted) {
 #if defined(TARGET_I386)
-        if (cpu->interrupt_request & CPU_INTERRUPT_POLL) {
-            X86CPU *x86_cpu = X86_CPU(cpu);
-            qemu_mutex_lock_iothread();
-            apic_poll_irq(x86_cpu->apic_state);
-            cpu_reset_interrupt(cpu, CPU_INTERRUPT_POLL);
-            qemu_mutex_unlock_iothread();
+        int request = qatomic_read(&cpu->interrupt_request);
+
+        if (request & CPU_INTERRUPT_POLL) {
+#ifdef CONFIG_LATX_OPT
+            if (!latx_try_apic_poll(cpu, request))
+#endif
+            {
+                qemu_mutex_lock_iothread();
+                /*
+                 * Claim POLL before scanning. A producer can publish a
+                 * second request while we scan even with BQL held.
+                 */
+                qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_POLL);
+                apic_poll_irq(X86_CPU(cpu)->apic_state);
+                qemu_mutex_unlock_iothread();
+            }
         }
 #endif /* TARGET_I386 */
 #ifdef CONFIG_LATX_OPT
-        if (x86_cpu_pending_interrupt(cpu, cpu->interrupt_request) == 0) {
+        /*
+         * POLL arriving after the scan makes cpu_thread_is_idle() false,
+         * so MTTCG will recheck it before sleeping. Only a deliverable
+         * interrupt can complete the guest HLT.
+         */
+        if (x86_cpu_pending_interrupt(cpu, qatomic_read(&cpu->interrupt_request) &
+                                          ~CPU_INTERRUPT_POLL) == 0) {
             return true;
-	    }
+        }
 #else
         if (!cpu_has_work(cpu)) {
             return true;
         }
 #endif
 
-        cpu->halted = 0;
+        if (qemu_vcpu_statelock_enabled()) {
+            lats_lockdep_acquire(&cpu->state_lock, LOCK_RANK_LEAF,
+                                 "cpu->state_lock");
+            qemu_spin_lock(&cpu->state_lock);
+            qatomic_set(&cpu->halted, 0);
+            qemu_spin_unlock(&cpu->state_lock);
+            lats_lockdep_release(&cpu->state_lock);
+        } else {
+            cpu->halted = 0;
+        }
     }
 #endif /* !CONFIG_USER_ONLY */
 
@@ -2088,6 +2146,8 @@ static void cpu_handle_debug_exception(CPUState *cpu)
 
 #ifdef CONFIG_LATX_OPT
 extern void x86_cpu_do_interrupt(CPUState *cpu);
+extern bool x86_cpu_try_local_hard(CPUState *cs);
+extern bool x86_cpu_try_statelock_interrupt(CPUState *cs, int interrupt_request);
 extern bool x86_cpu_exec_interrupt(CPUState *cpu, int int_req);
 #endif
 
@@ -2227,32 +2287,158 @@ static bool cpu_handle_interrupt(CPUState *cpu,
 
 #if defined(CONFIG_LATX_OPT) && defined(TARGET_I386) && \
     !defined(CONFIG_USER_ONLY)
+    bool irq_fast_v2 = latx_irq_fast_v2_enabled();
     interrupt_request = qatomic_read(&cpu->interrupt_request);
-    if (option_irq_gate_nobql &&
-        unlikely(latx_maskable_interrupt_gate_closed(cpu, interrupt_request)) &&
-        likely(!cpu_exec_exit_pending(cpu))) {
-        uint32_t cflags = cpu->cflags_next_tb;
-
-        if (cflags == -1) {
-            cflags = curr_cflags(cpu);
-        }
-        /* Keep an IF-masked request pending. Reopening delivery checks it
-         * explicitly; special execution modes keep their existing path. */
-        if (qemu_tcg_mode_2_lat() &&
-            (option_int_opt == IRQ_CHECK_BLOCK_END ||
-             option_int_opt == IRQ_CHECK_ASYNC_NOTIFY) &&
-            inhibit_irq_hflags() && !(cpu->env_ptr->eflags & IF_MASK) &&
-            cpu->cflags_next_tb == -1 && replay_mode == REPLAY_MODE_NONE &&
-            !(cflags & (CF_USE_ICOUNT | CF_NO_GOTO_TB | CF_NO_GOTO_PTR))) {
-            return false;
-        }
-        /* IF=1 interrupt shadows and special modes still use an unchained TB. */
-        if (cpu->env_ptr->cr[0] & CR0_PG_MASK) {
-            cpu->cflags_next_tb = cflags | CF_NO_GOTO_TB | CF_NO_GOTO_PTR;
+    if (irq_fast_v2 && !interrupt_request) {
+        goto check_exit;
+    }
+    for (int tries = 0; tries < (irq_fast_v2 ? 3 : 1); ++tries) {
+        if (interrupt_request == CPU_INTERRUPT_HARD &&
+            !cpu->singlestep_enabled &&
+            replay_mode == REPLAY_MODE_NONE && !icount_enabled() &&
+            qemu_tcg_mode_2_lat() && x86_cpu_try_local_hard(cpu)) {
+#ifdef CONFIG_LATX_TU
             cpu->env_ptr->aot_observed_call_pending.valid = false;
+#endif
             *last_tb = NULL;
-            return false;
+            cpu->exception_index = -1;
+            if (qatomic_read(&cpu->interrupt_request)) {
+                lats_request_tb_exit(cpu);
+            }
+            goto check_exit;
         }
+        if (latx_try_apic_poll(cpu, interrupt_request)) {
+#ifdef CONFIG_LATX_OPT_NOFP
+            __nofp_sync_xmm_to_env(cpu);
+            __nofp_sync_fpr_to_env(cpu, 0);
+#endif
+#ifdef CONFIG_LATX_TU
+            cpu->env_ptr->aot_observed_call_pending.valid = false;
+#endif
+            *last_tb = NULL;
+            cpu->exception_index = -1;
+            if (qatomic_read(&cpu->interrupt_request)) {
+                lats_request_tb_exit(cpu);
+            }
+            goto check_exit;
+        }
+        if (qemu_vcpu_statelock_enabled() && qemu_tcg_mode_2_lat() &&
+            replay_mode == REPLAY_MODE_NONE && !icount_enabled() &&
+            !cpu->singlestep_enabled) {
+            if (interrupt_request == CPU_INTERRUPT_EXITTB) {
+                qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_EXITTB);
+                *last_tb = NULL;
+                goto check_exit;
+            }
+            if ((interrupt_request & CPU_INTERRUPT_HALT) &&
+                !(interrupt_request & (CPU_INTERRUPT_DEBUG | CPU_INTERRUPT_INIT))) {
+                lats_lockdep_acquire(&cpu->state_lock, LOCK_RANK_LEAF,
+                                     "cpu->state_lock");
+                qemu_spin_lock(&cpu->state_lock);
+                qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_HALT);
+                qatomic_set(&cpu->halted, 1);
+                qemu_spin_unlock(&cpu->state_lock);
+                lats_lockdep_release(&cpu->state_lock);
+                cpu->exception_index = EXCP_HLT;
+                return true;
+            }
+            if ((interrupt_request & CPU_INTERRUPT_INIT) &&
+                !(interrupt_request & (CPU_INTERRUPT_DEBUG | CPU_INTERRUPT_HALT)) &&
+                !(cpu->env_ptr->hflags & HF_GUEST_MASK)) {
+#ifdef CONFIG_LATX_OPT_NOFP
+                __nofp_sync_xmm_to_env(cpu);
+                __nofp_sync_fpr_to_env(cpu, 0);
+#endif
+#ifdef CONFIG_LATX_TU
+                cpu->env_ptr->aot_observed_call_pending.valid = false;
+#endif
+                do_cpu_init(X86_CPU(cpu));
+                *last_tb = NULL;
+                cpu->exception_index = EXCP_HALTED;
+                return true;
+            }
+            if ((interrupt_request & CPU_INTERRUPT_SIPI) &&
+                !(interrupt_request & (CPU_INTERRUPT_DEBUG | CPU_INTERRUPT_HALT |
+                                       CPU_INTERRUPT_INIT | CPU_INTERRUPT_POLL))) {
+#ifdef CONFIG_LATX_OPT_NOFP
+                __nofp_sync_xmm_to_env(cpu);
+                __nofp_sync_fpr_to_env(cpu, 0);
+#endif
+#ifdef CONFIG_LATX_TU
+                cpu->env_ptr->aot_observed_call_pending.valid = false;
+#endif
+                do_cpu_sipi(X86_CPU(cpu));
+                *last_tb = NULL;
+                cpu->exception_index = -1;
+                if (qatomic_read(&cpu->interrupt_request)) {
+                    lats_request_tb_exit(cpu);
+                }
+                goto check_exit;
+            }
+            if (!(interrupt_request & (CPU_INTERRUPT_DEBUG | CPU_INTERRUPT_HALT |
+                                       CPU_INTERRUPT_INIT | CPU_INTERRUPT_POLL)) &&
+                x86_cpu_try_statelock_interrupt(cpu, interrupt_request)) {
+#ifdef CONFIG_LATX_TU
+                cpu->env_ptr->aot_observed_call_pending.valid = false;
+#endif
+                if (qatomic_read(&cpu->interrupt_request) & CPU_INTERRUPT_EXITTB) {
+                    qatomic_and(&cpu->interrupt_request, ~CPU_INTERRUPT_EXITTB);
+                }
+                *last_tb = NULL;
+                cpu->exception_index = -1;
+                if (qatomic_read(&cpu->interrupt_request)) {
+                    lats_request_tb_exit(cpu);
+                }
+                goto check_exit;
+            }
+        }
+        if (option_irq_gate_nobql &&
+            unlikely(latx_maskable_interrupt_gate_closed(cpu,
+                                                         interrupt_request))) {
+            if (unlikely(cpu_exec_exit_pending(cpu))) {
+                if (irq_fast_v2 && replay_mode == REPLAY_MODE_NONE &&
+                    !icount_enabled() && !cpu->singlestep_enabled) {
+                    lats_request_tb_exit(cpu);
+                    goto check_exit;
+                }
+            } else {
+                uint32_t cflags = cpu->cflags_next_tb;
+
+                if (cflags == -1) {
+                    cflags = curr_cflags(cpu);
+                }
+                /* Keep an IF-masked request pending. Reopening delivery checks it
+                 * explicitly; special execution modes keep their existing path. */
+                if (qemu_tcg_mode_2_lat() &&
+                    (option_int_opt == IRQ_CHECK_BLOCK_END ||
+                     option_int_opt == IRQ_CHECK_ASYNC_NOTIFY) &&
+                    inhibit_irq_hflags() && !(cpu->env_ptr->eflags & IF_MASK) &&
+                    cpu->cflags_next_tb == -1 &&
+                    replay_mode == REPLAY_MODE_NONE &&
+                    !(cflags & (CF_USE_ICOUNT | CF_NO_GOTO_TB | CF_NO_GOTO_PTR))) {
+                    return false;
+                }
+                /* IF=1 interrupt shadows and special modes still use an unchained TB. */
+                if ((cpu->env_ptr->cr[0] & CR0_PG_MASK) ||
+                    qemu_vcpu_statelock_enabled()) {
+                    cpu->cflags_next_tb = cflags | CF_NO_GOTO_TB | CF_NO_GOTO_PTR;
+                    cpu->env_ptr->aot_observed_call_pending.valid = false;
+                    *last_tb = NULL;
+                    return false;
+                }
+            }
+        }
+        if (!irq_fast_v2) {
+            break;
+        }
+        int fresh = qatomic_read(&cpu->interrupt_request);
+        if (!fresh) {
+            goto check_exit;
+        }
+        if (fresh == interrupt_request) {
+            break;
+        }
+        interrupt_request = fresh;
     }
 #endif
 
@@ -2365,6 +2551,9 @@ static bool cpu_handle_interrupt(CPUState *cpu,
         qemu_mutex_unlock_iothread();
     }
 
+#if defined(CONFIG_LATX_OPT) && defined(TARGET_I386) && !defined(CONFIG_USER_ONLY)
+check_exit:
+#endif
     /* Finally, check if we need to exit to the main loop.  */
     if (cpu_exec_exit_pending(cpu)) {
         qatomic_set(&cpu->exit_request, 0);
@@ -2758,7 +2947,7 @@ void tcg_free_jump_caches(CPUJumpCache *jc, LatxNJC *njc)
 {
     if (njc) {
         if (option_table_addr) {
-            call_rcu(njc, latx_njc_aligned_free, rcu);
+            call_rcu_nobql(njc, latx_njc_aligned_free, rcu);
         } else {
             g_free_rcu(njc, rcu);
         }

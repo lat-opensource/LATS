@@ -9,6 +9,7 @@
 #include "ir1.h"
 #include "latx-hamt.h"
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "lsenv.h"
 #include "host/cpuinfo.h"
 #include <larchintrin.h>
@@ -859,6 +860,10 @@ QemuOptsList qemu_latx_opts = {
             .type = QEMU_OPT_BOOL,
             .help = "skip BQL while maskable interrupt gates are closed",
         }, {
+            .name = "irqkickfast",
+            .type = QEMU_OPT_BOOL,
+            .help = "notify remote IRQs without requesting a main-loop exit",
+        }, {
             .name = "sysflag",
             .type = QEMU_OPT_NUMBER,
             .help = "optimization for eflags",
@@ -1665,6 +1670,7 @@ void latx_parse_options(QemuOpts *opts)
 
     parse_options_bool("htimer", option_htimer);
     parse_options_bool("irqgatenobql", option_irq_gate_nobql);
+    parse_options_bool("irqkickfast", option_irq_kick_fast);
     
     opt = qemu_opt_find(opts, "imm_cache");
     if(opt) options_parse_imm_cache(opt->str);
@@ -1926,6 +1932,7 @@ void dump_latxs_options(void)
     latx_options_printf("[LATX-SYS] kvm init htimer = 0x%x\n", option_htimer);
     latx_options_printf("[LATX-SYS] irq gate no-BQL = 0x%x\n",
                         option_irq_gate_nobql);
+    latx_options_printf("[LATX-SYS] irq kick fast = 0x%x\n", option_irq_kick_fast);
 #endif
     latx_options_printf("[LATX-SYS] -----------------------------------------------------\n");
     latx_options_printf("[LATX-SYS] pcid = %d\n", option_pcid);
@@ -2402,6 +2409,7 @@ void latxs_options_init(void)
     option_smc_bitmap_flush = 1;
     option_htimer = 0;
     option_irq_gate_nobql = 1;
+    option_irq_kick_fast = lats_nobql_enabled() ? 1 : 0;
 #else
     option_hamt = 0; /* no hamt in user mode */
     option_hamt_mode = 0;

@@ -252,6 +252,18 @@ retry:
     return node;
 }
 
+static bool rcu_nobql_enabled(void)
+{
+    static int enabled = -1;
+    int val = qatomic_read(&enabled);
+
+    if (unlikely(val < 0)) {
+        val = lats_nobql_enabled();
+        qatomic_set(&enabled, val);
+    }
+    return val != 0;
+}
+
 static void *call_rcu_thread(void *opaque)
 {
     struct rcu_head *node;
@@ -261,6 +273,8 @@ static void *call_rcu_thread(void *opaque)
     for (;;) {
         int tries = 0;
         int n = qatomic_read(&rcu_call_count);
+        bool nobql = rcu_nobql_enabled();
+        bool bql_held = false;
 
         /* Heuristically wait for a decent number of callbacks to pile up.
          * Fetch rcu_call_count now, we only must process elements that were
@@ -283,24 +297,42 @@ static void *call_rcu_thread(void *opaque)
 
         qatomic_sub(&rcu_call_count, n);
         synchronize_rcu();
-        qemu_mutex_lock_iothread();
+        if (!nobql) {
+            qemu_mutex_lock_iothread();
+            bql_held = true;
+        }
         while (n > 0) {
             node = try_dequeue();
             while (!node) {
-                qemu_mutex_unlock_iothread();
+                if (bql_held) {
+                    qemu_mutex_unlock_iothread();
+                    bql_held = false;
+                }
                 qemu_event_reset(&rcu_call_ready_event);
                 node = try_dequeue();
                 if (!node) {
                     qemu_event_wait(&rcu_call_ready_event);
                     node = try_dequeue();
                 }
-                qemu_mutex_lock_iothread();
+                if (!nobql && !bql_held) {
+                    qemu_mutex_lock_iothread();
+                    bql_held = true;
+                }
             }
 
             n--;
+            if (nobql) {
+                bool need_bql = !(node->flags & RCU_HEAD_NO_BQL);
+                if (need_bql && !bql_held) {
+                    qemu_mutex_lock_iothread();
+                    bql_held = true;
+                }
+            }
             node->func(node);
         }
-        qemu_mutex_unlock_iothread();
+        if (bql_held) {
+            qemu_mutex_unlock_iothread();
+        }
     }
     abort();
 }
@@ -308,6 +340,16 @@ static void *call_rcu_thread(void *opaque)
 void call_rcu1(struct rcu_head *node, void (*func)(struct rcu_head *node))
 {
     node->func = func;
+    node->flags = 0;
+    enqueue(node);
+    qatomic_inc(&rcu_call_count);
+    qemu_event_set(&rcu_call_ready_event);
+}
+
+void call_rcu1_nobql(struct rcu_head *node, void (*func)(struct rcu_head *node))
+{
+    node->func = func;
+    node->flags = RCU_HEAD_NO_BQL;
     enqueue(node);
     qatomic_inc(&rcu_call_count);
     qemu_event_set(&rcu_call_ready_event);
@@ -360,7 +402,7 @@ void drain_call_rcu(void)
      */
 
     qatomic_inc(&in_drain_call_rcu);
-    call_rcu1(&rcu_drain.rcu, drain_rcu_callback);
+    call_rcu1_nobql(&rcu_drain.rcu, drain_rcu_callback);
     qemu_event_wait(&rcu_drain.drain_complete_event);
     qatomic_dec(&in_drain_call_rcu);
 

@@ -89,7 +89,6 @@ __thread ENV *lsenv;
 extern void *hpet_global_ptr;
 extern void *timers_state_ptr;
 
-extern QemuMutex qemu_global_mutex;
 #endif
 
 void latx_lsenv_init(CPUArchState *env)
@@ -158,9 +157,6 @@ void latx_lsenv_init(CPUArchState *env)
     }
 
     env->rr_counter_ptr = rr_counter_get_ptr();
-#ifdef CONFIG_SOFTMMU
-    env->qemu_global_mutex_ptr = (void *)&(qemu_global_mutex.spin);
-#endif
     env->syscall_tb = NULL;
 
 #ifdef CONFIG_SOFTMMU

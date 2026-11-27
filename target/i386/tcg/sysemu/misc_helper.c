@@ -164,21 +164,26 @@ void helper_write_crN(CPUX86State *env, int reg, target_ulong t0)
         }
         cpu_x86_update_cr4(env, t0);
         break;
-    case 8:
-        if (!(env->hflags2 & HF2_VINTR_MASK)) {
-            qemu_mutex_lock_iothread();
-            cpu_set_apic_tpr(env_archcpu(env)->apic_state, t0);
-            qemu_mutex_unlock_iothread();
+    case 8: {
+        DeviceState *apic = env_archcpu(env)->apic_state;
+        CPUState *cs = env_cpu(env);
+
+        if (!(env->hflags2 & HF2_VINTR_MASK) &&
+            !apic_try_set_local_tpr(apic, t0)) {
+            QEMU_IOTHREAD_LOCK_GUARD();
+            cpu_set_apic_tpr(apic, t0);
         }
         env->int_ctl = (env->int_ctl & ~V_TPR_MASK) | (t0 & V_TPR_MASK);
 
-        CPUState *cs = env_cpu(env);
         if (ctl_has_irq(env)) {
+            QEMU_IOTHREAD_LOCK_GUARD();
             cpu_interrupt(cs, CPU_INTERRUPT_VIRQ);
         } else {
-            cpu_reset_interrupt(cs, CPU_INTERRUPT_VIRQ);
+            /* Only this vCPU produces VIRQ from its SVM interrupt control. */
+            qatomic_and(&cs->interrupt_request, ~CPU_INTERRUPT_VIRQ);
         }
         break;
+    }
     default:
         env->cr[reg] = t0;
         break;

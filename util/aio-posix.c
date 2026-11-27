@@ -125,9 +125,6 @@ void aio_set_fd_handler(AioContext *ctx,
             qemu_lockcnt_unlock(&ctx->list_lock);
             return;
         }
-        /* Clean events in order to unregister fd from the ctx epoll. */
-        node->pfd.events = 0;
-
         poll_disable_change = -!node->io_poll;
     } else {
         poll_disable_change = !io_poll - (node && !node->io_poll);
@@ -149,10 +146,10 @@ void aio_set_fd_handler(AioContext *ctx,
         } else {
             new_node->pfd = node->pfd;
         }
-        g_source_add_poll(&ctx->source, &new_node->pfd);
-
+        /* GLib can query a registered GPollFD without the BQL. */
         new_node->pfd.events = (io_read ? G_IO_IN | G_IO_HUP | G_IO_ERR : 0);
         new_node->pfd.events |= (io_write ? G_IO_OUT | G_IO_ERR : 0);
+        g_source_add_poll(&ctx->source, &new_node->pfd);
 
         QLIST_INSERT_HEAD_RCU(&ctx->aio_handlers, new_node, node);
     }
@@ -317,6 +314,9 @@ static void aio_free_deleted_handlers(AioContext *ctx)
     qemu_lockcnt_inc_and_unlock(&ctx->list_lock);
 }
 
+void trial_poll_aio_activity(unsigned activity) __attribute__((weak));
+void trial_main_callback(unsigned kind, uintptr_t pc) __attribute__((weak));
+
 static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
 {
     bool progress = false;
@@ -353,6 +353,12 @@ static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
          */
         QLIST_SAFE_REMOVE(node, node_poll);
 
+        if (trial_poll_aio_activity) {
+            trial_poll_aio_activity(node->opaque == &ctx->notifier ? 2u : 8u);
+        }
+        if (trial_main_callback) {
+            trial_main_callback(1, (uintptr_t)node->io_poll_ready);
+        }
         node->io_poll_ready(node->opaque);
 
         if (!QLIST_IS_INSERTED(node, node_poll)) {
@@ -369,6 +375,12 @@ static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
     if (!QLIST_IS_INSERTED(node, node_deleted) &&
         (revents & (G_IO_IN | G_IO_HUP | G_IO_ERR)) &&
         node->io_read) {
+        if (trial_poll_aio_activity) {
+            trial_poll_aio_activity(node->opaque == &ctx->notifier ? 2u : 8u);
+        }
+        if (trial_main_callback) {
+            trial_main_callback(1, (uintptr_t)node->io_read);
+        }
         node->io_read(node->opaque);
 
         /* aio_notify() does not count as progress */
@@ -379,6 +391,12 @@ static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
     if (!QLIST_IS_INSERTED(node, node_deleted) &&
         (revents & (G_IO_OUT | G_IO_ERR)) &&
         node->io_write) {
+        if (trial_poll_aio_activity) {
+            trial_poll_aio_activity(8u);
+        }
+        if (trial_main_callback) {
+            trial_main_callback(1, (uintptr_t)node->io_write);
+        }
         node->io_write(node->opaque);
         progress = true;
     }

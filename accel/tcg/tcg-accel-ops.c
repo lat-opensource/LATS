@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include CONFIG_DEVICES
 #include "sysemu/tcg.h"
 #include "sysemu/replay.h"
 #include "sysemu/cpu-timers.h"
@@ -35,15 +36,23 @@
 #include "exec/exec-all.h"
 #include "exec/hwaddr.h"
 #include "exec/gdbstub.h"
+#include "exec/memory.h"
 
 #include "tcg-accel-ops.h"
 #include "tcg-accel-ops-mttcg.h"
 #include "tcg-accel-ops-rr.h"
 #include "tcg-accel-ops-icount.h"
 #include "latx-sigrt-sys.h"
+#ifdef CONFIG_APIC
+#include "hw/i386/apic.h"
+#endif
+#if defined(CONFIG_LATX_OPT) && defined(TARGET_I386)
+#include "latx-options.h"
+#endif
 #if defined(TARGET_I386) && defined(CONFIG_LATX_HACK_MEM) && !defined(CONFIG_USER_ONLY)
 #include "hamt-ptw.h"
 #endif
+
 
 /* common functionality among all TCG variants */
 
@@ -90,17 +99,37 @@ int tcg_cpus_exec(CPUState *cpu)
 /* mask must never be zero, except for A20 change call */
 void tcg_handle_interrupt(CPUState *cpu, int mask)
 {
+#ifdef CONFIG_LATX_OPT_MMIO_LOCKLESS
+    if (!memory_region_device_lock_enabled()) {
+        g_assert(qemu_mutex_iothread_locked());
+    }
+#else
     g_assert(qemu_mutex_iothread_locked());
+#endif
 
-    cpu->interrupt_request |= mask;
+    qatomic_or(&cpu->interrupt_request, mask);
 
     /*
      * If called from iothread context, wake the target cpu in
      * case its halted.
      */
     if (!qemu_cpu_is_self(cpu)) {
+#if defined(CONFIG_LATX_OPT) && defined(TARGET_I386)
+        const int irq_mask = CPU_INTERRUPT_POLL | CPU_INTERRUPT_HARD;
+
+        if (option_irq_kick_fast && mask && !(mask & ~irq_mask) &&
+            qemu_tcg_mode_2_lat() && qemu_tcg_mttcg_enabled() &&
+            !icount_enabled() && replay_mode == REPLAY_MODE_NONE &&
+            !cpu->singlestep_enabled) {
+            smp_wmb();
+            qemu_cond_broadcast_3(cpu->halt_cond);
+            lats_request_tb_exit(cpu);
+            return;
+        }
+#endif
         qemu_cpu_kick(cpu);
     } else {
+        smp_wmb();
         lats_request_tb_exit(cpu);
     }
 }
@@ -214,6 +243,10 @@ static void tcg_accel_ops_init(AccelOpsClass *ops)
             ops->handle_interrupt = tcg_handle_interrupt;
         }
     }
+
+#ifdef CONFIG_APIC
+    ops->set_irq_delivery_paused = apic_set_msi_paused;
+#endif
 
     ops->supports_guest_debug = tcg_supports_guest_debug;
     ops->insert_breakpoint = tcg_insert_breakpoint;

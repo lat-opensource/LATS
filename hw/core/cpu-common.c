@@ -27,6 +27,9 @@
 #include "qemu/main-loop.h"
 #include "exec/log.h"
 #include "exec/cpu-common.h"
+#if !defined(CONFIG_USER_ONLY) && defined(CONFIG_LATX_OPT_MMIO_LOCKLESS)
+#include "exec/memory.h"
+#endif
 #include "qemu/error-report.h"
 #include "qemu/qemu-print.h"
 #include "sysemu/tcg.h"
@@ -71,6 +74,12 @@ CPUState *cpu_create(const char *typename)
  * BQL here if we need to.  cpu_interrupt assumes it is held.*/
 void cpu_reset_interrupt(CPUState *cpu, int mask)
 {
+#if !defined(CONFIG_USER_ONLY) && defined(CONFIG_LATX_OPT_MMIO_LOCKLESS)
+    if (memory_region_device_lock_enabled()) {
+        qatomic_and(&cpu->interrupt_request, ~mask);
+        return;
+    }
+#endif
     bool need_lock = !qemu_mutex_iothread_locked();
 
     if (need_lock) {
@@ -236,6 +245,7 @@ static void cpu_common_initfn(Object *obj)
     cpu->cflags_next_tb = -1;
 
     qemu_mutex_init(&cpu->work_mutex);
+    qemu_spin_init(&cpu->state_lock);
     qemu_lockcnt_init(&cpu->in_ioctl_lock);
     QSIMPLEQ_INIT(&cpu->work_list);
     QTAILQ_INIT(&cpu->breakpoints);
@@ -249,6 +259,7 @@ static void cpu_common_finalize(Object *obj)
     CPUState *cpu = CPU(obj);
 
     qemu_lockcnt_destroy(&cpu->in_ioctl_lock);
+    qemu_spin_destroy(&cpu->state_lock);
     qemu_mutex_destroy(&cpu->work_mutex);
 }
 

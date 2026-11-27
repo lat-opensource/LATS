@@ -409,6 +409,12 @@ int aio_bh_poll(AioContext *ctx);
  */
 void qemu_bh_schedule(QEMUBH *bh);
 
+/*
+ * Queue a bottom half without interrupting the owner. The caller must
+ * arrange for the context to check pending work before blocking again.
+ */
+void qemu_bh_schedule_no_notify(QEMUBH *bh);
+
 /**
  * qemu_bh_cancel: Cancel execution of a bottom half.
  *
