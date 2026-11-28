@@ -12,6 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[5]
 TESTS = [
     "latx-aot/test-hamt-ptr-memory.py",
+    "latx-aot/test-hamt-mmio-ade.py",
     "latx-aot/test-hamt-poison-entry.py",
     "latx-aot/test-mtcc-region-reset.py",
     "latx-aot/test-ras-tp-boundary.py",

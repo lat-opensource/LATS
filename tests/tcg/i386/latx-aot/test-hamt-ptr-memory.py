@@ -14,7 +14,7 @@ import tempfile
 root = Path(__file__).resolve().parents[4]
 header = (root / 'target/i386/hamt/hamt-internal.h').read_text()
 source = (root / 'target/i386/hamt/hamt.c').read_text()
-dune = (root / 'target/i386/hamt/dune-loop.c').read_text()
+inject = (root / 'target/i386/hamt/dune-inject-ade.c').read_text()
 
 def function(text, signature):
     start = text.index(signature)
@@ -27,7 +27,8 @@ def function(text, signature):
 
 # Both injected-ADE paths must use the same scaled displacement decoder.
 assert 'simm = hamt_ptr_offset(inst);' in function(source, 'static uint64_t hamt_fix_injected_ade(')
-assert 'simm = hamt_ptr_offset(inst);' in dune
+assert 'access->simm = hamt_ptr_offset(inst);' in function(
+    inject, 'static bool dune_decode_inject_ade_access(')
 for name in ('hamt_get_st_val_softmmu', 'load_into_reg_softmmu'):
     start = source.index(name + '(')
     assert 'get_opc_from_epc(epc)' in source[start:source.index('\n}', start)]
@@ -38,6 +39,10 @@ prefix = r'''
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+static inline int32_t sextract32(uint32_t value, int start, int length)
+{
+    return (int32_t)(value << (32 - start - length)) >> (32 - length);
+}
 typedef unsigned MemOpIdx;
 enum {MO_SB=1,MO_UB,MO_LESW,MO_LEUW,MO_LESL,MO_LEUL,MO_LEUQ,MO_128};
 static MemOpIdx make_memop_idx(unsigned op,unsigned idx) {return op|(idx<<8);}
@@ -51,6 +56,7 @@ end = header.index('} ld_st_inst;', start) + len('} ld_st_inst;')
 parts = [prefix, header[start:end]]
 for name in ('hamt_is_ptr_mem', 'hamt_ptr_offset', 'hamt_indexed_mem_opcode', 'hamt_mem_opcode'):
     parts.append(function(header, 'static inline ' + ('bool' if name == 'hamt_is_ptr_mem' else 'int' if name == 'hamt_ptr_offset' else 'uint32_t') + ' ' + name + '('))
+parts.append(function(header, 'static inline int hamt_simm12('))
 for signature in ('static inline uint64_t hamt_get_mem_address(', 'static inline uint32_t get_opc_from_epc(', 'static inline int is_atomic_inst(', 'static inline int is_write_inst(', 'static MemOpIdx hamt_get_oi('):
     parts.append(function(source, signature))
 parts.append(r'''

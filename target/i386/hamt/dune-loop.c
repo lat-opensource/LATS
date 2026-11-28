@@ -33,12 +33,12 @@
 #include "latx-hamt.h"
 
 #include "dune-arch.h"
+#include "dune-inject-ade.h"
 #include "dune-info.h"
 #include "dune-kvm.h"
 #include "dune-kvm-init.h"
 
 #include "hamt-options.h"
-#include "hamt-internal.h"
 #include "hamt-dmw.h"
 #include "hamt-fake-fork.h"
 #include "cpu.h"
@@ -203,9 +203,6 @@ static struct dune_kvm_cpu *dune_emulate_fork(
     return NULL;
 }
 
-void hamt_mark_injected_ade(uint64_t pc, uint64_t rj, uint64_t rk);
-int hamt_mmio_inst_type(uint32_t inst);
-
 /*
  * The signal only stops KVM_RUN. Capture and allocation run outside its
  * handler, before the virtual CPU executes another instruction.
@@ -297,103 +294,37 @@ void dune_loop(struct dune_kvm_cpu *vcpu)
             continue;
         }
 
-        /* handle x86 Guest ADE in LA Guest DMW */
+        /*
+         * A scalar MMIO access translated into a DMW window needs an injected
+         * ADE. The injection file screens the opcode and effective address;
+         * this branch owns the KVM exit policy and fatal fallback.
+         */
         if (vcpu->kvm_run->exit_reason == KVM_EXIT_MMIO) {
             if (ioctl(vcpu->vcpu_fd, KVM_GET_REGS, &regs) < 0) {
                 printf("%s:%d ADE in DMW fail to get kvm regs\n",
                         __func__, __LINE__);
                 goto dune_handle_ade_in_dmw_fail;
             }
-            /* For mmio write, kvm performs PC+4 before ioctl return.
-             * Fix the regs.pc to point to the memory access inst. */
-            if (vcpu->kvm_run->mmio.is_write) { regs.pc -= 4; }
-            uint32_t *epc = (void *)regs.pc;
-            epc = (uint32_t *) DMW_OUT(epc);
-            uint32_t inst = *epc;
-            int type = hamt_mmio_inst_type(inst);
-            if (type == 0) {
-                printf("%s:%d kvm mmio epc %p inst %08x\n",
-                        __func__, __LINE__, epc, inst);
-                goto dune_handle_ade_in_dmw_fail;
-            }
-            int rd = 0, rj = 0, rk = 0;
-            int imm = 0, simm = 0;
-            uint64_t base = 0;
-            switch (type) {
-            case 1: /* ld/st */
-                rd = (inst >> 0) & 0x1f;
-                rj = (inst >> 5) & 0x1f;
-                imm = (inst >> 10) & 0xfff;
-                simm = (imm << 20) >> 20;
-                base = regs.gpr[rj];
-                break;
-            case 2: /* ldx/stx */
-                rd = (inst >> 0) & 0x1f;
-                rj = (inst >> 5) & 0x1f;
-                rk = (inst >> 10) & 0x1f;
-                simm = imm = 0;
-                base = regs.gpr[rj] + regs.gpr[rk];
-                break;
-            case 3: /* ldptr/stptr */
-                rd = (inst >> 0) & 0x1f;
-                rj = (inst >> 5) & 0x1f;
-                simm = hamt_ptr_offset(inst);
-                base = regs.gpr[rj];
-                break;
-            default:
-                break;
-            }
-            uint64_t addr = base + simm;
-            if (((addr >> 56) & 0xff) == 0x90) {
-#ifdef CONFIG_LATX_DEBUG
-                printf("%s:%d ====== ADE %lx type %d inst %08x\n",
-                        __func__, __LINE__, addr, type, inst);
-                printf("%s:%d ====== rj %llx rk %llx simm %x\n",
-                        __func__, __LINE__, regs.gpr[rj], regs.gpr[rk], simm);
-#endif
-                hamt_mark_injected_ade((uint64_t)epc,
-                        regs.gpr[rj], regs.gpr[rk]);
-                /* For type 1,3 : modify gpr[rj] is enough to avoid DMW
-                 * addr = 0xab... + simm will not in DMW */
-                regs.gpr[rj] &= ~(0xffULL << 56);
-                regs.gpr[rj] |=  (0xabULL << 56);
-#ifdef CONFIG_LATX_DEBUG
-                printf("%s:%d set rj to %llx\n",
-                        __func__, __LINE__, regs.gpr[rj]);
-#endif
-                if (type == 2) {
-                    /* For type 2, make sure gpr[rk]'s upper 8 bits it 0x00
-                     * addr = 0xab.. + 0x00... will not in DMW */
-                    regs.gpr[rk] &= ~(0xffULL << 56);
-#ifdef CONFIG_LATX_DEBUG
-                printf("%s:%d set rk to %llx\n",
-                        __func__, __LINE__, regs.gpr[rk]);
-#endif
-                }
-                if (!vcpu->kvm_run->mmio.is_write) {
-                    if (rd == rj) {
-                        vcpu->kvm_run->mmio.len = 8;
-                        *((uint64_t*)&(vcpu->kvm_run->mmio.data[0])) = regs.gpr[rj];
-#ifdef CONFIG_LATX_DEBUG
-                        printf("%s:%d set KVM mmio read : len %d data %lx\n",
-                                __func__, __LINE__,
-                                vcpu->kvm_run->mmio.len,
-                                *((uint64_t*)&(vcpu->kvm_run->mmio.data[0])));
-#endif
-                    }
-                    /* For mmio read, PC+4 will be performed after ioctl.
-                     * Fix the regs.pc to make sure the memory access inst
-                     * will be executed again. */
-                    regs.pc -= 4;
-                }
-                if (ioctl(vcpu->vcpu_fd, KVM_SET_REGS, &regs) < 0) {
-                    printf("%s:%d ADE in DMW fail to set kvm regs\n",
-                            __func__, __LINE__);
-                    goto dune_handle_ade_in_dmw_fail;
-                }
+            if (dune_inject_ade_from_mmio(vcpu, &regs) ==
+                DUNE_INJECT_ADE_RETRY) {
                 continue;
             }
-            dune_info(" KVM mmio not handled at %p inst %08x", epc, *epc);
+            goto dune_handle_ade_in_dmw_fail;
+        }
+
+        /* The 4.19 KVM rejects vector MMIO emulation with INTERNAL_ERROR.
+         * Its read path leaves PC at the instruction and its write failure
+         * path rolls PC back, so preserve PC when retrying the vector op. */
+        if (vcpu->kvm_run->exit_reason == KVM_EXIT_INTERNAL_ERROR) {
+            if (ioctl(vcpu->vcpu_fd, KVM_GET_REGS, &regs) < 0) {
+                printf("%s:%d vector ADE fail to get kvm regs\n",
+                        __func__, __LINE__);
+                goto dune_handle_ade_in_dmw_fail;
+            }
+            if (dune_inject_ade_from_internal_error(vcpu, &regs) ==
+                DUNE_INJECT_ADE_RETRY) {
+                continue;
+            }
         }
 
 dune_handle_ade_in_dmw_fail:

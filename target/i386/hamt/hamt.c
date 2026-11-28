@@ -102,8 +102,7 @@ static inline uint64_t hamt_get_mem_address(uint32_t *epc, int cpuid)
         uint64_t base = ((uint64_t*)(hamt_data_area[cpuid]))[rj];
         return base + offset;
     }
-    int imm = (inst >> 10) & 0xfff;
-    int simm = (imm << 20) >> 20;
+    int simm = hamt_simm12(inst);
     uint64_t base = ((uint64_t*)(hamt_data_area[cpuid]))[rj];
     return base + simm;
 }
@@ -207,6 +206,7 @@ static inline int is_write_inst(uint32_t *epc)
         case OPC_FLD_S:
         case OPC_FLD_D:
         case OPC_VLD:
+        case OPC_XVLD:
             return 0;
         case OPC_ST_B:
         case OPC_ST_H:
@@ -215,6 +215,7 @@ static inline int is_write_inst(uint32_t *epc)
         case OPC_FST_S:
         case OPC_FST_D:
         case OPC_VST:
+        case OPC_XVST:
         case OPC_VSTELM_D:
             return 1;
         default: {
@@ -1364,8 +1365,6 @@ static void hamt_tlb_handler_ato(uint64_t badv,
     hamt_restore_to_native(env, cpuid);
 }
 
-int hamt_mmio_inst_type(uint32_t inst);
-
 void hamt_mark_injected_ade(uint64_t pc, uint64_t rj, uint64_t rk);
 void hamt_mark_injected_ade(uint64_t pc, uint64_t rj, uint64_t rk)
 {
@@ -1398,20 +1397,21 @@ static uint64_t hamt_fix_injected_ade(CPUX86State *env,
     uint64_t *data = ((uint64_t *)(hamt_data_area[cpuid]));
     uint64_t base = 0;
 
-    int imm = 0, simm = 0;
+    int simm = 0;
     int type = hamt_mmio_inst_type(inst);
     switch (type) {
     case 1: /* ld/st */
+    case 4: /* vector base */
 #ifdef CONFIG_LATX_DEBUG
         printf("%s:%d fix rj %lx to %lx\n", __func__, __LINE__,
                 data[rj], env->hamt_injected_ade_rj);
 #endif
         data[rj] = env->hamt_injected_ade_rj;
-        imm = (inst >> 10) & 0xfff;
-        simm = (imm << 20) >> 20;
+        simm = hamt_simm12(inst);
         base = data[rj] + simm;
         break;
     case 2: /* ldx/stx */
+    case 5: /* vector indexed */
 #ifdef CONFIG_LATX_DEBUG
         printf("%s:%d fix rj %lx to %lx\n", __func__, __LINE__,
                 data[rj], env->hamt_injected_ade_rj);
@@ -1443,21 +1443,55 @@ static uint64_t hamt_fix_injected_ade(CPUX86State *env,
     return base;
 }
 
+static uint64_t hamt_recover_injected_ade(CPUX86State *env,
+        uint32_t *epc, int cpuid)
+{
+    uint64_t epc0 = (uint64_t)epc;
+    uint64_t epc1 = (uint64_t)env->hamt_injected_ade_pc;
+
+#ifdef CONFIG_LATX_DEBUG
+    printf("%s:%d HAMT epc %lx\n", __func__, __LINE__, epc0);
+    printf("%s:%d HAMT injected ade at %lx\n", __func__, __LINE__, epc1);
+#endif
+
+    if (epc0 != epc1) {
+        printf("%s:%d error : inject ADE epc not equal\n"
+               "epc hamt   %lx\n"
+               "epc inject %lx\n",
+               __func__, __LINE__, epc0, epc1);
+        printf("%s:%d CPU[%d] %p env %p\n", __func__, __LINE__,
+                cpuid, env_cpu(env), env);
+        while (1) ;
+    }
+
+    uint64_t addr = hamt_fix_injected_ade(env, epc, cpuid);
+    hamt_clear_injected_ade();
+    return addr;
+}
+
 int hamt_mmio_inst_type(uint32_t inst)
 {
-    /* Vector indexed instructions use the same saved base/index fixup. */
-    if ((inst & 0xffff8000u) == OPC_VLDX ||
-        (inst & 0xffff8000u) == OPC_VSTX) {
+    if (hamt_is_vector_indexed_mem(inst)) {
+        return 5;
+    }
+
+    if (hamt_indexed_mem_opcode(inst)) {
         return 2;
     }
-    uint32_t opc = (inst >> 22) << 22;
-    switch(opc) {
+
+    if (hamt_is_vector_mem(inst)) {
+        return 4;
+    }
+
+    uint32_t opc = inst & 0xffc00000u;
+    switch (opc) {
     case OPC_LD_B:
     case OPC_LD_H:
     case OPC_LD_W:
     case OPC_LD_BU:
     case OPC_LD_HU:
     case OPC_LD_WU:
+    case OPC_LD_D:
     case OPC_ST_B:
     case OPC_ST_H:
     case OPC_ST_W:
@@ -1466,31 +1500,9 @@ int hamt_mmio_inst_type(uint32_t inst)
     default:
         break;
     }
-    opc = (inst >> 18) << 18;
-    switch (opc) {
-    case OPC_LDX_B:
-    case OPC_LDX_H:
-    case OPC_LDX_W:
-    case OPC_LDX_BU:
-    case OPC_LDX_HU:
-    case OPC_LDX_WU:
-    case OPC_STX_B:
-    case OPC_STX_H:
-    case OPC_STX_W:
-    case OPC_STX_D:
-        return 2;
-    default:
-        break;
-    }
-    opc = (inst >> 24) << 24;
-    switch (opc) {
-    case OPC_LDPTR_W:
-    case OPC_LDPTR_D:
-    case OPC_STPTR_W:
-    case OPC_STPTR_D:
+
+    if (hamt_is_ptr_mem(inst)) {
         return 3;
-    default:
-        break;
     }
     return 0;
 }
@@ -1531,29 +1543,6 @@ static void hamt_tlb_handler_softmmu(uint64_t hamt_badvaddr,
 #ifdef CONFIG_LATX_PRINT
     hamt_tlb_handler_print_error_stat(cpu, addr, epc);
 #endif
-
-    if (env->hamt_injected_ade) {
-        uint64_t epc0 = (uint64_t)epc;
-        uint64_t epc1 = (uint64_t)env->hamt_injected_ade_pc;
-#ifdef CONFIG_LATX_DEBUG
-        printf("%s:%d HAMT epc %lx\n", __func__, __LINE__, epc0);
-        printf("%s:%d HAMT injected ade at %lx\n", __func__, __LINE__, epc1);
-#endif
-        if (epc0 == epc1) {
-            uint64_t fix = hamt_fix_injected_ade(env, epc, cpuid);
-            addr = hamt_badvaddr = fix;
-        }
-        else {
-            printf("%s:%d error : inject ADE epc not equal\n" \
-                    "epc hamt   %lx\n" \
-                    "epc inject %lx\n" \
-                    , __func__, __LINE__, epc0, epc1);
-            printf("%s:%d CPU[%d] %p env %p\n", __func__, __LINE__,
-                    cpu->cpu_index, cpu, env);
-            while (1) ;
-        }
-        hamt_clear_injected_ade();
-    }
 
     uint32_t opc = get_opc_from_epc(epc);
     uint8_t *native_vreg = NULL;
@@ -1844,27 +1833,6 @@ static void hamt_tlb_handler_page_fault(CPUX86State *env,
 
     int64_t sext = (int64_t)addr >> 47;
     if (sext != 0 && sext != -1) {
-        if (env->hamt_injected_ade) {
-            uint64_t epc0 = (uint64_t)epc;
-            uint64_t epc1 = (uint64_t)env->hamt_injected_ade_pc;
-#ifdef CONFIG_LATX_DEBUG
-            printf("%s:%d HAMT epc %lx\n", __func__, __LINE__, epc0);
-            printf("%s:%d HAMT injected ade at %lx\n", __func__, __LINE__, epc1);
-#endif
-            if (epc0 == epc1) {
-                uint64_t fix = hamt_fix_injected_ade(env, (void *)epc, cpuid);
-                env->cr[2] = addr = fix;
-            } else {
-                printf("%s:%d error : inject ADE epc not equal\n" \
-                        "epc hamt   %lx\n" \
-                        "epc inject %lx\n" \
-                        , __func__, __LINE__, epc0, epc1);
-                printf("%s:%d CPU[%d] %p env %p\n", __func__, __LINE__,
-                        cpu->cpu_index, cpu, env);
-                while (1) ;
-            }
-            hamt_clear_injected_ade();
-        }
         /* Recover deferred TU flags before leaving the HAMT exception. */
         cpu_restore_state(cpu, (uintptr_t)epc);
         hamt_recover_ptn_eflag(env, epc);
@@ -1911,6 +1879,15 @@ void hamt_tlb_handler(uint64_t hamt_badvaddr,
 
     env = (void *)DMW_OUT((uint64_t)env);
     epc = (void *)DMW_OUT((uint64_t)epc);
+
+    if (env->hamt_injected_ade) {
+        CPUState *cpu = env_cpu(env);
+        int cpuid = qemu_tcg_mttcg_enabled() ? cpu->cpu_index : 0;
+
+        /* PTW and native recovery must never observe the temporary retry
+         * registers installed by the MMIO loop. */
+        hamt_badvaddr = hamt_recover_injected_ade(env, epc, cpuid);
+    }
 
     env->in_hamt_exception = true;
 #ifdef CONFIG_LATX_HACK_MEM

@@ -8,6 +8,7 @@
 #define _HAMT_INTERNAL_H_
 
 #include "hamt-cpu.h"
+#include "qemu/bitops.h"
 #include "qemu/typedefs.h"
 
 typedef enum {
@@ -46,8 +47,12 @@ typedef enum {
     OPC_FST_D    = 0x2BC00000,
     OPC_VLD      = 0x2C000000,
     OPC_VST      = 0x2C400000,
+    OPC_XVLD     = 0x2C800000,
+    OPC_XVST     = 0x2CC00000,
     OPC_VLDX     = 0x38400000,
     OPC_VSTX     = 0x38440000,
+    OPC_XVLDX    = 0x38480000,
+    OPC_XVSTX    = 0x384C0000,
     OPC_VSTELM_D = 0x31000000, //This opc covers VSTELM_D and VSTELM_W
 
     OPC_LL_W        = 0b00100000 << 24,
@@ -110,10 +115,35 @@ typedef enum {
     OPC_AMMIN_DB_DU = 0b00111000011100011 << 15,
 } ld_st_inst;
 
+/* Every HAMT MMIO class uses the ordinary signed 12-bit displacement. */
+static inline int hamt_simm12(uint32_t inst)
+{
+    return sextract32(inst, 10, 12);
+}
+
+/* 0: unsupported, 1: scalar base, 2: scalar indexed, 3: PTR,
+ * 4: vector base, 5: vector indexed. */
+int hamt_mmio_inst_type(uint32_t inst);
+
 /* PTR memory instructions use an eight-bit opcode and scaled si14. */
 static inline bool hamt_is_ptr_mem(uint32_t inst)
 {
     return (inst & 0xfc000000u) == OPC_LDPTR_W;
+}
+
+static inline bool hamt_is_vector_mem(uint32_t inst)
+{
+    uint32_t opc = inst & 0xffc00000u;
+    return opc == OPC_VLD || opc == OPC_VST ||
+           opc == OPC_XVLD || opc == OPC_XVST;
+}
+
+static inline bool hamt_is_vector_indexed_mem(uint32_t inst)
+{
+    return (inst & 0xffff8000u) == OPC_VLDX ||
+           (inst & 0xffff8000u) == OPC_VSTX ||
+           (inst & 0xffff8000u) == OPC_XVLDX ||
+           (inst & 0xffff8000u) == OPC_XVSTX;
 }
 
 static inline int hamt_ptr_offset(uint32_t inst)
@@ -140,6 +170,8 @@ static inline uint32_t hamt_indexed_mem_opcode(uint32_t inst)
     case OPC_STX_D: return OPC_ST_D;
     case OPC_VLDX: return OPC_VLD;
     case OPC_VSTX: return OPC_VST;
+    case OPC_XVLDX: return OPC_XVLD;
+    case OPC_XVSTX: return OPC_XVST;
     default: return 0;
     }
 }

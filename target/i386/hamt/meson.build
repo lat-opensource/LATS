@@ -10,6 +10,7 @@ if host_arch == 'loongarch64'
     'dune-kvm-init-csr.c',
     'dune-kvm-init-ebase.c',
     'dune-kvm-init-fpu.c',
+    'dune-inject-ade.c',
     'dune-loop.c',
     'dune-stack.c',
     'hamt.c',
